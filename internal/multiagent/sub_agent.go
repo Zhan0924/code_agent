@@ -53,8 +53,15 @@ func (a *SubAgent) Execute(ctx context.Context, req DelegationRequest, dispatche
 		}
 	}
 
-	// Default: dispatch the step action as a tool call
-	return dispatcher.Dispatch(ctx, string(req.AgentType)+"_execute", req.Parameters)
+	// Default: dispatch using the step's action as the tool name
+	toolName := req.Action
+	if toolName == "" {
+		toolName = string(req.AgentType) + "_execute"
+	}
+	if !isAllowed(toolName, allowedTools) {
+		return "", fmt.Errorf("tool %q not allowed for agent type %s", toolName, a.Type)
+	}
+	return dispatcher.Dispatch(ctx, toolName, req.Parameters)
 }
 
 func (a *SubAgent) allowedTools() []string {

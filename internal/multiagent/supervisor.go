@@ -116,9 +116,10 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	defer s.pool.Release(agent)
 
 	output, err := agent.Execute(stepCtx, DelegationRequest{
-		StepID:    step.ID,
-		AgentType: agentType,
-		Task:      step.Description,
+		StepID:     step.ID,
+		AgentType:  agentType,
+		Action:     step.Action,
+		Task:       step.Description,
 		Parameters: step.Parameters,
 	}, s.dispatcher)
 

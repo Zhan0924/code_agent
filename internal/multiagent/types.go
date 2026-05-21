@@ -31,6 +31,7 @@ type AgentResult struct {
 type DelegationRequest struct {
 	StepID       string          `json:"step_id"`
 	AgentType    AgentType       `json:"agent_type"`
+	Action       string          `json:"action"`
 	Task         string          `json:"task"`
 	Parameters   json.RawMessage `json:"parameters,omitempty"`
 	Context      string          `json:"context,omitempty"`

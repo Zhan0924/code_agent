@@ -72,6 +72,30 @@ func TestSubAgent_Execute(t *testing.T) {
 	}
 }
 
+func TestSubAgent_Execute_UsesActionFallback(t *testing.T) {
+	d := &mockDispatcher{}
+	agent := NewSubAgent(AgentCode, zap.NewNop())
+
+	params := json.RawMessage(`{"path":"main.go"}`)
+	output, err := agent.Execute(context.Background(), DelegationRequest{
+		StepID:     "step-1",
+		AgentType:  AgentCode,
+		Action:     "read_file",
+		Task:       "read a file",
+		Parameters: params,
+	}, d)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != "ok: read_file" {
+		t.Errorf("unexpected output: %s", output)
+	}
+	if len(d.calls) != 1 || d.calls[0] != "read_file" {
+		t.Errorf("unexpected dispatch calls: %v", d.calls)
+	}
+}
+
 func TestSubAgent_DisallowedTool(t *testing.T) {
 	d := &mockDispatcher{}
 	agent := NewSubAgent(AgentReview, zap.NewNop())
