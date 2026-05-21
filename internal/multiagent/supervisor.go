@@ -124,6 +124,7 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 
 	// Pre-check file conflicts before executing write actions
 	var conflictBlocked bool
+	var conflictMsg string
 	if isFileWriteAction(step.Action) {
 		filePath := extractFilePathFromParams(step.Parameters)
 		if filePath != "" {
@@ -137,6 +138,7 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 				winner := s.conflictResolver.Resolve(conflict)
 				if winner.AgentID != agent.ID {
 					conflictBlocked = true
+					conflictMsg = fmt.Sprintf("conflict on %s: resolved in favor of %s", filePath, winner.AgentID)
 				}
 			}
 		}
@@ -150,7 +152,7 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 
 	if conflictBlocked {
 		result.Success = false
-		result.Error = fmt.Sprintf("conflict on %s: resolved in favor of another agent", step.Action)
+		result.Error = conflictMsg
 		result.Duration = time.Since(start)
 	} else {
 		output, err := agent.Execute(stepCtx, DelegationRequest{
