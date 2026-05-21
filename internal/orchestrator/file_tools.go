@@ -104,7 +104,8 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "content"]
 			}`),
-			Source: "builtin",
+			Source:    "builtin",
+			RiskLevel: 2, // High risk: modifies files
 		},
 		{
 			Name:        "patch_file",
@@ -119,7 +120,8 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "old_text", "new_text"]
 			}`),
-			Source: "builtin",
+			Source:    "builtin",
+			RiskLevel: 1, // Moderate risk: modifies existing files
 		},
 		{
 			Name:        "list_files",
@@ -173,7 +175,8 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["command"]
 			}`),
-			Source: "builtin",
+			Source:    "builtin",
+			RiskLevel: 2, // High risk: arbitrary command execution on host
 		},
 		{
 			Name:        "edit_file",
@@ -188,7 +191,8 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "old_text", "new_text"]
 			}`),
-			Source: "builtin",
+			Source:    "builtin",
+			RiskLevel: 1, // Moderate risk: modifies existing files with rollback
 		},
 	}
 }

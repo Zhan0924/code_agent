@@ -178,6 +178,7 @@ type ToolDefinition struct {
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"` // JSON Schema
 	Source      string          `json:"source"`     // "builtin", "mcp:<server_name>"
+	RiskLevel   int             `json:"risk_level"` // 0=safe, 1=moderate, 2=high (requires approval)
 }
 
 // ToolResult represents the output of a tool execution.

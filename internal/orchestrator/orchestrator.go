@@ -1180,6 +1180,20 @@ func (o *Orchestrator) retrieveRAGContext(ctx context.Context, query string) str
 func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*models.ToolResult, error) {
 	start := time.Now()
 
+	// [P5] Tool-level HITL: check RiskLevel before execution
+	if !skipHITL(ctx) {
+		if def, ok := o.getToolRiskLevel(tc.Name); ok && def.RiskLevel >= 2 {
+			o.logger.Info("high-risk tool blocked pending approval",
+				zap.String("tool", tc.Name), zap.Int("risk_level", def.RiskLevel))
+			return &models.ToolResult{
+				ToolCallID: tc.ID,
+				Content: fmt.Sprintf("⚠️ Tool '%s' requires approval (risk_level=%d). "+
+					"This operation modifies system state. Please confirm execution.", tc.Name, def.RiskLevel),
+				IsError: true,
+			}, nil
+		}
+	}
+
 	// [P0-3] Speculative cache: return cached result for idempotent read tools
 	scope := o.cacheScope()
 	if o.toolCache != nil {
@@ -1215,6 +1229,17 @@ func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*mo
 	}
 
 	return result, err
+}
+
+func (o *Orchestrator) getToolRiskLevel(name string) (models.ToolDefinition, bool) {
+	if o.toolRegistry == nil {
+		return models.ToolDefinition{}, false
+	}
+	tool, ok := o.toolRegistry.Get(name)
+	if !ok {
+		return models.ToolDefinition{}, false
+	}
+	return tool.Definition(), true
 }
 
 func (o *Orchestrator) dispatchTool(ctx context.Context, tc models.ToolCall, start time.Time) (*models.ToolResult, error) {

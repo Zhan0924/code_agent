@@ -60,7 +60,8 @@ func gitToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["message"]
 			}`),
-			Source: "builtin",
+			Source:    "builtin",
+			RiskLevel: 2, // High risk: mutates git history
 		},
 		{
 			Name:        "git_log",
