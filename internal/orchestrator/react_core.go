@@ -1,0 +1,210 @@
+// react_core.go extracts the shared ReAct loop logic used by both
+// the synchronous reactLoop and the streaming ProcessMessageStreamFull.
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/agent/code_agent/internal/llm"
+	"github.com/agent/code_agent/internal/models"
+	"go.uber.org/zap"
+)
+
+// reactEventSink receives events during the ReAct loop execution.
+type reactEventSink interface {
+	Emit(event models.ReactStreamEvent)
+}
+
+// noopSink discards all events (used by synchronous reactLoop).
+type noopSink struct{}
+
+func (noopSink) Emit(models.ReactStreamEvent) {}
+
+// channelSink sends events to a buffered channel (used by streaming).
+type channelSink struct {
+	ch chan<- models.ReactStreamEvent
+}
+
+func (s *channelSink) Emit(e models.ReactStreamEvent) { s.ch <- e }
+
+// reactCoreOpts configures the shared ReAct loop.
+type reactCoreOpts struct {
+	task        *models.Task
+	messages    []models.Message
+	tools       []models.ToolDefinition
+	maxSteps    int
+	startStep   int // for auto-continue: the global step offset
+	interruptCh chan InterruptSignal
+}
+
+// reactCoreResult holds the outcome of a single batch of ReAct steps.
+type reactCoreResult struct {
+	content      string
+	messages     []models.Message // updated messages after loop
+	done         bool             // true if LLM produced a final answer
+	stepsUsed    int
+	hitStepLimit bool
+}
+
+// reactLoopCore runs the shared inner ReAct loop. Both reactLoop (sync) and
+// ProcessMessageStreamFull (streaming) delegate here for the step-by-step
+// LLM → tool → observe cycle.
+func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, sink reactEventSink) reactCoreResult {
+	messages := opts.messages
+	failTracker := &consecutiveFailureTracker{}
+	globalStep := opts.startStep
+
+	for step := range opts.maxSteps {
+		globalStep++
+
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return reactCoreResult{content: "Request cancelled", messages: messages, stepsUsed: step, done: true}
+		default:
+		}
+
+		// Check interrupt
+		if opts.interruptCh != nil {
+			select {
+			case sig := <-opts.interruptCh:
+				sink.Emit(models.ReactStreamEvent{Type: "message", Content: fmt.Sprintf("Task interrupted (%s).", sig.Type)})
+				return reactCoreResult{content: fmt.Sprintf("Task interrupted (%s).", sig.Type), messages: messages, stepsUsed: step, done: true}
+			default:
+			}
+		}
+
+		o.logger.Debug("ReAct step", zap.String("task_id", opts.task.ID), zap.Int("step", globalStep))
+
+		sink.Emit(models.ReactStreamEvent{Type: "step_start", Step: globalStep, TaskID: opts.task.ID, MaxSteps: opts.startStep + opts.maxSteps})
+
+		// Reflection checkpoint every 10 steps
+		if reflection := o.reflectionCheckpoint(step, opts.maxSteps); reflection != nil {
+			messages = append(messages, *reflection)
+		}
+
+		// Token budget check
+		const maxContextTokens = 128000
+		totalTokens := 0
+		for _, m := range messages {
+			totalTokens += llm.EstimateTokens(m.Content)
+		}
+		if totalTokens > maxContextTokens {
+			o.logger.Warn("token budget exceeded, pruning", zap.Int("tokens", totalTokens))
+			messages = o.pruneMessages(messages, maxContextTokens)
+		}
+
+		// LLM call with retry
+		var resp *llm.ChatResponse
+		var llmErr error
+		for attempt := range 3 {
+			resp, llmErr = o.llmClient.ChatCompletion(ctx, &llm.ChatRequest{
+				Messages: messages, Tools: opts.tools,
+			})
+			if llmErr == nil {
+				break
+			}
+			o.logger.Warn("LLM call failed, retrying", zap.Int("attempt", attempt+1), zap.Error(llmErr))
+			if attempt < 2 {
+				select {
+				case <-time.After(time.Duration(2<<attempt) * time.Second):
+				case <-ctx.Done():
+					return reactCoreResult{content: "Context cancelled during LLM retry", messages: messages, stepsUsed: step, done: true}
+				}
+			}
+		}
+		if llmErr != nil {
+			sink.Emit(models.ReactStreamEvent{Type: "error", Content: "LLM call failed: " + llmErr.Error()})
+			return reactCoreResult{content: "LLM call failed after 3 retries: " + llmErr.Error(), messages: messages, stepsUsed: step, done: true}
+		}
+
+		// Emit thinking if content present with tool calls
+		if resp.Content != "" {
+			if len(resp.ToolCalls) > 0 {
+				sink.Emit(models.ReactStreamEvent{Type: "thinking", Step: globalStep, Content: resp.Content})
+			} else {
+				sink.Emit(models.ReactStreamEvent{Type: "message", Step: globalStep, Content: resp.Content})
+			}
+		}
+
+		// No tool calls = final answer
+		if len(resp.ToolCalls) == 0 {
+			return reactCoreResult{content: resp.Content, messages: messages, stepsUsed: step + 1, done: true}
+		}
+
+		// Append assistant message
+		messages = append(messages, models.Message{
+			Role: models.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
+		})
+
+		// Execute tools
+		var editedFilePaths []string
+		for _, tc := range resp.ToolCalls {
+			sink.Emit(models.ReactStreamEvent{
+				Type: "tool_call", Step: globalStep,
+				ToolName: tc.Name, ToolArgs: string(tc.Args), ToolCallID: tc.ID,
+			})
+
+			result, execErr := o.executeTool(ctx, tc)
+			content := result.Content
+			if execErr != nil {
+				content = fmt.Sprintf("Error: %v", execErr)
+			}
+
+			// Track edited files for auto-test
+			if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file") && execErr == nil && !result.IsError {
+				var pathReq struct {
+					Path string `json:"path"`
+				}
+				if json.Unmarshal(tc.Args, &pathReq) == nil && pathReq.Path != "" {
+					editedFilePaths = append(editedFilePaths, pathReq.Path)
+				}
+			}
+
+			// Smart truncation
+			if llm.EstimateTokens(content) > 8000 {
+				runes := []rune(content)
+				if len(runes) > 32000 {
+					headSize := 8000
+					tailSize := 12000
+					content = string(runes[:headSize]) +
+						"\n\n... [middle truncated — " + fmt.Sprintf("%d", len(runes)-headSize-tailSize) + " chars omitted] ...\n\n" +
+						string(runes[len(runes)-tailSize:])
+				}
+			}
+
+			isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
+			sink.Emit(models.ReactStreamEvent{
+				Type: "tool_result", Step: globalStep,
+				ToolName: tc.Name, ToolCallID: tc.ID,
+				Content: content, IsError: isErr,
+			})
+
+			messages = append(messages, models.Message{
+				Role: models.RoleTool, Content: content, ToolCallID: tc.ID,
+			})
+
+			// Failure tracking
+			if failTracker.track(tc.Name, isErr) {
+				o.logger.Warn("fix loop detected", zap.String("tool", tc.Name), zap.Int("failures", failTracker.failCount))
+				messages = append(messages, failTracker.stepBackMessage())
+			}
+		}
+
+		// Auto-test after file edits
+		if len(editedFilePaths) > 0 {
+			if testResult := o.RunAutoTestAfterEdit(ctx, editedFilePaths); testResult != nil {
+				if msg := testResult.FormatForLLM(); msg != "" {
+					messages = append(messages, models.Message{Role: models.RoleSystem, Content: msg})
+				}
+			}
+		}
+	}
+
+	// Step limit exhausted
+	return reactCoreResult{messages: messages, stepsUsed: opts.maxSteps, hitStepLimit: true}
+}

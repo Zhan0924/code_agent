@@ -62,6 +62,12 @@ func (o *Orchestrator) SetWorkspaceManager(wm *workspace.Manager) {
 	if wm != nil {
 		o.editEngine = NewEditEngine(wm, o.logger)
 		o.autoTestRunner = NewAutoTestRunner(wm, o.logger)
+		// Register file and git tools into unified registry
+		if o.toolRegistry != nil {
+			if err := o.RegisterFileTools(o.toolRegistry); err != nil {
+				o.logger.Error("failed to register file tools", zap.Error(err))
+			}
+		}
 	}
 }
 

@@ -25,6 +25,7 @@ import (
 	"github.com/agent/code_agent/internal/session"
 	"github.com/agent/code_agent/internal/store"
 	"github.com/agent/code_agent/internal/toollearn"
+	"github.com/agent/code_agent/internal/tools"
 	"github.com/agent/code_agent/internal/workspace"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -67,6 +68,9 @@ type Orchestrator struct {
 	}
 	store  *store.Store // PostgreSQL persistence (nil = disabled)
 	logger *zap.Logger
+
+	// Unified tool registry for all tool dispatch
+	toolRegistry *tools.Registry
 
 	// [P0] Precision edit engine with unique-match, backup, and lint
 	editEngine *EditEngine
@@ -160,6 +164,12 @@ Always use tools when they would produce better answers. After receiving tool re
 		intentCache:    make(map[string]intentCacheEntry),
 		toolCache:      NewSpeculativeToolCache(0, logger),
 		ruleLoader:     NewRuleLoader(logger),
+		toolRegistry:   tools.NewRegistry(),
+	}
+
+	// Register built-in tools into the unified registry
+	if err := orch.RegisterBuiltinTools(orch.toolRegistry); err != nil {
+		logger.Error("failed to register builtin tools", zap.Error(err))
 	}
 
 	// [P2-D] Initialize tool learning subsystem
@@ -336,10 +346,9 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		o.txMu.Unlock()
 	}()
 
-	// [OPT-19] Use PromptBuilder for KV-cache-friendly, pruned prompt assembly.
+	// Build prompt via PromptBuilder
 	sess, _ := o.sessionMgr.Get(ctx, task.SessionID)
 
-	// Retrieve RAG code chunks for code-related intents
 	var codeChunks []models.CodeChunk
 	var relevanceScores []float64
 	if task.Intent == models.IntentCodeQuery || task.Intent == models.IntentDiagnose {
@@ -355,7 +364,6 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		}
 	}
 
-	// Update PromptBuilder's system prompt based on intent
 	o.promptBuilder.UpdateLongTermMemory(func() string {
 		if sess != nil {
 			return sess.Summary
@@ -364,176 +372,31 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 	}())
 
 	messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
-
-	// Override system prompt with intent-specific prompt
 	if len(messages) > 0 && messages[0].Role == models.RoleSystem {
 		messages[0] = o.buildSystemMessage(task.Intent)
 	}
 
 	tools := o.getAvailableTools()
 
-	// [OPT-7] Token budget: track cumulative tokens to prevent exceeding model context window.
-	// ⬆ 7K→128K: Claude Opus supports 200K input; reserve 16K for output + 56K headroom.
-	const maxContextTokens = 128000
+	// Delegate to shared core loop
+	result := o.reactLoopCore(ctx, reactCoreOpts{
+		task:        task,
+		messages:    messages,
+		tools:       tools,
+		maxSteps:    getMaxSteps(task.Intent),
+		startStep:   0,
+		interruptCh: interruptCh,
+	}, noopSink{})
 
-	// [Fix-4] Initialize failure tracker for fix loop detection
-	failTracker := &consecutiveFailureTracker{}
-
-	maxSteps := getMaxSteps(task.Intent)
-	for step := 0; step < maxSteps; step++ {
-		o.logger.Debug("ReAct step", zap.String("task_id", task.ID), zap.Int("step", step+1))
-
-		// [Fix-2] Inject reflection checkpoint every 10 steps
-		if reflection := o.reflectionCheckpoint(step, maxSteps); reflection != nil {
-			o.logger.Info("injecting reflection checkpoint", zap.Int("step", step+1))
-			messages = append(messages, *reflection)
-		}
-
-		// Check token budget before calling LLM
-		totalTokens := 0
-		for _, m := range messages {
-			totalTokens += llm.EstimateTokens(m.Content)
-		}
-		if totalTokens > maxContextTokens {
-			o.logger.Warn("ReAct token budget exceeded, pruning oldest messages",
-				zap.String("task_id", task.ID), zap.Int("tokens", totalTokens))
-			messages = o.pruneMessages(messages, maxContextTokens)
-		}
-
-		// [P0-2] LLM call with retry — recover from transient API failures
-		var resp *llm.ChatResponse
-		var llmErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			resp, llmErr = o.llmClient.ChatCompletion(ctx, &llm.ChatRequest{
-				Messages: messages, Tools: tools,
-			})
-			if llmErr == nil {
-				break
-			}
-			o.logger.Warn("LLM call failed, retrying",
-				zap.String("task_id", task.ID), zap.Int("step", step+1),
-				zap.Int("attempt", attempt+1), zap.Error(llmErr))
-			if attempt < 2 {
-				// Exponential backoff: 2s, 4s
-				select {
-				case <-time.After(time.Duration(2<<attempt) * time.Second):
-				case <-ctx.Done():
-					return "", fmt.Errorf("context cancelled during LLM retry: %w", ctx.Err())
-				}
-			}
-		}
-		if llmErr != nil {
-			// All retries exhausted — save progress and return partial result
-			o.saveProgressForContinuation(ctx, task)
-			return "", fmt.Errorf("LLM call failed at step %d after 3 retries: %w\n\n"+
-				"⚠️ Your workspace files are intact. Send 'continue' in the same session to resume.", step+1, llmErr)
-		}
-
-		// If no tool calls → LLM is done reasoning, return the final answer
-		if len(resp.ToolCalls) == 0 {
-			return resp.Content, nil
-		}
-
-		// Append assistant message with tool calls to conversation
-		assistantMsg := models.Message{
-			Role:      models.RoleAssistant,
-			Content:   resp.Content,
-			ToolCalls: resp.ToolCalls,
-		}
-		messages = append(messages, assistantMsg)
-
-		// Execute each tool and append results as tool-role messages
-		var editedFilePaths []string // [P0] Track files modified for auto-test
-
-		for _, tc := range resp.ToolCalls {
-			// [P2-E1] Check for interrupt signal between tool calls
-			if action, interrupted := o.checkInterrupt(ctx, interruptCh, task); interrupted {
-				if action.cancel {
-					// [P2-E2] Rollback dirty files on cancel
-					if tx.HasDirtyFiles() {
-						rolled, _ := tx.Rollback()
-						o.logger.Info("rolled back on interrupt", zap.Int("files", rolled))
-					}
-					return action.response, nil
-				}
-				if action.redirect {
-					tx.Clear()
-					task.UserInput = action.newMessage
-					return o.reactLoop(ctx, task)
-				}
-			}
-
-			o.logger.Info("tool call", zap.String("task_id", task.ID),
-				zap.String("tool", tc.Name), zap.Int("step", step+1))
-
-			result, execErr := o.executeTool(ctx, tc)
-			content := result.Content
-			if execErr != nil {
-				content = fmt.Sprintf("Error: %v", execErr)
-			}
-
-			// [P0] Track edited file paths for auto-test
-			if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file") && execErr == nil && !result.IsError {
-				var pathReq struct {
-					Path string `json:"path"`
-				}
-				if json.Unmarshal(tc.Args, &pathReq) == nil && pathReq.Path != "" {
-					editedFilePaths = append(editedFilePaths, pathReq.Path)
-				}
-			}
-
-			// [OPT-7] Smart truncation: keep HEAD + TAIL to preserve error details
-			if llm.EstimateTokens(content) > 8000 {
-				runes := []rune(content)
-				if len(runes) > 32000 {
-					headSize := 8000  // first 8K chars: test names, setup info
-					tailSize := 12000 // last 12K chars: error messages, FAIL details
-					content = string(runes[:headSize]) +
-						"\n\n... [middle truncated — " + fmt.Sprintf("%d", len(runes)-headSize-tailSize) + " chars omitted] ...\n\n" +
-						string(runes[len(runes)-tailSize:])
-				}
-			}
-
-			// Tool result message (fed back to LLM for next reasoning step)
-			messages = append(messages, models.Message{
-				Role:       models.RoleTool,
-				Content:    content,
-				ToolCallID: tc.ID,
-			})
-
-			// [Fix-4] Track consecutive failures and inject "step back" prompt if stuck
-			isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
-			if failTracker.track(tc.Name, isErr) {
-				o.logger.Warn("fix loop detected", zap.String("tool", tc.Name), zap.Int("failures", failTracker.failCount))
-				msg := failTracker.stepBackMessage()
-				messages = append(messages, msg)
-			}
-		}
-
-		// [P0] Auto-test: after file modifications, run related tests and inject results
-		if len(editedFilePaths) > 0 {
-			if testResult := o.RunAutoTestAfterEdit(ctx, editedFilePaths); testResult != nil {
-				autoTestMsg := testResult.FormatForLLM()
-				if autoTestMsg != "" {
-					o.logger.Info("auto-test result injected",
-						zap.Strings("files", editedFilePaths),
-						zap.Bool("passed", testResult.Passed))
-					messages = append(messages, models.Message{
-						Role:    models.RoleSystem,
-						Content: autoTestMsg,
-					})
-				}
-			}
-		}
+	if result.done {
+		return result.content, nil
 	}
 
-	// Save progress for continuation — write .progress.json to workspace
+	// Step limit exhausted — save progress
 	o.saveProgressForContinuation(ctx, task)
-
-	return "⚠️ I reached the maximum reasoning steps (50). Your workspace files and .plan.md are intact.\n\n" +
+	return "⚠️ I reached the maximum reasoning steps. Your workspace files and .plan.md are intact.\n\n" +
 		"**To continue from where I left off**, send a follow-up message saying `continue` in the same session. " +
-		"I will read .plan.md and .progress.json to resume the remaining steps.\n\n" +
-		"Here's what I completed so far based on the tool results above.", nil
+		"I will read .plan.md and .progress.json to resume the remaining steps.", nil
 }
 
 // saveProgressForContinuation writes a .progress.json to the workspace
@@ -831,18 +694,15 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 	go func() {
 		defer close(eventCh)
 
-		// Register interrupt channel for this session
 		interruptCh := o.registerInterrupt(sessionID)
 		defer o.unregisterInterrupt(sessionID)
 
-		// 1. Parse intent
 		intent, err := o.parseIntent(ctx, sessionID, userMessage)
 		if err != nil {
 			eventCh <- models.ReactStreamEvent{Type: "error", Content: "Failed to parse intent: " + err.Error()}
 			return
 		}
 
-		// 2. Create task
 		task := &models.Task{
 			ID:        uuid.New().String(),
 			SessionID: sessionID,
@@ -852,7 +712,6 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			CreatedAt: time.Now(),
 		}
 
-		// Security check — suspend for HITL if sensitive
 		if !skipHITL(ctx) && (o.containsSensitiveContent(userMessage) || intent == models.IntentDeploy) {
 			task.State = models.TaskStateSuspended
 			o.persistTaskCreate(ctx, task)
@@ -875,18 +734,13 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 		}
 
 		maxSteps := getMaxSteps(intent)
-
-		// Emit intent event (show absoluteMaxSteps as the total capacity)
 		const absoluteMaxSteps = 200
 		eventCh <- models.ReactStreamEvent{
 			Type: "step_start", Intent: string(intent),
 			TaskID: task.ID, MaxSteps: absoluteMaxSteps,
 		}
 
-		// 3. Run a simplified ReAct loop with event emission
 		sess, _ := o.sessionMgr.Get(ctx, sessionID)
-
-		// RAG retrieval
 		var codeChunks []models.CodeChunk
 		var relevanceScores []float64
 		if task.Intent == models.IntentCodeQuery || task.Intent == models.IntentDiagnose {
@@ -897,10 +751,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 						codeChunks = append(codeChunks, r.Chunk)
 						relevanceScores = append(relevanceScores, r.Score)
 					}
-					eventCh <- models.ReactStreamEvent{
-						Type:    "rag_context",
-						Content: fmt.Sprintf("Retrieved %d code chunks from RAG", len(results)),
-					}
+					eventCh <- models.ReactStreamEvent{Type: "rag_context", Content: fmt.Sprintf("Retrieved %d code chunks from RAG", len(results))}
 				}
 			}
 		}
@@ -916,153 +767,53 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 		if len(messages) > 0 && messages[0].Role == models.RoleSystem {
 			messages[0] = o.buildSystemMessage(task.Intent)
 		}
-
 		tools := o.getAvailableTools()
+		sink := &channelSink{ch: eventCh}
 
-		// Auto-continue: use an outer loop with absolute hard limit to prevent infinite loops.
-		// Each "batch" runs up to maxSteps. When a batch exhausts, we inject a continuation
-		// prompt and start a new batch, up to absoluteMaxSteps total.
 		globalStep := 0
-
 		for globalStep < absoluteMaxSteps {
 			batchLimit := maxSteps
 			if globalStep+batchLimit > absoluteMaxSteps {
 				batchLimit = absoluteMaxSteps - globalStep
 			}
 
-			for batchStep := 0; batchStep < batchLimit; batchStep++ {
-				globalStep++
+			result := o.reactLoopCore(ctx, reactCoreOpts{
+				task:        task,
+				messages:    messages,
+				tools:       tools,
+				maxSteps:    batchLimit,
+				startStep:   globalStep,
+				interruptCh: interruptCh,
+			}, sink)
 
-				select {
-				case <-ctx.Done():
-					eventCh <- models.ReactStreamEvent{Type: "error", Content: "Request cancelled"}
-					return
-				case sig := <-interruptCh:
-					eventCh <- models.ReactStreamEvent{
-						Type:    "message",
-						Content: fmt.Sprintf("Task interrupted (%s).", sig.Type),
-					}
-					eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
-					return
-				default:
+			messages = result.messages
+			globalStep += result.stepsUsed
+
+			if result.done {
+				if result.content != "" {
+					_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
+						Role: models.RoleAssistant, Content: result.content,
+					})
 				}
+				eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
+				return
+			}
 
+			if result.hitStepLimit && globalStep < absoluteMaxSteps {
 				eventCh <- models.ReactStreamEvent{
-					Type: "step_start", Step: globalStep, MaxSteps: absoluteMaxSteps, TaskID: task.ID,
+					Type:    "thinking",
+					Step:    globalStep,
+					Content: fmt.Sprintf("Auto-continuing... (%d/%d steps used)", globalStep, absoluteMaxSteps),
 				}
-
-				// LLM call
-				var resp *llm.ChatResponse
-				var llmErr error
-				for attempt := 0; attempt < 3; attempt++ {
-					resp, llmErr = o.llmClient.ChatCompletion(ctx, &llm.ChatRequest{
-						Messages: messages, Tools: tools,
-					})
-					if llmErr == nil {
-						break
-					}
-					if attempt < 2 {
-						select {
-						case <-time.After(time.Duration(2<<attempt) * time.Second):
-						case <-ctx.Done():
-							eventCh <- models.ReactStreamEvent{Type: "error", Content: "Timeout during LLM retry"}
-							return
-						}
-					}
-				}
-				if llmErr != nil {
-					eventCh <- models.ReactStreamEvent{Type: "error", Content: "LLM call failed: " + llmErr.Error()}
-					return
-				}
-
-				// Emit thinking/content if present
-				if resp.Content != "" {
-					if len(resp.ToolCalls) > 0 {
-						// Content with tool calls = thinking
-						eventCh <- models.ReactStreamEvent{Type: "thinking", Step: globalStep, Content: resp.Content}
-					} else {
-						// No tool calls = final answer
-						eventCh <- models.ReactStreamEvent{Type: "message", Step: globalStep, Content: resp.Content}
-						// Store in session
-						_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
-							Role: models.RoleAssistant, Content: resp.Content,
-						})
-						eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
-						return
-					}
-				}
-
-				// No tool calls = done
-				if len(resp.ToolCalls) == 0 {
-					eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
-					return
-				}
-
-				// Append assistant message
-				assistantMsg := models.Message{
-					Role: models.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
-				}
-				messages = append(messages, assistantMsg)
-
-				// Execute tools
-				for _, tc := range resp.ToolCalls {
-					argsStr := string(tc.Args)
-					eventCh <- models.ReactStreamEvent{
-						Type: "tool_call", Step: globalStep,
-						ToolName: tc.Name, ToolArgs: argsStr, ToolCallID: tc.ID,
-					}
-
-					result, execErr := o.executeTool(ctx, tc)
-					content := result.Content
-					if execErr != nil {
-						content = fmt.Sprintf("Error: %v", execErr)
-					}
-
-					// Truncate large output
-					if llm.EstimateTokens(content) > 8000 {
-						runes := []rune(content)
-						if len(runes) > 32000 {
-							headSize := 8000
-							tailSize := 12000
-							content = string(runes[:headSize]) +
-								"\n\n... [truncated " + fmt.Sprintf("%d", len(runes)-headSize-tailSize) + " chars] ...\n\n" +
-								string(runes[len(runes)-tailSize:])
-						}
-					}
-
-					isErr := (execErr != nil) || (result != nil && result.IsError)
-					eventCh <- models.ReactStreamEvent{
-						Type: "tool_result", Step: globalStep,
-						ToolName: tc.Name, ToolCallID: tc.ID,
-						Content: content, IsError: isErr,
-					}
-
-					messages = append(messages, models.Message{
-						Role: models.RoleTool, Content: content, ToolCallID: tc.ID,
-					})
-				}
+				messages = append(messages, models.Message{
+					Role: models.RoleUser,
+					Content: "You have used " + fmt.Sprintf("%d", globalStep) + " steps so far. " +
+						"Continue executing the remaining tasks. Focus on completing the current work efficiently. " +
+						"If you have completed all tasks, provide a final summary response without any tool calls.",
+				})
 			}
-
-			// Batch exhausted — auto-continue by injecting a continuation message
-			o.logger.Info("auto-continue: batch exhausted, injecting continuation prompt",
-				zap.Int("global_step", globalStep), zap.Int("absolute_max", absoluteMaxSteps))
-
-			eventCh <- models.ReactStreamEvent{
-				Type:    "thinking",
-				Step:    globalStep,
-				Content: fmt.Sprintf("Auto-continuing... (%d/%d steps used)", globalStep, absoluteMaxSteps),
-			}
-
-			// Inject a system-level continuation prompt to keep the LLM focused
-			messages = append(messages, models.Message{
-				Role: models.RoleUser,
-				Content: "You have used " + fmt.Sprintf("%d", globalStep) + " steps so far. " +
-					"Continue executing the remaining tasks. Focus on completing the current work efficiently. " +
-					"If you have completed all tasks, provide a final summary response without any tool calls.",
-			})
 		}
 
-		// Absolute hard limit reached
 		eventCh <- models.ReactStreamEvent{
 			Type:    "message",
 			Content: fmt.Sprintf("⚠️ Reached absolute maximum of %d reasoning steps. Task progress has been saved.", absoluteMaxSteps),
@@ -1461,7 +1212,7 @@ func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*mo
 }
 
 func (o *Orchestrator) dispatchTool(ctx context.Context, tc models.ToolCall, start time.Time) (*models.ToolResult, error) {
-	// Check MCP tools first
+	// Check MCP tools first (they may shadow built-in names)
 	if o.mcpGateway != nil {
 		if serverName, ok := o.mcpGateway.FindServerForTool(tc.Name); ok {
 			result, err := o.mcpGateway.CallTool(ctx, serverName, tc.Name, tc.Args)
@@ -1471,40 +1222,21 @@ func (o *Orchestrator) dispatchTool(ctx context.Context, tc models.ToolCall, sta
 		}
 	}
 
-	// Built-in tools
-	switch tc.Name {
-	case "execute_code":
-		return o.toolExecuteCode(ctx, tc.Args)
-	case "search_code":
-		return o.toolSearchCode(ctx, tc.Args)
-	// Autonomous file tools — LLM decides when to use these
-	case "read_file":
-		return o.toolReadFile(ctx, tc.Args)
-	case "write_file":
-		return o.toolWriteFile(ctx, tc.Args)
-	case "patch_file":
-		return o.toolPatchFile(ctx, tc.Args)
-	case "edit_file":
-		return o.toolEditFile(ctx, tc.Args)
-	case "list_files":
-		return o.toolListFiles(ctx, tc.Args)
-	case "create_directory":
-		return o.toolCreateDirectory(ctx, tc.Args)
-	case "run_tests":
-		return o.toolRunTests(ctx, tc.Args)
-	case "run_workspace_cmd":
-		return o.toolRunWorkspaceCmd(ctx, tc.Args)
-	case "git_status", "git_diff", "git_commit", "git_log", "git_branch":
-		return o.executeGitTool(ctx, tc)
-	default:
-		// Check dynamic skills
-		if o.skillRegistry != nil {
-			if _, ok := o.skillRegistry.FindSkill(tc.Name); ok {
-				return o.skillRegistry.Execute(ctx, tc.Name, tc.Args)
-			}
+	// Unified registry dispatch for built-in + file + git tools
+	if o.toolRegistry != nil {
+		if _, ok := o.toolRegistry.Get(tc.Name); ok {
+			return o.toolRegistry.Execute(ctx, tc.Name, tc.Args)
 		}
-		return &models.ToolResult{Content: fmt.Sprintf("Unknown tool: %s", tc.Name), IsError: true}, nil
 	}
+
+	// Dynamic skills as fallback
+	if o.skillRegistry != nil {
+		if _, ok := o.skillRegistry.FindSkill(tc.Name); ok {
+			return o.skillRegistry.Execute(ctx, tc.Name, tc.Args)
+		}
+	}
+
+	return &models.ToolResult{Content: fmt.Sprintf("Unknown tool: %s", tc.Name), IsError: true}, nil
 }
 
 func (o *Orchestrator) toolExecuteCode(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
@@ -1585,24 +1317,9 @@ func (o *Orchestrator) toolSearchCode(ctx context.Context, args json.RawMessage)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func (o *Orchestrator) getAvailableTools() []models.ToolDefinition {
-	tools := []models.ToolDefinition{
-		{
-			Name:        "execute_code",
-			Description: "Execute code in a sandboxed Docker container. Returns stdout, stderr, and exit code.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"language":{"type":"string","enum":["python","go","bash","node"],"description":"Programming language"},"code":{"type":"string","description":"Code to execute"}},"required":["language","code"]}`),
-			Source:      "builtin",
-		},
-		{
-			Name:        "search_code",
-			Description: "Search the indexed codebase using semantic and keyword search. Returns matching code snippets with file paths and line numbers.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Natural language search query or exact symbol name"}},"required":["query"]}`),
-			Source:      "builtin",
-		},
-	}
-	// File tools — only available when workspace manager is connected
-	if o.workspaceMgr != nil {
-		tools = append(tools, fileToolDefinitions()...)
-		tools = append(tools, gitToolDefinitions()...)
+	tools := make([]models.ToolDefinition, 0, 16)
+	if o.toolRegistry != nil {
+		tools = append(tools, o.toolRegistry.Definitions()...)
 	}
 	if o.mcpGateway != nil {
 		tools = append(tools, o.mcpGateway.GetAvailableTools()...)
