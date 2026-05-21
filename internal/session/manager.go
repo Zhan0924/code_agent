@@ -93,6 +93,10 @@ type Manager struct {
 	// ColdStore is an optional callback for archiving cold session data.
 	// In production, this would write to PostgreSQL or S3.
 	ColdStore func(ctx context.Context, sessionID string, data *ColdSessionData) error
+
+	// Summarizer is an optional LLM-based summarizer for archived messages.
+	// If nil, buildSummary falls back to simple string truncation.
+	Summarizer Summarizer
 }
 
 // ColdSessionData represents archived session data for long-term storage.
@@ -385,8 +389,16 @@ func (m *Manager) archiveToCold(ctx context.Context, sessionID string, messages 
 }
 
 // buildSummary generates a summary from archived messages.
-// In production, this would trigger an async LLM call.
+// Uses LLM-based Summarizer when available, falls back to naive truncation.
 func (m *Manager) buildSummary(existingSummary string, messages []models.Message) string {
+	if m.Summarizer != nil {
+		summary, err := m.Summarizer.Summarize(context.Background(), messages, existingSummary)
+		if err == nil {
+			return summary
+		}
+		m.logger.Warn("LLM summarizer failed, falling back to naive", zap.Error(err))
+	}
+
 	var parts []string
 	for _, msg := range messages {
 		parts = append(parts, fmt.Sprintf("[%s]: %s", msg.Role, truncate(msg.Content, 80)))

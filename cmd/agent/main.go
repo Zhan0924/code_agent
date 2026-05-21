@@ -60,6 +60,7 @@ import (
 	"github.com/agent/code_agent/internal/indexer"
 	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/mcp"
+	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/orchestrator"
 	"github.com/agent/code_agent/internal/planner"
 	"github.com/agent/code_agent/internal/rag"
@@ -140,6 +141,25 @@ func main() {
 	logger.Info("LLM client initialized",
 		zap.String("primary", cfg.LLM.Primary.Provider+"/"+cfg.LLM.Primary.Model),
 	)
+
+	// ─── Wire LLM Summarizer into Session Manager ───────────────────────
+	sessionMgr.Summarizer = session.NewLLMSummarizer(
+		func(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+			resp, err := llmClient.ChatCompletion(ctx, &llm.ChatRequest{
+				Messages: []models.Message{
+					{Role: models.RoleSystem, Content: systemPrompt},
+					{Role: models.RoleUser, Content: userPrompt},
+				},
+				Temperature: 0.2,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		},
+		logger,
+	)
+	logger.Info("LLM summarizer wired into session manager")
 
 	// ─── Initialize RAG Engine (optional - depends on Qdrant) ────────────
 	// [OPT-2] Wire the OpenAI Embedder to prevent nil pointer on IndexCode/Retrieve.
