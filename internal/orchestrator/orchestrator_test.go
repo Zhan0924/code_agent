@@ -226,3 +226,54 @@ func TestEvictIntentCacheLocked_BoundsGrowth(t *testing.T) {
 			len(o.intentCache), intentCacheMaxEntries)
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P7: classifyIntentByKeywords Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestClassifyIntentByKeywords(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want models.TaskIntent
+	}{
+		// Deploy
+		{"deploy english", "please deploy this to production", models.IntentDeploy},
+		{"kubectl", "kubectl apply -f deploy.yaml", models.IntentDeploy},
+		{"terraform", "run terraform plan", models.IntentDeploy},
+		{"deploy chinese", "帮我部署到线上", models.IntentDeploy},
+
+		// Code execute
+		{"run command", "run the tests please", models.IntentCodeExecute},
+		{"execute", "execute this script", models.IntentCodeExecute},
+		{"chinese run", "运行一下这个程序", models.IntentCodeExecute},
+
+		// Diagnose
+		{"debug", "debug this crash", models.IntentDiagnose},
+		{"check logs", "check logs for errors", models.IntentDiagnose},
+		{"chinese diagnose", "帮我排查这个问题", models.IntentDiagnose},
+
+		// MCP
+		{"github issue", "create a github issue for this bug", models.IntentMCPCall},
+		{"jira", "update the jira ticket", models.IntentMCPCall},
+
+		// Code query
+		{"how does", "how does the auth middleware work?", models.IntentCodeQuery},
+		{"explain", "explain this function", models.IntentCodeQuery},
+		{"chinese query", "这段代码是什么意思", models.IntentCodeQuery},
+
+		// Ambiguous — should return empty (fall through to LLM)
+		{"ambiguous", "fix the login bug", ""},
+		{"generic", "hello", ""},
+		{"vague", "make it better", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyIntentByKeywords(tt.msg)
+			if got != tt.want {
+				t.Errorf("classifyIntentByKeywords(%q) = %q, want %q", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
