@@ -37,6 +37,7 @@ type Engine struct {
 	embedder Embedder
 	store    VectorStore
 	reranker Reranker
+	depGraph *DepGraph
 	cfg      *config.RAGConfig
 	logger   *zap.Logger
 }
@@ -47,6 +48,7 @@ func NewEngine(embedder Embedder, store VectorStore, reranker Reranker, cfg *con
 		embedder: embedder,
 		store:    store,
 		reranker: reranker,
+		depGraph: NewDepGraph(),
 		cfg:      cfg,
 		logger:   logger.With(zap.String("component", "rag")),
 	}
@@ -83,12 +85,23 @@ func (e *Engine) IndexCode(ctx context.Context, filePath, language, content stri
 		return fmt.Errorf("failed to upsert chunks: %w", err)
 	}
 
+	// Populate dependency graph for Go files
+	if language == "go" {
+		depInfo := ExtractGoDeps(filePath, content)
+		PopulateDepGraph(e.depGraph, depInfo)
+	}
+
 	e.logger.Info("code indexed",
 		zap.String("file", filePath),
 		zap.Int("chunks", len(chunks)),
 	)
 
 	return nil
+}
+
+// DepGraph returns the engine's dependency graph for external queries.
+func (e *Engine) DepGraph() *DepGraph {
+	return e.depGraph
 }
 
 // Retrieve performs dual-recall retrieval followed by reranking.
@@ -148,7 +161,7 @@ func (e *Engine) Retrieve(ctx context.Context, query string, filters map[string]
 		if err != nil {
 			e.logger.Warn("reranking failed, using raw results", zap.Error(err))
 		} else {
-			return reranked, nil
+			allResults = reranked
 		}
 	}
 
@@ -160,6 +173,10 @@ func (e *Engine) Retrieve(ctx context.Context, query string, filters map[string]
 	if len(allResults) > e.cfg.RerankTopN {
 		allResults = allResults[:e.cfg.RerankTopN]
 	}
+
+	// Dependency-aware expansion: boost results whose symbols are connected
+	// to already-retrieved symbols in the dependency graph.
+	allResults = e.expandWithDeps(allResults)
 
 	return allResults, nil
 }
@@ -280,4 +297,50 @@ func countLines(s string) int {
 		}
 	}
 	return count
+}
+
+// expandWithDeps uses the dependency graph to expand retrieval results.
+// For each retrieved symbol, it follows dependency edges to find related
+// symbols and boosts their scores if they appear in the result set.
+func (e *Engine) expandWithDeps(results []models.RetrievalResult) []models.RetrievalResult {
+	if len(results) == 0 {
+		return results
+	}
+
+	// Extract seed symbols from top results
+	seeds := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Chunk.SymbolName != "" {
+			qSym := qualifiedSymbol(r.Chunk.FilePath, r.Chunk.SymbolName)
+			seeds = append(seeds, qSym)
+		}
+	}
+
+	if len(seeds) == 0 {
+		return results
+	}
+
+	// Expand via dependency graph (1 hop)
+	expanded := e.depGraph.ExpandRetrievalContext(seeds, 1)
+
+	// Build a boost map: symbol → boost score
+	boostMap := make(map[string]float64, len(expanded))
+	for _, s := range expanded {
+		boostMap[s.Symbol] = s.Score
+	}
+
+	// Apply boosts to existing results
+	for i := range results {
+		qSym := qualifiedSymbol(results[i].Chunk.FilePath, results[i].Chunk.SymbolName)
+		if boost, ok := boostMap[qSym]; ok {
+			results[i].Score += boost * 0.3 // 30% weight for dependency boost
+		}
+	}
+
+	// Re-sort after boosting
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	return results
 }
