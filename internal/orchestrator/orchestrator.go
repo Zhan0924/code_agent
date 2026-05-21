@@ -20,6 +20,7 @@ import (
 	"github.com/agent/code_agent/internal/mcp"
 	"github.com/agent/code_agent/internal/metrics"
 	"github.com/agent/code_agent/internal/models"
+	"github.com/agent/code_agent/internal/multiagent"
 	"github.com/agent/code_agent/internal/rag"
 	"github.com/agent/code_agent/internal/sandbox"
 	"github.com/agent/code_agent/internal/session"
@@ -104,6 +105,10 @@ type Orchestrator struct {
 	// Optional Planner bridge — nil unless AttachPlanner has been called.
 	// See planner_bridge.go for the behaviour.
 	planner *plannerComponents
+
+	// Optional multi-agent Supervisor — nil unless AttachSupervisor has been called.
+	// See multiagent_bridge.go for the behaviour.
+	supervisor *multiagent.Supervisor
 
 	// Optional Temporal client for durable HITL workflows.
 	// When set, suspendForApproval uses Temporal instead of in-process channels.

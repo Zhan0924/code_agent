@@ -143,6 +143,12 @@ func (o *Orchestrator) MaybeUsePlanner(ctx context.Context, task *models.Task) (
 	// Persist initial plan state
 	o.persistPlan(ctx, task.ID, plan)
 
+	// Choose execution backend: multi-agent Supervisor for plans with
+	// parallelizable steps, serial Executor otherwise.
+	if o.supervisor != nil && planHasParallelism(plan) {
+		return o.executePlanWithSupervisor(ctx, task, plan)
+	}
+
 	execResult, err := o.planner.executor.Execute(ctx, plan)
 	if err != nil {
 		return nil, false, fmt.Errorf("plan execution: %w", err)

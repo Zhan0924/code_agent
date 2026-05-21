@@ -61,6 +61,7 @@ import (
 	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/mcp"
 	"github.com/agent/code_agent/internal/models"
+	"github.com/agent/code_agent/internal/multiagent"
 	"github.com/agent/code_agent/internal/orchestrator"
 	"github.com/agent/code_agent/internal/planner"
 	"github.com/agent/code_agent/internal/rag"
@@ -306,6 +307,12 @@ func main() {
 	p := planner.NewPlanner(plannerAdapter, logger)
 	orch.AttachPlanner(p)
 	logger.Info("orchestrator initialized (planner attached)")
+
+	// Wire multi-agent Supervisor for parallel plan execution
+	supCfg := multiagent.DefaultSupervisorConfig()
+	supervisor := multiagent.NewSupervisor(orch.NewToolDispatcherAdapter(), supCfg, logger)
+	orch.AttachSupervisor(supervisor)
+	logger.Info("multi-agent supervisor attached")
 
 	// ─── Wire Memory Store (optional) ───────────────────────────────────
 	memoryAdapter := NewMemoryAdapter(rdb, pgStore, logger)
