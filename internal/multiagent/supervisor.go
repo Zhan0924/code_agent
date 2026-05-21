@@ -14,21 +14,25 @@ import (
 // It receives a plan (DAG), assigns steps to specialized sub-agents based on
 // step type, and coordinates their execution with bounded parallelism.
 type Supervisor struct {
-	pool       *AgentPool
-	bus        *MessageBus
-	dispatcher ToolDispatcher
-	config     SupervisorConfig
-	logger     *zap.Logger
+	pool             *AgentPool
+	bus              *MessageBus
+	dispatcher       ToolDispatcher
+	conflictResolver *ConflictResolver
+	roleSelector     *RoleSelector
+	config           SupervisorConfig
+	logger           *zap.Logger
 }
 
 // NewSupervisor creates a multi-agent supervisor.
 func NewSupervisor(dispatcher ToolDispatcher, config SupervisorConfig, logger *zap.Logger) *Supervisor {
 	return &Supervisor{
-		pool:       NewAgentPool(config.MaxParallel, logger),
-		bus:        NewMessageBus(logger),
-		dispatcher: dispatcher,
-		config:     config,
-		logger:     logger.With(zap.String("component", "multiagent.supervisor")),
+		pool:             NewAgentPool(config.MaxParallel, logger),
+		bus:              NewMessageBus(logger),
+		dispatcher:       dispatcher,
+		conflictResolver: NewConflictResolver(StrategyPriority, logger),
+		roleSelector:     NewRoleSelector(logger),
+		config:           config,
+		logger:           logger.With(zap.String("component", "multiagent.supervisor")),
 	}
 }
 
@@ -106,7 +110,9 @@ func (s *Supervisor) executeLevel(ctx context.Context, steps []planner.Step) ([]
 }
 
 func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentResult {
-	agentType := classifyStep(step)
+	// Use dynamic role selection instead of static classification
+	candidates := CandidatesForAction(step.Action)
+	agentType := s.roleSelector.SelectBest(step.Action, candidates)
 	start := time.Now()
 
 	stepCtx, cancel := context.WithTimeout(ctx, s.config.StepTimeout)
@@ -138,6 +144,9 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 		result.Output = output
 	}
 
+	// Record result for dynamic role selection learning
+	s.roleSelector.RecordResult(agentType, result.Success, result.Duration)
+
 	s.bus.Publish(Message{
 		From:      agent.ID,
 		To:        "supervisor",
@@ -147,18 +156,4 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	})
 
 	return result
-}
-
-func classifyStep(step planner.Step) AgentType {
-	switch step.Action {
-	case "write_file", "edit_file", "patch_file", "create_directory",
-		"git_commit", "git_branch":
-		return AgentCode
-	case "run_tests", "execute_code":
-		return AgentTest
-	case "read_file", "search_code", "list_files":
-		return AgentReview
-	default:
-		return AgentCode
-	}
 }
