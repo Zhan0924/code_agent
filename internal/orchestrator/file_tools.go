@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -52,6 +53,93 @@ func minimalCommandEnv() []string {
 		}
 	}
 	return env
+}
+
+// bannedCommandPatterns matches dangerous shell patterns that should never
+// be executed in a workspace context, regardless of the tool's stated purpose.
+var bannedCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\brm\s+(-[a-z]*f[a-z]*\s+)?/`),        // rm targeting root
+	regexp.MustCompile(`(?i)\bmkfs\b`),                              // format filesystem
+	regexp.MustCompile(`(?i)\bdd\s+if=`),                            // raw disk write
+	regexp.MustCompile(`:\(\)\s*\{\s*:\|:\s*&\s*\}\s*;`),            // fork bomb
+	regexp.MustCompile(`(?i)\bcurl\b.*\|\s*(ba)?sh`),                // pipe-to-shell
+	regexp.MustCompile(`(?i)\bwget\b.*\|\s*(ba)?sh`),                // pipe-to-shell
+	regexp.MustCompile(`(?i)\bnc\s+-[a-z]*l`),                       // netcat listen
+	regexp.MustCompile(`(?i)\bchmod\s+[0-7]*s`),                     // setuid
+	regexp.MustCompile(`(?i)\bchown\s+root\b`),                      // chown to root
+	regexp.MustCompile(`(?i)\bsudo\b`),                              // privilege escalation
+	regexp.MustCompile(`(?i)\bsu\s+`),                               // switch user
+	regexp.MustCompile(`(?i)/etc/(passwd|shadow|sudoers)`),           // sensitive system files
+	regexp.MustCompile(`(?i)\biptables\b`),                          // firewall manipulation
+	regexp.MustCompile(`(?i)\bsystemctl\b`),                         // service management
+	regexp.MustCompile(`(?i)\bshutdown\b`),                          // system shutdown
+	regexp.MustCompile(`(?i)\breboot\b`),                            // system reboot
+	regexp.MustCompile(`(?i)\bmount\b`),                             // filesystem mount
+	regexp.MustCompile(`(?i)\bumount\b`),                            // filesystem unmount
+}
+
+// allowedCommandPrefixes defines the set of command prefixes considered safe
+// for development workflows. Commands not starting with one of these are rejected.
+var allowedCommandPrefixes = []string{
+	"go ", "go\t", "python", "pip", "node", "npm", "npx", "pnpm",
+	"yarn", "cargo", "rustc", "make", "cmake", "mvn", "gradle",
+	"javac", "java ", "dotnet", "gcc", "g++", "clang",
+	"cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ",
+	"ls", "wc ", "sort ", "uniq ", "diff ", "file ",
+	"echo ", "printf ", "test ", "true", "false",
+	"mkdir ", "cp ", "mv ", "touch ", "rm ",
+	"git ", "docker ", "kubectl ",
+	"curl ", "wget ", "jq ", "yq ",
+	"sed ", "awk ", "cut ", "tr ",
+	"env ", "which ", "type ", "command ",
+	"sh ", "bash ", "zsh ",
+	"tsc", "eslint", "prettier", "jest", "vitest", "pytest",
+	"golangci-lint", "staticcheck", "gopls",
+	"ruff", "mypy", "black", "isort",
+}
+
+// validateWorkspaceCommand checks a command string for security violations.
+// Returns an empty string if safe, or a rejection reason.
+func validateWorkspaceCommand(command string) string {
+	if strings.TrimSpace(command) == "" {
+		return "empty command"
+	}
+
+	// Check banned patterns
+	for _, pat := range bannedCommandPatterns {
+		if pat.MatchString(command) {
+			return fmt.Sprintf("matches banned pattern: %s", pat.String())
+		}
+	}
+
+	// Extract the base command (first token, ignoring env var assignments)
+	baseCmd := extractBaseCommand(command)
+	if baseCmd == "" {
+		return "could not determine base command"
+	}
+
+	// Check against allowed prefixes
+	for _, prefix := range allowedCommandPrefixes {
+		trimmed := strings.TrimSpace(prefix)
+		if baseCmd == trimmed || strings.HasPrefix(baseCmd, trimmed) {
+			return ""
+		}
+	}
+
+	return fmt.Sprintf("command '%s' not in allowed list — use standard dev tools (go, python, node, make, git, etc.)", baseCmd)
+}
+
+// extractBaseCommand strips leading env assignments (KEY=val) and returns
+// the actual command being invoked.
+func extractBaseCommand(command string) string {
+	parts := strings.Fields(command)
+	for _, p := range parts {
+		if strings.Contains(p, "=") && !strings.HasPrefix(p, "-") {
+			continue
+		}
+		return p
+	}
+	return ""
 }
 
 // SetWorkspaceManager injects the workspace manager after construction,
@@ -455,12 +543,9 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 		return &models.ToolResult{Content: "Workspace not found. Create files first using write_file.", IsError: true}, nil
 	}
 
-	// Security: basic command validation — reject obviously dangerous commands
-	lower := strings.ToLower(req.Command)
-	for _, banned := range []string{"rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:"} {
-		if strings.Contains(lower, banned) {
-			return &models.ToolResult{Content: "Command rejected for safety reasons: " + req.Command, IsError: true}, nil
-		}
+	// Security: comprehensive command validation
+	if rejection := validateWorkspaceCommand(req.Command); rejection != "" {
+		return &models.ToolResult{Content: "Command rejected: " + rejection, IsError: true}, nil
 	}
 
 	// Set a per-command timeout (2 minutes max)
