@@ -108,6 +108,9 @@ type Orchestrator struct {
 	// Optional Temporal client for durable HITL workflows.
 	// When set, suspendForApproval uses Temporal instead of in-process channels.
 	temporalClient TemporalClient
+
+	// Optional long-term memory store for cross-session context.
+	memoryStore MemoryRetriever
 }
 
 // intentCacheEntry stores a cached intent classification result.
@@ -365,10 +368,12 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 	}
 
 	o.promptBuilder.UpdateLongTermMemory(func() string {
+		summary := ""
 		if sess != nil {
-			return sess.Summary
+			summary = sess.Summary
 		}
-		return ""
+		// Inject long-term memory alongside session summary
+		return o.buildLongTermMemory(ctx, summary, task.SessionID, "", task.UserInput)
 	}())
 
 	messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
@@ -757,10 +762,11 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 		}
 
 		o.promptBuilder.UpdateLongTermMemory(func() string {
+			summary := ""
 			if sess != nil {
-				return sess.Summary
+				summary = sess.Summary
 			}
-			return ""
+			return o.buildLongTermMemory(ctx, summary, sessionID, "", task.UserInput)
 		}())
 
 		messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)

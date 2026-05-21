@@ -287,6 +287,13 @@ func main() {
 	orch.AttachPlanner(p)
 	logger.Info("orchestrator initialized (planner attached)")
 
+	// ─── Wire Memory Store (optional) ───────────────────────────────────
+	memoryAdapter := NewMemoryAdapter(rdb, pgStore, logger)
+	if memoryAdapter != nil {
+		orch.SetMemoryStore(memoryAdapter)
+		logger.Info("long-term memory store wired into orchestrator")
+	}
+
 	// ─── Initialize API Server ───────────────────────────────────────────
 	var pgPingFn func(ctx context.Context) error
 	if pgStore != nil {
