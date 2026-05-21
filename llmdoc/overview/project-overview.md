@@ -20,7 +20,7 @@ code_agent 是一个生产级 ReAct 代码智能体平台，核心能力是通�
 | 包 | 文件数 | 职责 |
 |---|---|---|
 | `internal/api` | 11 | Gin 路由器、中间件链、SSE/WS handler、DI 胶水层 |
-| `internal/orchestrator` | 20 | ReAct 主循环 + 文件/git/编辑工具 + 失败跟踪 + 自动测试 + 项目规则注入 |
+| `internal/orchestrator` | 20+ | ReAct 主循环 + 文件/git/编辑工具 + 失败跟踪 + 自动测试 + 项目规则注入 + 元认知自适应（Confidence/StuckScore/Pivot） |
 | `internal/llm` | 9 | OpenAI 兼容客户端，primary/fallback 路由，gobreaker 熔断 |
 | `internal/session` | 5 | Redis hot/cold 会话管理，滑动窗口 token 预算 |
 | `internal/context` | 5 | PromptBuilder（5 区域）+ TokenPruner（AST 元数据多信号裁剪） |
@@ -55,7 +55,9 @@ code_agent 是一个生产级 ReAct 代码智能体平台，核心能力是通�
 |---|---|---|
 | `internal/config` | 4 | Viper 配置加载 + 多错误验证 + `${VAR}` 展开 |
 | `internal/skill` | 6 | 统一工具注册（builtin/MCP/user-webhook），schema 快照（原子指针 + 代际计数） |
-| `internal/planner` | 3 | 可选 DAG 多步规划器（ReAct 的替代模式） |
+| `internal/planner` | 8 | DAG 多步规划器 + 质量评估器（4 维度评分+自动改进）+ 进度追踪 |
+| `internal/multiagent` | 9 | 多Agent协作：Supervisor（DAG拓扑并行）+ SubAgent + AgentPool + MessageBus + ConflictResolver + RoleSelector |
+| `internal/toollearn` | 9 | 持续学习：Collector（反馈采集）→ Distiller（策略蒸馏）→ Advisor（会话注入推荐）；PG 持久化已实现但 main.go 未接线 |
 | `internal/pool` | 2 | `sync.Pool` 泛型封装（byte slice / buffer / JSON encoder） |
 | `internal/models` | 1 | 共享数据类型（ToolDefinition, ToolResult, Message 等） |
 | `internal/errors` | 2 | 错误类型定义 |

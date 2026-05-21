@@ -39,6 +39,7 @@
 | 文档 | 内容 |
 |------|------|
 | `memory/doc-gaps.md` | 已知文档缺口、死代码清单、需要未来调查的领域 |
+| `memory/reflections/2026-05-21-new-subsystems.md` | 反思：multiagent/toollearn/metacognition/planner-evaluator 新增未及时记录 |
 
 ---
 

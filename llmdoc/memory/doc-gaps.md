@@ -57,6 +57,9 @@ Session 层使用低精度版本，可能导致上下文窗口管理偏差。
 - `_principles.go` 设计文档中描述的理想架构 vs 当前实现的差异全貌
 - Indexer 校验和存储持久化（当前仅内存，重启丢失）
 - Repomap 正则提取的精度限制（多行 receiver、Python decorator 等）
+- Distiller 策略持久化（`pg_store.go` 已存在但 main.go 未接线确认）
+- MultiAgent Supervisor 在 Orchestrator 中的集成路径（`main.go` 接线状态未确认）
+- Metacognition 对 ReAct 循环决策的实际影响范围
 
 ## 文档结构待办
 
