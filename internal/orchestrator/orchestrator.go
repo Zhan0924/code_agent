@@ -32,6 +32,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// Context keys for passing metadata through the call chain.
+type contextKey string
+
+const ctxKeySessionID contextKey = "session_id"
+
 // [P2-10] Adaptive step limits based on task complexity.
 // getMaxSteps returns the step limit for a given intent.
 func getMaxSteps(intent models.TaskIntent) int {
@@ -1276,7 +1281,8 @@ func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*mo
 		} else if result != nil && result.IsError {
 			errMsg = result.Content
 		}
-		o.toolCollector.Record(tc.Name, tc.Args, success, time.Since(start), errMsg, "")
+		sessionID, _ := ctx.Value(ctxKeySessionID).(string)
+		o.toolCollector.Record(tc.Name, tc.Args, success, time.Since(start), errMsg, sessionID)
 	}
 
 	// [P0-3] Cache write: store successful idempotent results

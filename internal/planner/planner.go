@@ -60,13 +60,23 @@ type LLMCaller interface {
 
 // Planner generates and revises execution plans via LLM.
 type Planner struct {
-	llm    LLMCaller
-	logger *zap.Logger
+	llm       LLMCaller
+	evaluator *PlanEvaluator
+	logger    *zap.Logger
 }
 
 // NewPlanner creates a new Planner instance.
 func NewPlanner(llm LLMCaller, logger *zap.Logger) *Planner {
-	return &Planner{llm: llm, logger: logger}
+	defaultActions := []string{
+		"read_file", "write_file", "edit_file", "execute_code",
+		"search_code", "run_tests", "think", "patch_file",
+		"list_files", "create_directory", "run_workspace_cmd",
+	}
+	return &Planner{
+		llm:       llm,
+		evaluator: NewPlanEvaluator(defaultActions),
+		logger:    logger,
+	}
 }
 
 const plannerSystemPrompt = `You are a planning agent. Given a user's coding task, produce a JSON execution plan.
@@ -74,7 +84,7 @@ const plannerSystemPrompt = `You are a planning agent. Given a user's coding tas
 Rules:
 1. Break the task into discrete steps. Each step has an "id" (like "step_1"), "action" (tool name), "description", optional "parameters", and "depends_on" (list of prerequisite step IDs).
 2. Steps with no dependencies can run in parallel.
-3. Use actions: read_file, write_file, edit_file, execute_code, search_code, run_tests, think.
+3. Use actions: read_file, write_file, edit_file, patch_file, execute_code, search_code, run_tests, run_workspace_cmd, list_files, create_directory, think.
 4. The plan should be minimal but complete — don't add unnecessary steps.
 5. Output ONLY valid JSON matching this schema:
 {
@@ -112,12 +122,79 @@ func (p *Planner) CreatePlan(ctx context.Context, task string, contextInfo strin
 		return nil, fmt.Errorf("invalid plan DAG: %w", err)
 	}
 
+	// Evaluate plan quality and attempt improvement if below threshold
+	if p.evaluator != nil {
+		quality := p.evaluator.Evaluate(plan, task)
+		p.logger.Info("plan quality assessed",
+			zap.String("plan_id", plan.ID),
+			zap.Float64("overall", quality.Overall),
+			zap.Int("weaknesses", len(quality.Weaknesses)),
+		)
+
+		if quality.ShouldImprove() {
+			improved, improveErr := p.improvePlan(ctx, plan, task, &quality)
+			if improveErr == nil && improved != nil {
+				plan = improved
+			}
+		}
+	}
+
 	p.logger.Info("plan created",
 		zap.String("plan_id", plan.ID),
 		zap.Int("steps", len(plan.Steps)),
 		zap.String("goal", plan.Goal),
 	)
 	return plan, nil
+}
+
+const improvementSystemPrompt = `You are a planning agent improving an execution plan that has quality issues.
+
+Given the original plan and its quality assessment, produce an improved plan that addresses the weaknesses.
+- Fix identified issues (missing steps, unknown actions, redundancies).
+- Ensure the plan is complete, feasible, and efficient.
+- Add verification steps if missing.
+- Output ONLY valid JSON in the same schema as the original plan.`
+
+// improvePlan asks the LLM to fix quality issues in a plan.
+func (p *Planner) improvePlan(ctx context.Context, plan *Plan, goal string, quality *PlanQuality) (*Plan, error) {
+	planJSON, _ := json.MarshalIndent(plan, "", "  ")
+	userPrompt := fmt.Sprintf("Original goal: %s\n\nCurrent plan:\n%s\n\nQuality assessment:\n%s\n\nPlease improve this plan to address the weaknesses.",
+		goal, string(planJSON), quality.FormatReport())
+
+	raw, err := p.llm.Call(ctx, improvementSystemPrompt, userPrompt)
+	if err != nil {
+		p.logger.Warn("plan improvement LLM call failed", zap.Error(err))
+		return nil, err
+	}
+
+	improved, err := parsePlanJSON(raw)
+	if err != nil {
+		p.logger.Warn("failed to parse improved plan", zap.Error(err))
+		return nil, err
+	}
+
+	improved.ID = plan.ID
+	improved.CreatedAt = plan.CreatedAt
+	now := time.Now()
+	improved.RevisedAt = &now
+	improved.Version = plan.Version + 1
+
+	if err := ValidateDAG(improved.Steps); err != nil {
+		return nil, err
+	}
+
+	// Verify improvement actually helped
+	newQuality := p.evaluator.Evaluate(improved, goal)
+	if newQuality.Overall <= quality.Overall {
+		p.logger.Info("improvement did not help, keeping original")
+		return nil, nil
+	}
+
+	p.logger.Info("plan improved",
+		zap.Float64("quality_before", quality.Overall),
+		zap.Float64("quality_after", newQuality.Overall),
+	)
+	return improved, nil
 }
 
 const revisionSystemPrompt = `You are a planning agent revising an execution plan that encountered failures.

@@ -54,6 +54,8 @@ type reactCoreResult struct {
 // ProcessMessageStreamFull (streaming) delegate here for the step-by-step
 // LLM → tool → observe cycle.
 func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, sink reactEventSink) reactCoreResult {
+	// Inject session ID into context for downstream use (e.g., tool feedback recording)
+	ctx = context.WithValue(ctx, ctxKeySessionID, opts.task.SessionID)
 	messages := opts.messages
 	failTracker := &consecutiveFailureTracker{}
 	meta := NewMetacognitiveState()
