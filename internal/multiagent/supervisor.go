@@ -123,6 +123,7 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	defer s.pool.Release(agent)
 
 	// Pre-check file conflicts before executing write actions
+	var conflictBlocked bool
 	if isFileWriteAction(step.Action) {
 		filePath := extractFilePathFromParams(step.Parameters)
 		if filePath != "" {
@@ -135,40 +136,39 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 			if conflict := s.conflictResolver.RecordEdit(edit); conflict != nil {
 				winner := s.conflictResolver.Resolve(conflict)
 				if winner.AgentID != agent.ID {
-					return AgentResult{
-						AgentID:   agent.ID,
-						AgentType: agentType,
-						StepID:    step.ID,
-						Duration:  time.Since(start),
-						Success:   false,
-						Error:     fmt.Sprintf("conflict on %s: resolved in favor of %s", filePath, winner.AgentID),
-					}
+					conflictBlocked = true
 				}
 			}
 		}
 	}
 
-	output, err := agent.Execute(stepCtx, DelegationRequest{
-		StepID:     step.ID,
-		AgentType:  agentType,
-		Action:     step.Action,
-		Task:       step.Description,
-		Parameters: step.Parameters,
-	}, s.dispatcher)
-
 	result := AgentResult{
 		AgentID:   agent.ID,
 		AgentType: agentType,
 		StepID:    step.ID,
-		Duration:  time.Since(start),
 	}
 
-	if err != nil {
+	if conflictBlocked {
 		result.Success = false
-		result.Error = err.Error()
+		result.Error = fmt.Sprintf("conflict on %s: resolved in favor of another agent", step.Action)
+		result.Duration = time.Since(start)
 	} else {
-		result.Success = true
-		result.Output = output
+		output, err := agent.Execute(stepCtx, DelegationRequest{
+			StepID:     step.ID,
+			AgentType:  agentType,
+			Action:     step.Action,
+			Task:       step.Description,
+			Parameters: step.Parameters,
+		}, s.dispatcher)
+
+		result.Duration = time.Since(start)
+		if err != nil {
+			result.Success = false
+			result.Error = err.Error()
+		} else {
+			result.Success = true
+			result.Output = output
+		}
 	}
 
 	// Record result for dynamic role selection learning

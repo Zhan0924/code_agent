@@ -55,12 +55,16 @@ func (d *Distiller) Distill() int {
 	}
 	newFeedback := make([]Feedback, len(buffer)-startIdx)
 	copy(newFeedback, buffer[startIdx:])
-	d.processedOffset = len(buffer)
 	d.collector.mu.Unlock()
 
 	if len(newFeedback) < d.minSamples {
 		return 0
 	}
+
+	// Advance offset only after passing the threshold
+	d.collector.mu.Lock()
+	d.processedOffset = startIdx + len(newFeedback)
+	d.collector.mu.Unlock()
 
 	// Group feedback by session
 	bySession := make(map[string][]Feedback)
