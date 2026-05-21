@@ -29,6 +29,7 @@ Orchestrator 同时承担**两份工作**：
 - **工具失败检测**（`consecutiveFailureTracker`）：同名工具连错 3 次就注入 "step back" 提示让 LLM 换思路；
 - **Token 预算管理**（`pruneMessages`）：逼近 128K 上限时按策略删旧消息；
 - **反思检查点**（`reflectionCheckpoint`）：每 10 步注入"你离目标多远？"的 meta-prompt；
+- **自适应元认知反思**（`MetacognitiveState`）：基于工具成功率和卡住程度动态注入反思，不依赖固定步数间隔。当置信度 < 30% 或卡住度 > 70% 时触发，提示 LLM 换策略或请求用户澄清；
 - **敏感内容拦截**（`containsSensitiveContent` → `suspendForApproval`）：HITL 同步挂起等前端授权；
 - **自动测试**（`AutoTestRunner`）：写完代码顺手跑 `go test ./...` 把结果塞回 LLM；
 - **项目规则注入**（`ProjectRules`）：把仓库根目录的 lint/cursor 配置摘要放进 system prompt；

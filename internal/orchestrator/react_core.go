@@ -56,6 +56,9 @@ type reactCoreResult struct {
 func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, sink reactEventSink) reactCoreResult {
 	messages := opts.messages
 	failTracker := &consecutiveFailureTracker{}
+	meta := NewMetacognitiveState()
+	lastToolNames := make(map[string]int) // track tool call frequency for repeat detection
+	var lastToolName string               // most recent tool executed (for sequence hints)
 	globalStep := opts.startStep
 
 	for step := range opts.maxSteps {
@@ -82,9 +85,19 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 
 		sink.Emit(models.ReactStreamEvent{Type: "step_start", Step: globalStep, TaskID: opts.task.ID, MaxSteps: opts.startStep + opts.maxSteps})
 
-		// Reflection checkpoint every 10 steps
+		// Reflection checkpoint every 10 steps, plus adaptive reflection when confidence drops
 		if reflection := o.reflectionCheckpoint(step, opts.maxSteps); reflection != nil {
 			messages = append(messages, *reflection)
+		}
+		if meta.NeedsReflection() {
+			messages = append(messages, *meta.AdaptiveReflectionMessage(globalStep, opts.startStep+opts.maxSteps))
+		}
+
+		// Tool learning: inject context hints from adaptive policy
+		if o.toolPolicy != nil && step > 0 {
+			if hint := o.toolPolicy.FormatContextHint(lastToolName); hint != "" {
+				messages = append(messages, models.Message{Role: models.RoleSystem, Content: hint})
+			}
 		}
 
 		// Token budget check
@@ -178,6 +191,14 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			}
 
 			isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
+
+			// Record outcome in metacognitive state
+			lastToolNames[tc.Name]++
+			meta.RecordOutcome(tc.Name, !isErr, lastToolNames[tc.Name] > 1 && isErr)
+			if isErr {
+				meta.AddUncertainty("recent tool failure: " + tc.Name)
+			}
+
 			sink.Emit(models.ReactStreamEvent{
 				Type: "tool_result", Step: globalStep,
 				ToolName: tc.Name, ToolCallID: tc.ID,
@@ -193,6 +214,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				o.logger.Warn("fix loop detected", zap.String("tool", tc.Name), zap.Int("failures", failTracker.failCount))
 				messages = append(messages, failTracker.stepBackMessage())
 			}
+			lastToolName = tc.Name
 		}
 
 		// Auto-test after file edits
@@ -202,6 +224,11 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 					messages = append(messages, models.Message{Role: models.RoleSystem, Content: msg})
 				}
 			}
+		}
+
+		// Update tool policy every 5 steps
+		if o.toolPolicy != nil && step > 0 && step%5 == 0 {
+			o.toolPolicy.Update()
 		}
 	}
 
