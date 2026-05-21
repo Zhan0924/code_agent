@@ -67,6 +67,8 @@ Grep: 函数名/类名 查找引用
 gh pr comment {pr_number} --body "审查报告"
 ```
 
+> 审查报告通过 `gh pr comment` 发布为单条综合评论。
+
 ## 审查结论
 
 | 结论              | 说明     | 使用场景           |
@@ -78,21 +80,18 @@ gh pr comment {pr_number} --body "审查报告"
 ## 问题分级
 
 ### 🔴 严重问题 (Critical)
-
 - 安全漏洞
 - 数据丢失风险
 - 生产环境崩溃风险
 - 明显的逻辑错误
 
 ### 🟠 重要问题 (Important)
-
 - 性能问题
 - 代码质量问题
 - 架构设计问题
 - 测试覆盖不足
 
 ### 🟢 改进建议 (Suggestions)
-
 - 代码风格改进
 - 命名优化
 - 文档补充
@@ -149,7 +148,6 @@ gh pr comment {pr_number} --body "审查报告"
 
 ---
 
-桀桀桀! 魂殿来抓人啦!
 ```
 
 ### 结构化输出 Schema

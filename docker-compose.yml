@@ -15,6 +15,7 @@ services:
       - CODE_AGENT_POSTGRES_DSN=postgres://agent:agent_secret@postgres:5432/code_agent?sslmode=disable
       - CODE_AGENT_QDRANT_ADDR=qdrant:6334
       - CODE_AGENT_TEMPORAL_HOST=temporal:7233
+      - CODE_AGENT_TRACING_ENDPOINT=jaeger:4317
       - CODE_AGENT_SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock
       # LLM config (can also override via env)
       # - CODE_AGENT_LLM_PRIMARY_API_KEY=sk-xxx
@@ -81,6 +82,19 @@ services:
       - "6334:6334"   # gRPC
     volumes:
       - qdrant-data:/qdrant/storage
+    networks:
+      - agent-net
+
+  # ─── Jaeger (Distributed Tracing) ────────────────────────
+  jaeger:
+    image: docker.m.daocloud.io/jaegertracing/all-in-one:latest
+    container_name: agent-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
     networks:
       - agent-net
 
