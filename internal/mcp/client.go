@@ -453,6 +453,7 @@ func (sc *ServerConnection) close() error {
 type Gateway struct {
 	servers       map[string]*ServerConnection
 	serverConfigs map[string]*config.MCPServerConfig // (F8) stored for reconnection
+	toolIndex     map[string]string                  // toolName -> serverName for O(1) lookup
 	mu            sync.RWMutex
 	logger        *zap.Logger
 }
@@ -462,6 +463,7 @@ func NewGateway(cfg *config.MCPConfig, logger *zap.Logger) (*Gateway, error) {
 	gw := &Gateway{
 		servers:       make(map[string]*ServerConnection),
 		serverConfigs: make(map[string]*config.MCPServerConfig),
+		toolIndex:     make(map[string]string),
 		logger:        logger.With(zap.String("component", "mcp")),
 	}
 
@@ -496,6 +498,9 @@ func NewGateway(cfg *config.MCPConfig, logger *zap.Logger) (*Gateway, error) {
 
 		gw.servers[serverCfg.Name] = conn
 		gw.serverConfigs[serverCfg.Name] = serverCfg
+		for _, t := range conn.tools {
+			gw.toolIndex[t.Name] = serverCfg.Name
+		}
 		gw.logger.Info("MCP server connected",
 			zap.String("server", serverCfg.Name),
 			zap.Int("tools", len(conn.tools)),
@@ -609,18 +614,13 @@ func (gw *Gateway) CallTool(ctx context.Context, serverName, toolName string, ar
 }
 
 // FindServerForTool locates which MCP server provides the given tool.
+// Uses pre-built index for O(1) lookup instead of linear scan.
 func (gw *Gateway) FindServerForTool(toolName string) (string, bool) {
 	gw.mu.RLock()
 	defer gw.mu.RUnlock()
 
-	for serverName, conn := range gw.servers {
-		for _, t := range conn.tools {
-			if t.Name == toolName {
-				return serverName, true
-			}
-		}
-	}
-	return "", false
+	serverName, ok := gw.toolIndex[toolName]
+	return serverName, ok
 }
 
 // ─── Dynamic Server Management ───────────────────────────────────────────────
@@ -656,6 +656,9 @@ func (gw *Gateway) AddServer(cfg *config.MCPServerConfig) (*ServerStatus, error)
 
 	gw.servers[cfg.Name] = conn
 	gw.serverConfigs[cfg.Name] = cfg
+	for _, t := range conn.tools {
+		gw.toolIndex[t.Name] = cfg.Name
+	}
 
 	toolNames := make([]string, len(conn.tools))
 	for i, t := range conn.tools {
@@ -685,6 +688,11 @@ func (gw *Gateway) RemoveServer(name string) error {
 
 	if err := conn.close(); err != nil {
 		gw.logger.Warn("error closing MCP server", zap.String("server", name), zap.Error(err))
+	}
+
+	// Remove tool index entries for this server
+	for _, t := range conn.tools {
+		delete(gw.toolIndex, t.Name)
 	}
 
 	delete(gw.servers, name)
