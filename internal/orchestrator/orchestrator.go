@@ -858,11 +858,12 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			o.persistTaskCreate(ctx, task)
 			o.persistTaskState(ctx, task.ID, models.TaskStateSuspended)
 
-			var wfID string
 			if o.temporalClient != nil {
-				wfID, _ = o.temporalClient.StartHITLWorkflow(ctx, task.ID, sessionID, userMessage)
+				if _, err := o.temporalClient.StartHITLWorkflow(ctx, task.ID, sessionID, userMessage); err != nil {
+					o.logger.Warn("temporal HITL failed in stream, falling back to in-process",
+						zap.String("task_id", task.ID), zap.Error(err))
+				}
 			}
-			_ = wfID
 
 			eventCh <- models.ReactStreamEvent{
 				Type:    "approval_request",

@@ -7,6 +7,7 @@ bin/
 *.dylib
 code-agent
 code-agent-*
+agent
 
 # Test binary, built with `go test -c`
 *.test
@@ -42,11 +43,16 @@ go.work
 .llmdoc-tmp/
 *.tmp
 *.bak
+.claude/scheduled_tasks.lock
 
 # Environment files
 .env
 .env.local
 *.local.yaml
+
+# Config files with secrets (use config.example.yaml as template)
+configs/config.yaml
+configs/config.allinone.yaml
 
 # Docker volumes
 data/
