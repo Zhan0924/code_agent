@@ -312,11 +312,23 @@ func TestNeedsPlanning(t *testing.T) {
 	}{
 		{"What does this do?", false},
 		{"Refactor multiple files to implement authentication, then add tests and verify", true},
+		// New: deployment triggers planning
+		{"Deploy the service to production with docker", true},
+		// New: database migration triggers planning
+		{"Create a database migration to add user roles table", true},
+		// New: API integration
+		{"Implement a new REST API endpoint with authentication and validation", true},
+		// New: multi-verb (add + update + test)
+		{"Add a new handler, update the router, and test the endpoint", true},
+		// New: simple single action stays below threshold
+		{"fix the typo in README", false},
+		// New: Chinese complex task
+		{"首先重构数据库模块，然后更新API接口，最后部署到线上", true},
 	}
 	for _, tt := range tests {
 		name := tt.msg
-		if len(name) > 20 {
-			name = name[:20]
+		if len(name) > 30 {
+			name = name[:30]
 		}
 		t.Run(name, func(t *testing.T) {
 			got := NeedsPlanning(tt.msg)

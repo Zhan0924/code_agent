@@ -42,6 +42,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -273,7 +274,7 @@ func buildFailureSummary(failures []Step) string {
 // ─── Plan Complexity Estimation ─────────────────────────────────────────────
 
 // EstimateComplexity analyzes a user message to decide if it needs a plan.
-// Returns true if the task is complex enough to warrant planning (> threshold).
+// Returns a complexity score; higher scores indicate more complex tasks.
 func EstimateComplexity(userMessage string) int {
 	score := 0
 	lower := strings.ToLower(userMessage)
@@ -291,6 +292,7 @@ func EstimateComplexity(userMessage string) int {
 	multiFileKeywords := []string{
 		"multiple files", "several files", "across files", "refactor",
 		"多个文件", "重构", "批量", "all files", "每个文件",
+		"entire codebase", "whole project", "all modules",
 	}
 	for _, kw := range multiFileKeywords {
 		if strings.Contains(lower, kw) {
@@ -305,17 +307,24 @@ func EstimateComplexity(userMessage string) int {
 		"first", "second", "third", "然后", "接着", "最后", "首先",
 		"and also", "additionally", "并且", "同时",
 	}
+	stepCount := 0
 	for _, kw := range multiStepKeywords {
 		if strings.Contains(lower, kw) {
-			score += 2
-			break
+			stepCount++
 		}
+	}
+	if stepCount > 0 {
+		score += 2
+	}
+	if stepCount >= 3 {
+		score += 2
 	}
 
 	// Implementation indicators
 	implKeywords := []string{
 		"implement", "create", "build", "develop", "add feature",
 		"实现", "创建", "开发", "添加功能", "新增",
+		"integrate", "migrate", "upgrade",
 	}
 	for _, kw := range implKeywords {
 		if strings.Contains(lower, kw) {
@@ -330,6 +339,90 @@ func EstimateComplexity(userMessage string) int {
 		"测试", "验证", "确保",
 	}
 	for _, kw := range testKeywords {
+		if strings.Contains(lower, kw) {
+			score++
+			break
+		}
+	}
+
+	// Deployment/infrastructure indicators (inherently multi-step)
+	deployKeywords := []string{
+		"deploy", "deployment", "部署", "上线",
+		"docker", "kubernetes", "k8s", "terraform",
+		"ci/cd", "pipeline", "release",
+		"production", "staging", "生产环境",
+	}
+	deployHits := 0
+	for _, kw := range deployKeywords {
+		if strings.Contains(lower, kw) {
+			deployHits++
+		}
+	}
+	if deployHits > 0 {
+		score += 3
+	}
+	if deployHits >= 2 {
+		score += 2
+	}
+
+	// Database/migration indicators
+	dbKeywords := []string{
+		"database", "migration", "schema", "数据库", "迁移",
+		"sql", "postgres", "mysql", "mongodb",
+	}
+	for _, kw := range dbKeywords {
+		if strings.Contains(lower, kw) {
+			score += 2
+			break
+		}
+	}
+
+	// API/integration indicators
+	apiKeywords := []string{
+		"api", "endpoint", "integration", "webhook",
+		"接口", "集成", "对接",
+	}
+	for _, kw := range apiKeywords {
+		if strings.Contains(lower, kw) {
+			score += 2
+			break
+		}
+	}
+
+	// Action verb count (multiple actions = multi-step)
+	actionVerbs := []string{
+		"add", "remove", "update", "modify", "change", "fix",
+		"create", "delete", "refactor", "optimize", "improve",
+		"implement", "integrate", "migrate", "deploy", "test",
+		"添加", "删除", "更新", "修改", "修复", "优化",
+	}
+	verbCount := 0
+	for _, verb := range actionVerbs {
+		if strings.Contains(lower, verb) {
+			verbCount++
+		}
+	}
+	if verbCount >= 3 {
+		score += 2
+	} else if verbCount >= 2 {
+		score++
+	}
+
+	// File path mentions (e.g., "internal/api/handler.go")
+	pathPattern := regexp.MustCompile(`[a-z_]+/[a-z_]+`)
+	pathMatches := pathPattern.FindAllString(lower, -1)
+	if len(pathMatches) >= 3 {
+		score += 2
+	} else if len(pathMatches) >= 2 {
+		score++
+	}
+
+	// Conditional/branching indicators (adds complexity)
+	conditionalKeywords := []string{
+		"if", "unless", "except", "when", "in case",
+		"如果", "除非", "当", "假如",
+	}
+	for _, kw := range conditionalKeywords {
 		if strings.Contains(lower, kw) {
 			score++
 			break
