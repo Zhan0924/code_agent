@@ -1,0 +1,16 @@
+# Dockerfile.test 专用 — 包含 *_test.go
+bin/
+coverage.out
+.idea/
+.vscode/
+*.swp
+.git/
+.gitignore
+.github/
+docker-compose.yml
+Dockerfile
+Dockerfile.local
+README.md
+docs/
+.DS_Store
+Thumbs.db

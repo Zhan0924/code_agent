@@ -1,0 +1,127 @@
+# Docker Compose (version key removed - deprecated in modern Docker)
+
+services:
+  # ─── Code Agent Service ───────────────────────────────────
+  agent:
+    build: .
+    container_name: code-agent
+    ports:
+      - "8080:8080"   # HTTP API
+      - "8081:8081"   # WebSocket / SSE
+    environment:
+      # Override localhost → Docker service hostnames
+      # Viper reads CODE_AGENT_<SECTION>_<KEY> via AutomaticEnv()
+      - CODE_AGENT_REDIS_ADDR=redis:6379
+      - CODE_AGENT_POSTGRES_DSN=postgres://agent:agent_secret@postgres:5432/code_agent?sslmode=disable
+      - CODE_AGENT_QDRANT_ADDR=qdrant:6334
+      - CODE_AGENT_TEMPORAL_HOST=temporal:7233
+      - CODE_AGENT_SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock
+      # LLM config (can also override via env)
+      # - CODE_AGENT_LLM_PRIMARY_API_KEY=sk-xxx
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # Sandbox needs Docker
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      # temporal:
+      #   condition: service_started
+    restart: unless-stopped
+    # Docker socket needs root or docker group access
+    user: "0:0"
+    networks:
+      - agent-net
+
+  # ─── Redis (Session + Cache) ────────────────────────────
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: agent-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - agent-net
+
+  # ─── PostgreSQL (Config + Metadata) ─────────────────────
+  postgres:
+    image: docker.m.daocloud.io/library/postgres:16-alpine
+    container_name: agent-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: code_agent
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent_secret
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d code_agent"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - agent-net
+
+  # ─── Qdrant Vector Database ─────────────────────────────
+  qdrant:
+    image: docker.m.daocloud.io/qdrant/qdrant:v1.12.4
+    container_name: agent-qdrant
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - agent-net
+
+  # ─── Temporal Server (optional, comment out if not using) ─
+  temporal:
+    image: docker.m.daocloud.io/temporalio/auto-setup:1.25
+    container_name: agent-temporal
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=agent
+      - POSTGRES_PWD=agent_secret
+      - POSTGRES_SEEDS=postgres
+      # Use a separate database for Temporal to avoid schema conflicts
+      - DBNAME=temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - agent-net
+
+  # ─── Temporal Web UI ────────────────────────────────────
+  temporal-ui:
+    image: docker.m.daocloud.io/temporalio/ui:2.31.2
+    container_name: agent-temporal-ui
+    ports:
+      - "8088:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+    networks:
+      - agent-net
+
+volumes:
+  redis-data:
+  pg-data:
+  qdrant-data:
+
+networks:
+  agent-net:
+    driver: bridge

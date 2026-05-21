@@ -1,0 +1,31 @@
+# Build artifacts
+# bin/ — NOT excluded: Dockerfile.local needs bin/code-agent-linux
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# Docker (prevent recursive context)
+docker-compose.yml
+Dockerfile
+
+# Docs
+README.md
+*.md
+
+# Test caches
+**/*_test.go
+
+# OS files
+.DS_Store
+Thumbs.db

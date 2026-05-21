@@ -1,0 +1,103 @@
+# ============================================================
+# All-in-One Docker Image: Code Agent + ALL Services
+# ============================================================
+# Bundles: Redis, PostgreSQL, Qdrant, Temporal, Docker (DinD)
+# Managed by entrypoint.sh process supervisor.
+#
+# Build:
+#   CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-w -s" -o bin/code-agent-linux-arm64 ./cmd/agent
+#   docker build -f Dockerfile.allinone -t code-agent:allinone .
+#
+# Run (with Docker-in-Docker sandbox support):
+#   docker run -d --privileged -p 8080:8080 \
+#     --name code-agent-allinone code-agent:allinone
+#
+# Run (without sandbox, no --privileged needed):
+#   docker run -d -p 8080:8080 \
+#     --name code-agent-allinone code-agent:allinone
+# ============================================================
+FROM alpine:local
+
+# ── Install all system packages ──────────────────────────────
+RUN apk add --no-cache \
+    redis \
+    postgresql16 \
+    postgresql16-client \
+    docker \
+    go \
+    python3 \
+    nodejs \
+    npm \
+    git \
+    ca-certificates \
+    tzdata \
+    curl \
+    bash \
+    su-exec \
+    iptables \
+    && mkdir -p /var/lib/postgresql/data /run/postgresql /var/log/agent \
+    && chown -R postgres:postgres /var/lib/postgresql /run/postgresql \
+    && mkdir -p /var/lib/redis \
+    && chown -R redis:redis /var/lib/redis \
+    && mkdir -p /var/lib/qdrant/storage /var/lib/qdrant/snapshots
+
+# ── Initialize PostgreSQL data directory ──────────────────────
+RUN su-exec postgres initdb -D /var/lib/postgresql/data \
+    && echo "host all all 0.0.0.0/0 md5" >> /var/lib/postgresql/data/pg_hba.conf \
+    && echo "listen_addresses='*'" >> /var/lib/postgresql/data/postgresql.conf \
+    && echo "max_connections=50" >> /var/lib/postgresql/data/postgresql.conf \
+    && echo "shared_buffers=64MB" >> /var/lib/postgresql/data/postgresql.conf
+
+# ── Create DB user and database at init time ──────────────────
+RUN su-exec postgres pg_ctl -D /var/lib/postgresql/data start -w -t 30 \
+    && su-exec postgres psql -c "ALTER USER postgres PASSWORD 'agent_secret';" \
+    && su-exec postgres psql -c "CREATE USER agent WITH PASSWORD 'agent_secret' CREATEDB;" \
+    && su-exec postgres psql -c "CREATE DATABASE code_agent OWNER agent;" \
+    && su-exec postgres pg_ctl -D /var/lib/postgresql/data stop -w -t 30
+
+# ── Copy Redis config ────────────────────────────────────────
+RUN mkdir -p /etc/redis
+COPY deploy/redis.conf /etc/redis/redis.conf
+
+# ── Copy Qdrant binary ───────────────────────────────────────
+COPY deploy/bin/qdrant /usr/local/bin/qdrant
+RUN chmod +x /usr/local/bin/qdrant
+
+# ── Copy Qdrant config ───────────────────────────────────────
+COPY deploy/qdrant.yaml /etc/qdrant/config.yaml
+
+# ── Copy Temporal CLI binary ─────────────────────────────────
+COPY deploy/bin/temporal /usr/local/bin/temporal
+RUN chmod +x /usr/local/bin/temporal
+
+# ── Copy Jaeger all-in-one binary ────────────────────────────
+COPY deploy/bin/jaeger-all-in-one /usr/local/bin/jaeger-all-in-one
+RUN chmod +x /usr/local/bin/jaeger-all-in-one
+
+# ── Copy Agent binary and config ─────────────────────────────
+COPY bin/code-agent-linux-arm64 /usr/local/bin/code-agent
+COPY configs/config.allinone.yaml /etc/code-agent/configs/config.yaml
+
+# ── Copy entrypoint script ───────────────────────────────────
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# ── Expose ports ─────────────────────────────────────────────
+# 8080  = Agent HTTP API
+# 6379  = Redis
+# 5432  = PostgreSQL
+# 6333  = Qdrant HTTP API
+# 6334  = Qdrant gRPC
+# 7233  = Temporal Frontend
+# 4317  = Jaeger OTLP gRPC (traces ingest)
+# 16686 = Jaeger UI
+EXPOSE 8080 6379 5432 6333 6334 7233 4317 16686
+
+# ── Volumes for data persistence ─────────────────────────────
+VOLUME ["/var/lib/postgresql/data", "/var/lib/redis", "/var/lib/qdrant"]
+
+# ── Health check ─────────────────────────────────────────────
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -q -O /dev/null http://localhost:8080/healthz || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]

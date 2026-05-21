@@ -1,0 +1,61 @@
+run:
+  timeout: 5m
+  go: "1.22"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errname
+    - errorlint
+    - exportloopref
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+
+linters-settings:
+  govet:
+    shadow: true
+  gosec:
+    excludes:
+      - G104  # Unhandled error (too noisy for _ = err patterns)
+      - G304  # File inclusion (expected for config loading)
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: error-return
+      - name: exported
+      - name: increment-decrement
+      - name: var-naming
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+    disabled-checks:
+      - hugeParam  # We pass structs by value intentionally sometimes
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+        - gocritic
+    - path: internal/temporal/
+      linters:
+        - unused  # Temporal SDK types may appear unused
+  max-issues-per-linter: 50
+  max-same-issues: 5

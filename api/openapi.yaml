@@ -1,0 +1,278 @@
+openapi: 3.0.3
+info:
+  title: Code Intelligence Agent API
+  description: Production-grade Code Intelligence Agent with ReAct reasoning, sandbox execution, RAG, and MCP integration.
+  version: 1.0.0
+  contact:
+    name: Code Agent Team
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Service is alive
+
+  /readyz:
+    get:
+      summary: Readiness probe
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Service is ready
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Prometheus metrics in text format
+
+  /api/v1/auth/token:
+    post:
+      summary: Generate JWT token (admin only)
+      tags: [Authentication]
+      security:
+        - AdminSecret: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+      responses:
+        "200":
+          description: Token generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "403":
+          description: Admin privileges required
+
+  /api/v1/chat:
+    post:
+      summary: Send a message to the agent
+      tags: [Chat]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Agent response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+
+  /api/v1/chat/stream:
+    post:
+      summary: Send a message with SSE streaming response
+      tags: [Chat]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: SSE stream of response chunks
+          content:
+            text/event-stream: {}
+
+  /api/v1/sessions:
+    post:
+      summary: Create a new session
+      tags: [Sessions]
+      responses:
+        "200":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+
+  /api/v1/sessions/{id}:
+    get:
+      summary: Get session details
+      tags: [Sessions]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session details
+    delete:
+      summary: Delete a session
+      tags: [Sessions]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session deleted
+
+  /api/v1/tasks/{id}/approve:
+    post:
+      summary: Approve or reject a suspended task (HITL)
+      tags: [HITL]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalRequest"
+      responses:
+        "200":
+          description: Approval processed
+
+  /api/v1/index:
+    post:
+      summary: Index a code repository for RAG
+      tags: [RAG]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repo_path:
+                  type: string
+                project_name:
+                  type: string
+              required: [repo_path, project_name]
+      responses:
+        "200":
+          description: Indexing started
+
+  /api/v1/ws:
+    get:
+      summary: WebSocket endpoint for real-time communication
+      tags: [WebSocket]
+      responses:
+        "101":
+          description: WebSocket upgrade
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    AdminSecret:
+      type: apiKey
+      in: header
+      name: X-Admin-Secret
+
+  schemas:
+    TokenRequest:
+      type: object
+      properties:
+        user_id:
+          type: string
+        role:
+          type: string
+          enum: [admin, dev, readonly, service]
+        email:
+          type: string
+      required: [user_id, role]
+
+    TokenResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        user_id:
+          type: string
+        role:
+          type: string
+
+    ChatRequest:
+      type: object
+      properties:
+        session_id:
+          type: string
+        message:
+          type: string
+      required: [session_id, message]
+
+    ChatResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        task_id:
+          type: string
+        message:
+          type: string
+        state:
+          type: string
+          enum: [pending, planning, executing, suspended, completed, failed, cancelled]
+        approval:
+          $ref: "#/components/schemas/ApprovalInfo"
+
+    ApprovalInfo:
+      type: object
+      properties:
+        task_id:
+          type: string
+        action:
+          type: string
+        risk_level:
+          type: string
+        details:
+          type: string
+
+    ApprovalRequest:
+      type: object
+      properties:
+        approved:
+          type: boolean
+        reason:
+          type: string
+      required: [approved]
+
+    SessionResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time

@@ -1,0 +1,139 @@
+# ============================================================
+# Code Agent Configuration
+# ============================================================
+
+server:
+  http_addr: ":8080"
+  ws_addr: ":8081"
+  read_timeout: 30s
+  write_timeout: 600s    # ⬆ 60s→600s: ReAct loop may take multiple LLM calls, each up to 5min
+  shutdown_timeout: 30s   # ⬆ 15s→30s: allow in-flight long tasks to drain
+
+llm:
+  primary:
+    provider: "anthropic"
+    api_key: "${CODE_AGENT_LLM_PRIMARY_API_KEY}"  # Set via environment variable
+    model: "claude-opus-4-7"
+    base_url: "https://api.anthropic.com"  # Or your proxy URL
+    max_tokens: 16384     # ⬆ 4096→16384: Opus supports 32K output; 16K per-step for long code gen
+    temperature: 0.1
+    timeout: 300s          # ⬆ 60s→300s: 16K tokens at ~40tok/s ≈ 400s; 300s with streaming safety margin
+  fallback:
+    provider: "ollama"
+    base_url: "http://localhost:11434/v1"
+    model: "qwen2.5-coder:7b"
+    max_tokens: 2048
+    temperature: 0.1
+    timeout: 120s
+  circuit_breaker:
+    max_failures: 5
+    timeout: 30s
+    half_open_max_requests: 2
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 20
+  min_idle_conns: 5
+
+postgres:
+  dsn: "postgres://agent:your_password@localhost:5432/code_agent?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 10
+  conn_max_lifetime: 5m
+
+qdrant:
+  addr: "localhost:6334"
+  collection: "code_embeddings"
+  vector_size: 1536
+  timeout: 10s
+
+temporal:
+  host: "localhost:7233"
+  namespace: "code-agent"
+  task_queue: "agent-tasks"
+  workflow_timeout: 30m
+  activity_timeout: 5m
+
+sandbox:
+  docker_host: "unix:///var/run/docker.sock"
+  default_image: "python:3.12-slim"
+  images:
+    python: "python:3.12-slim"
+    go: "golang:1.23-alpine"
+    node: "node:22-alpine"
+    bash: "alpine:3.20"
+  memory_limit: "512m"
+  cpu_limit: "1.0"
+  timeout: 120s
+  network_mode: "none"
+  workspace_dir: "/workspace"
+
+mcp:
+  servers: []
+  # Example:
+  # - name: "github"
+  #   transport: "stdio"
+  #   command: "npx"
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+rag:
+  chunk_max_tokens: 512
+  overlap_tokens: 64
+  embedding_model: "text-embedding-3-small"
+
+  # Embedding API — requires OpenAI-compatible endpoint (separate from LLM provider).
+  # Override via env: CODE_AGENT_RAG_EMBEDDING_BASE_URL / CODE_AGENT_RAG_EMBEDDING_API_KEY
+  embedding_base_url: "${CODE_AGENT_RAG_EMBEDDING_BASE_URL}"
+  embedding_api_key: "${CODE_AGENT_RAG_EMBEDDING_API_KEY}"
+
+  # Reranking — disabled by default. Enable when cross-encoder model is available.
+  rerank_enabled: false
+  rerank_model: ""
+  rerank_base_url: ""
+  rerank_api_key: ""
+  top_k: 10
+  rerank_top_n: 3
+
+session:
+  max_history_tokens: 32000       # ⬆ 4K→32K: Opus has 200K context; keep rich multi-turn history
+  summary_threshold_tokens: 28000  # ⬆ 3.5K→28K: only summarize when truly approaching budget
+  ttl: 24h
+
+security:
+  sensitive_patterns:
+    - "DROP\\s+DATABASE"
+    - "DROP\\s+TABLE"
+    - "DELETE\\s+FROM\\s+\\w+\\s*$"
+    - "kubectl\\s+delete"
+    - "kubectl\\s+apply"
+    - "rm\\s+-rf\\s+/"
+    - "TRUNCATE"
+  require_approval_commands:
+    - "kubectl apply"
+    - "docker push"
+    - "terraform apply"
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+
+# ─── Authentication ─────────────────────────────────────────
+auth:
+  enabled: false  # Set to true in production
+  jwt_secret: "${CODE_AGENT_AUTH_JWT_SECRET}"  # MUST set via env var
+  jwt_issuer: "code-agent"
+  token_expiry: "24h"
+  refresh_expiry: "168h"
+
+# ─── Distributed Tracing ────────────────────────────────────
+tracing:
+  enabled: true
+  endpoint: "localhost:4317"
+  service_name: "code-agent"
+  sample_rate: 0.1
+  insecure: true

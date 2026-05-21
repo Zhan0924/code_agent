@@ -1,0 +1,66 @@
+# ============================================================
+# Dockerfile.p0test —— P0 优化项集成验证镜像
+# ============================================================
+# 目标：在干净容器环境中重放所有 P0 优化测试，输出可读报告，
+# 包括：
+#   ① go build  —— 编译通过证明 API 兼容；
+#   ② go vet    —— 静态检查，避免引入未使用 import / shadow；
+#   ③ go test -race -v  —— 对 4 个新模块跑全部用例；
+#   ④ go test -bench  —— 性能对比（Cache hit/miss 吞吐对比）。
+#
+# 构建：
+#   docker build -f Dockerfile.p0test -t p0test:latest .
+# 运行：
+#   docker run --rm p0test:latest
+# ============================================================
+# 使用本地已可用的国内镜像源；GOTOOLCHAIN=auto 会自动拉取 go.mod 所需的 1.25 工具链
+FROM docker.1ms.run/golang:1.24-alpine
+
+ENV GOTOOLCHAIN=auto \
+    GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=sum.golang.google.cn
+
+# -race 需要 cgo + gcc；musl-dev 提供 libc headers
+RUN apk add --no-cache git ca-certificates tzdata bash gcc musl-dev
+ENV CGO_ENABLED=1
+
+WORKDIR /app
+
+# 先拉依赖以便 cache
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 拷源码（含 *_test.go）
+COPY . .
+
+# -- 阶段 1：编译（CGO off 确保纯静态二进制）--
+RUN echo "=== [1/4] go build ===" && \
+    CGO_ENABLED=0 go build -o /dev/null ./... && \
+    echo "BUILD OK"
+
+# -- 阶段 2：静态检查 --
+RUN echo "=== [2/4] go vet ===" && \
+    go vet ./internal/skill/... ./internal/rag/... ./internal/orchestrator/... ./internal/sandbox/... && \
+    echo "VET OK"
+
+# 入口：单元测试（包内存隔离） + 端口级集成测试（真实 HTTP）+ benchmark
+CMD ["sh", "-c", "\
+    echo '=== [3/5] go test -race (P0 unit modules) ===' && \
+    go test -race -count=1 -v \
+      ./internal/skill/... \
+      ./internal/rag/... \
+      ./internal/orchestrator/... \
+      ./internal/sandbox/... \
+      -run 'Snapshot|CachedEmbedder|MemLRU|SpeculativeCache|WarmPool|ShouldInvalidateAfter|DefaultWarmPool' && \
+    echo '' && \
+    echo '=== [4/5] go test -race -v (P0 HTTP integration / port-level) ===' && \
+    go test -race -count=1 -v \
+      ./internal/api/... \
+      -run '^TestP0_' && \
+    echo '' && \
+    echo '=== [5/5] go test -bench (throughput) ===' && \
+    go test -bench . -benchmem -run '^$' \
+      ./internal/skill/... \
+      ./internal/rag/... \
+      ./internal/orchestrator/... \
+    "]

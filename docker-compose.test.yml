@@ -1,0 +1,46 @@
+# Test compose: spins up agent + minimum deps on distinct ports/names to avoid
+# colliding with pre-existing containers on this host (code-agent-allinone,
+# redis-stack, etc). Bring up with `docker compose -f docker-compose.test.yml up -d`.
+
+services:
+  agent-p0:
+    image: code-agent:p0-fixes
+    container_name: agent-p0
+    ports:
+      - "28080:8080"   # HTTP API
+    environment:
+      - CODE_AGENT_REDIS_ADDR=redis-p0:6379
+      - CODE_AGENT_QDRANT_ADDR=qdrant-p0:6334
+      # Disable optional deps we don't want to start for basic smoke tests
+      - CODE_AGENT_POSTGRES_DSN=
+      - CODE_AGENT_TEMPORAL_HOST=
+      # Auth off by default for the smoke test — we'll test auth paths
+      # explicitly via setting this true on a follow-up run if needed.
+      - CODE_AGENT_AUTH_ENABLED=false
+      # Tracing off — no OTel collector in this minimal stack.
+      - CODE_AGENT_TRACING_ENABLED=false
+    depends_on:
+      redis-p0:
+        condition: service_healthy
+    restart: "no"
+    networks: [p0-net]
+
+  redis-p0:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: redis-p0
+    command: redis-server --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [p0-net]
+
+  qdrant-p0:
+    image: docker.m.daocloud.io/qdrant/qdrant:v1.12.4
+    container_name: qdrant-p0
+    networks: [p0-net]
+
+networks:
+  p0-net:
+    driver: bridge
