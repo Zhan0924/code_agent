@@ -26,11 +26,12 @@ type StrategyEntry struct {
 // It identifies recurring patterns of tool usage that lead to success and
 // distills them into strategy entries for future sessions.
 type Distiller struct {
-	mu         sync.RWMutex
-	strategies map[string]*StrategyEntry // taskPattern → strategy
-	collector  *Collector
-	minSamples int
-	logger     *zap.Logger
+	mu              sync.RWMutex
+	strategies      map[string]*StrategyEntry // taskPattern → strategy
+	collector       *Collector
+	minSamples      int
+	processedOffset int // tracks how many feedback entries have been processed
+	logger          *zap.Logger
 }
 
 // NewDistiller creates a knowledge distiller backed by a feedback collector.
@@ -46,17 +47,24 @@ func NewDistiller(collector *Collector, logger *zap.Logger) *Distiller {
 // Distill analyzes recent successful sessions and extracts strategy patterns.
 func (d *Distiller) Distill() int {
 	d.collector.mu.Lock()
-	buffer := make([]Feedback, len(d.collector.buffer))
-	copy(buffer, d.collector.buffer)
+	buffer := d.collector.buffer
+	startIdx := d.processedOffset
+	if startIdx >= len(buffer) {
+		d.collector.mu.Unlock()
+		return 0
+	}
+	newFeedback := make([]Feedback, len(buffer)-startIdx)
+	copy(newFeedback, buffer[startIdx:])
+	d.processedOffset = len(buffer)
 	d.collector.mu.Unlock()
 
-	if len(buffer) < d.minSamples {
+	if len(newFeedback) < d.minSamples {
 		return 0
 	}
 
 	// Group feedback by session
 	bySession := make(map[string][]Feedback)
-	for _, fb := range buffer {
+	for _, fb := range newFeedback {
 		bySession[fb.SessionID] = append(bySession[fb.SessionID], fb)
 	}
 

@@ -3,6 +3,7 @@ package multiagent
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/agent/code_agent/internal/planner"
@@ -10,11 +11,14 @@ import (
 )
 
 type mockDispatcher struct {
+	mu    sync.Mutex
 	calls []string
 }
 
 func (m *mockDispatcher) Dispatch(_ context.Context, toolName string, _ json.RawMessage) (string, error) {
+	m.mu.Lock()
 	m.calls = append(m.calls, toolName)
+	m.mu.Unlock()
 	return "ok: " + toolName, nil
 }
 

@@ -122,6 +122,32 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	agent := s.pool.Acquire(agentType)
 	defer s.pool.Release(agent)
 
+	// Pre-check file conflicts before executing write actions
+	if isFileWriteAction(step.Action) {
+		filePath := extractFilePathFromParams(step.Parameters)
+		if filePath != "" {
+			edit := FileEdit{
+				AgentID:   agent.ID,
+				FilePath:  filePath,
+				Action:    step.Action,
+				Timestamp: time.Now(),
+			}
+			if conflict := s.conflictResolver.RecordEdit(edit); conflict != nil {
+				winner := s.conflictResolver.Resolve(conflict)
+				if winner.AgentID != agent.ID {
+					return AgentResult{
+						AgentID:   agent.ID,
+						AgentType: agentType,
+						StepID:    step.ID,
+						Duration:  time.Since(start),
+						Success:   false,
+						Error:     fmt.Sprintf("conflict on %s: resolved in favor of %s", filePath, winner.AgentID),
+					}
+				}
+			}
+		}
+	}
+
 	output, err := agent.Execute(stepCtx, DelegationRequest{
 		StepID:     step.ID,
 		AgentType:  agentType,
@@ -143,26 +169,6 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	} else {
 		result.Success = true
 		result.Output = output
-	}
-
-	// Record file edits for conflict detection on write actions
-	if isFileWriteAction(step.Action) {
-		filePath := extractFilePathFromParams(step.Parameters)
-		if filePath != "" {
-			edit := FileEdit{
-				AgentID:   agent.ID,
-				FilePath:  filePath,
-				Action:    step.Action,
-				Timestamp: time.Now(),
-			}
-			if conflict := s.conflictResolver.RecordEdit(edit); conflict != nil {
-				winner := s.conflictResolver.Resolve(conflict)
-				if winner.AgentID != agent.ID {
-					result.Success = false
-					result.Error = fmt.Sprintf("conflict on %s: resolved in favor of %s", filePath, winner.AgentID)
-				}
-			}
-		}
 	}
 
 	// Record result for dynamic role selection learning

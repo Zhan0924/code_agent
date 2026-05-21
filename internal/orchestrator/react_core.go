@@ -57,6 +57,13 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	// Inject session ID into context for downstream use (e.g., tool feedback recording)
 	ctx = context.WithValue(ctx, ctxKeySessionID, opts.task.SessionID)
 	messages := opts.messages
+
+	// Trigger knowledge distillation on exit (regardless of success/failure/interrupt)
+	defer func() {
+		if o.toolDistiller != nil {
+			o.toolDistiller.Distill()
+		}
+	}()
 	failTracker := &consecutiveFailureTracker{}
 	meta := NewMetacognitiveState()
 	lastToolNames := make(map[string]int) // track tool call frequency for repeat detection
@@ -239,11 +246,6 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		if o.toolPolicy != nil && step > 0 && step%5 == 0 {
 			o.toolPolicy.Update()
 		}
-	}
-
-	// End of ReAct loop: trigger knowledge distillation
-	if o.toolDistiller != nil {
-		o.toolDistiller.Distill()
 	}
 
 	// Step limit exhausted
