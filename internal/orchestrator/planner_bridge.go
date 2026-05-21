@@ -32,6 +32,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// PlanStore abstracts plan persistence so the planner bridge doesn't depend
+// directly on *store.Store (testability + nil-safety).
+type PlanStore interface {
+	SavePlan(ctx context.Context, taskID string, planJSON []byte) error
+	LoadPlan(ctx context.Context, taskID string) ([]byte, error)
+}
+
 // ─── LLM Adapter for Planner ───────────────────────────────────────────────
 
 // llmCallerAdapter adapts llm.Client to the planner.LLMCaller interface.
@@ -133,10 +140,16 @@ func (o *Orchestrator) MaybeUsePlanner(ctx context.Context, task *models.Task) (
 	}
 	metrics.PlannerPlansCreated.Inc()
 
+	// Persist initial plan state
+	o.persistPlan(ctx, task.ID, plan)
+
 	execResult, err := o.planner.executor.Execute(ctx, plan)
 	if err != nil {
 		return nil, false, fmt.Errorf("plan execution: %w", err)
 	}
+
+	// Persist final plan state (with step outputs/statuses)
+	o.persistPlan(ctx, task.ID, execResult.Plan)
 
 	// Record per-step outcomes into metrics for operators to see which step
 	// kinds fail most often.
@@ -238,4 +251,20 @@ func (o *Orchestrator) executePlanStep(ctx context.Context, step planner.Step) (
 		return "", nil
 	}
 	return result.Content, nil
+}
+
+// persistPlan serializes a plan to JSON and saves it via the store.
+// Failures are logged but not propagated — plan persistence is best-effort.
+func (o *Orchestrator) persistPlan(ctx context.Context, taskID string, plan *planner.Plan) {
+	if o.store == nil || plan == nil {
+		return
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		o.logger.Warn("failed to marshal plan for persistence", zap.Error(err))
+		return
+	}
+	if err := o.store.SavePlan(ctx, taskID, data); err != nil {
+		o.logger.Warn("failed to persist plan", zap.String("task_id", taskID), zap.Error(err))
+	}
 }

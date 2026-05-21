@@ -135,6 +135,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			state       TEXT NOT NULL DEFAULT 'pending',
 			user_input  TEXT NOT NULL,
 			result      TEXT,
+			plan_json   JSONB,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			completed_at TIMESTAMPTZ
@@ -177,6 +178,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 			resolved_at TIMESTAMPTZ
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)`,
+
+		// Plan state persistence (added for existing databases)
+		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_json JSONB`,
 	}
 
 	for _, m := range migrations {
@@ -200,6 +204,7 @@ type TaskRecord struct {
 	State       string     `json:"state"`
 	UserInput   string     `json:"user_input"`
 	Result      *string    `json:"result,omitempty"`
+	PlanJSON    *string    `json:"plan_json,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
@@ -231,13 +236,35 @@ func (s *Store) UpdateTaskState(ctx context.Context, taskID, state string, resul
 func (s *Store) GetTask(ctx context.Context, taskID string) (*TaskRecord, error) {
 	var t TaskRecord
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, session_id, user_id, intent, state, user_input, result, created_at, updated_at, completed_at
+		`SELECT id, session_id, user_id, intent, state, user_input, result, plan_json, created_at, updated_at, completed_at
 		 FROM tasks WHERE id=$1`, taskID).
-		Scan(&t.ID, &t.SessionID, &t.UserID, &t.Intent, &t.State, &t.UserInput, &t.Result, &t.CreatedAt, &t.UpdatedAt, &t.CompletedAt)
+		Scan(&t.ID, &t.SessionID, &t.UserID, &t.Intent, &t.State, &t.UserInput, &t.Result, &t.PlanJSON, &t.CreatedAt, &t.UpdatedAt, &t.CompletedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("task not found: %s", taskID)
 	}
 	return &t, err
+}
+
+// SavePlan persists a plan's JSON state for a given task.
+func (s *Store) SavePlan(ctx context.Context, taskID string, planJSON []byte) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET plan_json=$2, updated_at=$3 WHERE id=$1`,
+		taskID, planJSON, time.Now())
+	return err
+}
+
+// LoadPlan retrieves the persisted plan JSON for a task.
+func (s *Store) LoadPlan(ctx context.Context, taskID string) ([]byte, error) {
+	var planJSON *string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT plan_json FROM tasks WHERE id=$1`, taskID).Scan(&planJSON)
+	if err != nil {
+		return nil, err
+	}
+	if planJSON == nil {
+		return nil, nil
+	}
+	return []byte(*planJSON), nil
 }
 
 // ─── Audit Log ───────────────────────────────────────────────────────────────
