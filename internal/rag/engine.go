@@ -87,6 +87,7 @@ func (e *Engine) IndexCode(ctx context.Context, filePath, language, content stri
 
 	// Populate dependency graph for Go files
 	if language == "go" {
+		e.depGraph.RemoveFile(filePath)
 		depInfo := ExtractGoDeps(filePath, content)
 		PopulateDepGraph(e.depGraph, depInfo)
 	}

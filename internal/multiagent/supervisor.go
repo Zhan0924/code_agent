@@ -2,6 +2,7 @@ package multiagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -144,6 +145,26 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 		result.Output = output
 	}
 
+	// Record file edits for conflict detection on write actions
+	if isFileWriteAction(step.Action) {
+		filePath := extractFilePathFromParams(step.Parameters)
+		if filePath != "" {
+			edit := FileEdit{
+				AgentID:   agent.ID,
+				FilePath:  filePath,
+				Action:    step.Action,
+				Timestamp: time.Now(),
+			}
+			if conflict := s.conflictResolver.RecordEdit(edit); conflict != nil {
+				winner := s.conflictResolver.Resolve(conflict)
+				if winner.AgentID != agent.ID {
+					result.Success = false
+					result.Error = fmt.Sprintf("conflict on %s: resolved in favor of %s", filePath, winner.AgentID)
+				}
+			}
+		}
+	}
+
 	// Record result for dynamic role selection learning
 	s.roleSelector.RecordResult(agentType, result.Success, result.Duration)
 
@@ -156,4 +177,29 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	})
 
 	return result
+}
+
+func isFileWriteAction(action string) bool {
+	switch action {
+	case "write_file", "edit_file", "patch_file":
+		return true
+	}
+	return false
+}
+
+func extractFilePathFromParams(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var p struct {
+		FilePath string `json:"file_path"`
+		Path     string `json:"path"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	if p.FilePath != "" {
+		return p.FilePath
+	}
+	return p.Path
 }

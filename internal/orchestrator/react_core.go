@@ -102,6 +102,13 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			}
 		}
 
+		// Knowledge distillation: inject strategy recommendation on first step
+		if o.toolDistiller != nil && step == 0 {
+			if rec := o.toolDistiller.FormatRecommendation(opts.task.UserInput); rec != "" {
+				messages = append(messages, models.Message{Role: models.RoleSystem, Content: rec})
+			}
+		}
+
 		// Token budget check
 		const maxContextTokens = 128000
 		totalTokens := 0
@@ -232,6 +239,11 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		if o.toolPolicy != nil && step > 0 && step%5 == 0 {
 			o.toolPolicy.Update()
 		}
+	}
+
+	// End of ReAct loop: trigger knowledge distillation
+	if o.toolDistiller != nil {
+		o.toolDistiller.Distill()
 	}
 
 	// Step limit exhausted

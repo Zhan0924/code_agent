@@ -219,9 +219,10 @@ func PopulateDepGraph(graph *DepGraph, info *FileDepInfo) {
 	for _, sym := range info.Symbols {
 		qFrom := qualifiedSymbol(info.FilePath, sym)
 		for _, call := range info.CallRefs {
+			qTo := qualifyTarget(info.FilePath, call)
 			graph.AddEdge(DepEdge{
 				From:     qFrom,
-				To:       call,
+				To:       qTo,
 				Kind:     DepCall,
 				FilePath: info.FilePath,
 				Weight:   1.0,
@@ -233,9 +234,10 @@ func PopulateDepGraph(graph *DepGraph, info *FileDepInfo) {
 	for _, sym := range info.Symbols {
 		qFrom := qualifiedSymbol(info.FilePath, sym)
 		for _, ref := range info.TypeRefs {
+			qTo := qualifyTarget(info.FilePath, ref)
 			graph.AddEdge(DepEdge{
 				From:     qFrom,
-				To:       ref,
+				To:       qTo,
 				Kind:     DepType,
 				FilePath: info.FilePath,
 				Weight:   0.6,
@@ -247,9 +249,10 @@ func PopulateDepGraph(graph *DepGraph, info *FileDepInfo) {
 	for _, sym := range info.Symbols {
 		qFrom := qualifiedSymbol(info.FilePath, sym)
 		for _, embed := range info.Embeds {
+			qTo := qualifyTarget(info.FilePath, embed)
 			graph.AddEdge(DepEdge{
 				From:     qFrom,
-				To:       embed,
+				To:       qTo,
 				Kind:     DepEmbed,
 				FilePath: info.FilePath,
 				Weight:   0.8,
@@ -261,13 +264,23 @@ func PopulateDepGraph(graph *DepGraph, info *FileDepInfo) {
 	for _, sym := range info.Symbols {
 		qFrom := qualifiedSymbol(info.FilePath, sym)
 		for _, iface := range info.Implements {
+			qTo := qualifyTarget(info.FilePath, iface)
 			graph.AddEdge(DepEdge{
 				From:     qFrom,
-				To:       iface,
+				To:       qTo,
 				Kind:     DepImplement,
 				FilePath: info.FilePath,
 				Weight:   0.9,
 			})
 		}
 	}
+}
+
+// qualifyTarget qualifies a target symbol: if it contains a dot (cross-package),
+// keep as-is; otherwise qualify with the source file's package.
+func qualifyTarget(filePath, target string) string {
+	if strings.Contains(target, ".") {
+		return target
+	}
+	return qualifiedSymbol(filePath, target)
 }

@@ -87,10 +87,11 @@ type Orchestrator struct {
 	// [P1-D] Project rules loader for workspace-specific LLM guidance
 	ruleLoader *RuleLoader
 
-	// [P2-D] Tool learning: feedback collector + advisor + adaptive policy
+	// [P2-D] Tool learning: feedback collector + advisor + adaptive policy + distiller
 	toolCollector *toollearn.Collector
 	toolAdvisor   *toollearn.Advisor
 	toolPolicy    *toollearn.AdaptivePolicy
+	toolDistiller *toollearn.Distiller
 
 	// HITL: mutex-protected map of taskID → approval channel
 	approvalMu sync.RWMutex
@@ -192,6 +193,7 @@ Always use tools when they would produce better answers. After receiving tool re
 	orch.toolCollector = collector
 	orch.toolAdvisor = toollearn.NewAdvisor(extractor, logger)
 	orch.toolPolicy = toollearn.NewAdaptivePolicy(collector)
+	orch.toolDistiller = toollearn.NewDistiller(collector, logger)
 	if len(pgStore) > 0 && pgStore[0] != nil {
 		orch.store = pgStore[0]
 	}
