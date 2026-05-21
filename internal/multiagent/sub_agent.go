@@ -56,7 +56,7 @@ func (a *SubAgent) Execute(ctx context.Context, req DelegationRequest, dispatche
 	// Default: dispatch using the step's action as the tool name
 	toolName := req.Action
 	if toolName == "" {
-		toolName = string(req.AgentType) + "_execute"
+		return "", fmt.Errorf("no action specified in delegation request for step %s", req.StepID)
 	}
 	if !isAllowed(toolName, allowedTools) {
 		return "", fmt.Errorf("tool %q not allowed for agent type %s", toolName, a.Type)
