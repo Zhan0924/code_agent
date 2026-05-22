@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent/code_agent/internal/agentloop"
 	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/models"
 	"go.uber.org/zap"
@@ -65,6 +66,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		}
 	}()
 	failTracker := &consecutiveFailureTracker{}
+	adaptiveFB := &agentloop.AdaptiveFeedback{}
 	meta := NewMetacognitiveState()
 	lastToolNames := make(map[string]int) // track tool call frequency for repeat detection
 	var lastToolName string               // most recent tool executed (for sequence hints)
@@ -170,67 +172,111 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			Role: models.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
 		})
 
-		// Execute tools
+		// Execute tools — parallel for read-only batches, sequential otherwise
 		var editedFilePaths []string
+
+		// Emit all tool_call events upfront
 		for _, tc := range resp.ToolCalls {
 			sink.Emit(models.ReactStreamEvent{
 				Type: "tool_call", Step: globalStep,
 				ToolName: tc.Name, ToolArgs: string(tc.Args), ToolCallID: tc.ID,
 			})
+		}
 
-			result, execErr := o.executeTool(ctx, tc)
-			content := result.Content
-			if execErr != nil {
-				content = fmt.Sprintf("Error: %v", execErr)
-			}
+		type processedResult struct {
+			tc      models.ToolCall
+			content string
+			isErr   bool
+		}
 
-			// Track edited files for auto-test
-			if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file") && execErr == nil && !result.IsError {
-				var pathReq struct {
-					Path string `json:"path"`
+		var processed []processedResult
+
+		if canParallelExecute(resp.ToolCalls) {
+			// All tools are idempotent — execute concurrently
+			parallelResults := o.parallelExecuteTools(ctx, resp.ToolCalls)
+			for _, pr := range parallelResults {
+				content := pr.result.Content
+				if pr.execErr != nil {
+					content = fmt.Sprintf("Error: %v", pr.execErr)
 				}
-				if json.Unmarshal(tc.Args, &pathReq) == nil && pathReq.Path != "" {
-					editedFilePaths = append(editedFilePaths, pathReq.Path)
-				}
+				processed = append(processed, processedResult{tc: pr.tc, content: content, isErr: (pr.execErr != nil) || (pr.result != nil && pr.result.IsError)})
 			}
+			o.logger.Debug("parallel tool execution", zap.Int("count", len(resp.ToolCalls)))
+		} else {
+			// Sequential execution for write tools or single calls
+			for _, tc := range resp.ToolCalls {
+				result, execErr := o.executeTool(ctx, tc)
+				content := result.Content
+				if execErr != nil {
+					content = fmt.Sprintf("Error: %v", execErr)
+				}
+
+				// Track edited files for auto-test
+				if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file") && execErr == nil && !result.IsError {
+					var pathReq struct {
+						Path string `json:"path"`
+					}
+					if json.Unmarshal(tc.Args, &pathReq) == nil && pathReq.Path != "" {
+						editedFilePaths = append(editedFilePaths, pathReq.Path)
+					}
+				}
+
+				isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
+				processed = append(processed, processedResult{tc: tc, content: content, isErr: isErr})
+			}
+		}
+
+		// Post-process all results uniformly
+		for i := range processed {
+			pr := &processed[i]
 
 			// Smart truncation
-			if llm.EstimateTokens(content) > 8000 {
-				runes := []rune(content)
+			if llm.EstimateTokens(pr.content) > 8000 {
+				runes := []rune(pr.content)
 				if len(runes) > 32000 {
 					headSize := 8000
 					tailSize := 12000
-					content = string(runes[:headSize]) +
+					pr.content = string(runes[:headSize]) +
 						"\n\n... [middle truncated — " + fmt.Sprintf("%d", len(runes)-headSize-tailSize) + " chars omitted] ...\n\n" +
 						string(runes[len(runes)-tailSize:])
 				}
 			}
 
-			isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
+			if !pr.isErr {
+				pr.isErr = strings.Contains(pr.content, "❌ Command FAILED")
+			}
+
+			// Structured error classification and adaptive feedback
+			if pr.isErr {
+				toolErr := agentloop.ClassifyToolError(pr.tc.Name, &models.ToolResult{Content: pr.content, IsError: true}, nil)
+				adaptiveFB.Record(toolErr)
+				feedback := adaptiveFB.BuildFeedback(toolErr)
+				pr.content += "\n\n[SYSTEM HINT] " + feedback
+			}
 
 			// Record outcome in metacognitive state
-			lastToolNames[tc.Name]++
-			meta.RecordOutcome(tc.Name, !isErr, lastToolNames[tc.Name] > 1 && isErr)
-			if isErr {
-				meta.AddUncertainty("recent tool failure: " + tc.Name)
+			lastToolNames[pr.tc.Name]++
+			meta.RecordOutcome(pr.tc.Name, !pr.isErr, lastToolNames[pr.tc.Name] > 1 && pr.isErr)
+			if pr.isErr {
+				meta.AddUncertainty("recent tool failure: " + pr.tc.Name)
 			}
 
 			sink.Emit(models.ReactStreamEvent{
 				Type: "tool_result", Step: globalStep,
-				ToolName: tc.Name, ToolCallID: tc.ID,
-				Content: content, IsError: isErr,
+				ToolName: pr.tc.Name, ToolCallID: pr.tc.ID,
+				Content: pr.content, IsError: pr.isErr,
 			})
 
 			messages = append(messages, models.Message{
-				Role: models.RoleTool, Content: content, ToolCallID: tc.ID,
+				Role: models.RoleTool, Content: pr.content, ToolCallID: pr.tc.ID,
 			})
 
 			// Failure tracking
-			if failTracker.track(tc.Name, isErr) {
-				o.logger.Warn("fix loop detected", zap.String("tool", tc.Name), zap.Int("failures", failTracker.failCount))
+			if failTracker.track(pr.tc.Name, pr.isErr) {
+				o.logger.Warn("fix loop detected", zap.String("tool", pr.tc.Name), zap.Int("failures", failTracker.failCount))
 				messages = append(messages, failTracker.stepBackMessage())
 			}
-			lastToolName = tc.Name
+			lastToolName = pr.tc.Name
 		}
 
 		// Auto-test after file edits
