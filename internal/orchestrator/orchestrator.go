@@ -414,6 +414,12 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 	}, noopSink{})
 
 	if result.done {
+		if o.shouldVerifyOutput(task.Intent, result.stepsUsed) && result.content != "" {
+			vResult, vErr := o.verifyOutput(ctx, task.UserInput, result.content)
+			if vErr == nil && !vResult.Passed {
+				result.content += "\n\n" + formatVerificationFeedback(vResult)
+			}
+		}
 		return result.content, nil
 	}
 
@@ -817,6 +823,12 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 
 			if result.done {
 				if result.content != "" {
+					if o.shouldVerifyOutput(task.Intent, globalStep) {
+						vResult, vErr := o.verifyOutput(ctx, task.UserInput, result.content)
+						if vErr == nil && !vResult.Passed {
+							result.content += "\n\n" + formatVerificationFeedback(vResult)
+						}
+					}
 					_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
 						Role: models.RoleAssistant, Content: result.content,
 					})
