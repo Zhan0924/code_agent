@@ -255,6 +255,8 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				adaptiveFB.Record(toolErr)
 				feedback := adaptiveFB.BuildFeedback(toolErr)
 				pr.content += "\n\n[SYSTEM HINT] " + feedback
+			} else {
+				adaptiveFB.RecordSuccess(pr.tc.Name)
 			}
 
 			// Record outcome in metacognitive state
