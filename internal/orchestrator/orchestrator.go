@@ -18,6 +18,7 @@ import (
 	agentctx "github.com/agent/code_agent/internal/context"
 	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/mcp"
+	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/metrics"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/multiagent"
@@ -123,6 +124,8 @@ type Orchestrator struct {
 
 	// Optional long-term memory store for cross-session context.
 	memoryStore MemoryRetriever
+	// Optional memory extractor for learning from interactions.
+	memoryExtractor *memory.Extractor
 }
 
 // intentCacheEntry stores a cached intent classification result.
@@ -289,6 +292,9 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
 		Role: models.RoleAssistant, Content: response,
 	})
+
+	// Extract memories from this interaction (async, non-blocking)
+	o.extractMemoriesAsync(sessionID, userMessage, response)
 
 	return &models.ChatResponse{
 		SessionID: sessionID, TaskID: task.ID,
@@ -814,6 +820,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 					_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
 						Role: models.RoleAssistant, Content: result.content,
 					})
+					o.extractMemoriesAsync(sessionID, task.UserInput, result.content)
 				}
 				eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
 				return

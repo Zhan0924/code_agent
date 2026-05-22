@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/agent/code_agent/internal/memory"
 	"go.uber.org/zap"
 )
 
@@ -25,6 +27,25 @@ type MemoryEntry struct {
 func (o *Orchestrator) SetMemoryStore(ms MemoryRetriever) {
 	o.memoryStore = ms
 }
+
+// SetMemoryExtractor injects an optional memory extractor for learning from interactions.
+func (o *Orchestrator) SetMemoryExtractor(ext *memory.Extractor) {
+	o.memoryExtractor = ext
+}
+
+// extractMemoriesAsync runs memory extraction in a background goroutine.
+func (o *Orchestrator) extractMemoriesAsync(sessionID, userMsg, assistantMsg string) {
+	if o.memoryExtractor == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), memoryExtractionTimeout)
+		defer cancel()
+		o.memoryExtractor.ExtractFromInteraction(ctx, sessionID, "", userMsg, assistantMsg)
+	}()
+}
+
+const memoryExtractionTimeout = 30 * time.Second
 
 // buildLongTermMemory combines session summary with relevant memories
 // for injection into the prompt's semi-stable region.

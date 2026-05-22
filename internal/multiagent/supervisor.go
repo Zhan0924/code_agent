@@ -32,7 +32,8 @@ type Supervisor struct {
 // SupervisorOption configures optional Supervisor features.
 type SupervisorOption func(*Supervisor)
 
-// WithLLM enables ReAct reasoning in sub-agents.
+// WithLLM sets the LLM caller for ReAct sub-agents.
+// ReAct also requires WithToolExecutor and WithToolProvider to be set.
 func WithLLM(llm agentloop.LLMCaller) SupervisorOption {
 	return func(s *Supervisor) { s.llmCaller = llm }
 }
