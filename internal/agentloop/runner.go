@@ -58,6 +58,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOpts, sink EventSink) RunResul
 	tools := r.toolProv.Definitions()
 
 	failTracker := &ConsecutiveFailureTracker{}
+	adaptiveFB := &AdaptiveFeedback{}
 	meta := NewMetacognitiveState()
 	lastToolNames := make(map[string]int)
 
@@ -168,6 +169,14 @@ func (r *Runner) Run(ctx context.Context, opts RunOpts, sink EventSink) RunResul
 			}
 
 			isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
+
+			// Structured error classification and adaptive feedback
+			if isErr {
+				toolErr := ClassifyToolError(tc.Name, result, execErr)
+				adaptiveFB.Record(toolErr)
+				feedback := adaptiveFB.BuildFeedback(toolErr)
+				content += "\n\n[SYSTEM HINT] " + feedback
+			}
 
 			// Metacognitive tracking
 			lastToolNames[tc.Name]++
