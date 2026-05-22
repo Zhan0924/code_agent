@@ -66,6 +66,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	var lastToolName string               // most recent tool executed (for sequence hints)
 	var toolSequence []string             // ordered tool names for trajectory recording
 	var verificationAttempted bool        // only attempt low-confidence verification once
+	var loopDone bool                     // tracks if loop ended with a final answer
 	globalStep := opts.startStep
 
 	// Trigger knowledge distillation and trajectory recording on exit
@@ -74,8 +75,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			o.toolDistiller.Distill()
 		}
 		if o.trajectoryMem != nil && opts.task.Intent != "" && len(toolSequence) > 0 {
-			success := meta.Confidence >= 0.5
-			o.trajectoryMem.Record(string(opts.task.Intent), toolSequence, success)
+			o.trajectoryMem.Record(string(opts.task.Intent), toolSequence, loopDone)
 		}
 	}()
 
@@ -198,6 +198,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				})
 				continue
 			}
+			loopDone = true
 			return reactCoreResult{content: resp.Content, messages: messages, stepsUsed: step + 1, done: true}
 		}
 

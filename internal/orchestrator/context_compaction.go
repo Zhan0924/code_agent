@@ -56,7 +56,7 @@ func compactEarlyMessages(messages []models.Message, currentStep int) {
 		}
 
 		// Already compacted
-		if strings.Contains(content, "[compacted]") {
+		if strings.Contains(content, "[compacted:") {
 			continue
 		}
 
