@@ -113,10 +113,10 @@ Respond with ONLY a JSON array:
 [{"type": "preference|decision|knowledge|pattern", "content": "...", "importance": 0.0-1.0}]
 
 User message:
-%s
+{{USER_MSG}}
 
 Assistant response:
-%s`
+{{ASSISTANT_MSG}}`
 
 func (e *Extractor) extractWithLLM(ctx context.Context, userMsg, assistantMsg string) []ExtractedMemory {
 	// Truncate inputs to avoid excessive token usage
@@ -124,8 +124,8 @@ func (e *Extractor) extractWithLLM(ctx context.Context, userMsg, assistantMsg st
 	assistTrunc := truncate(assistantMsg, 3000)
 
 	prompt := strings.Replace(
-		strings.Replace(extractionPrompt, "%s", userTrunc, 1),
-		"%s", assistTrunc, 1)
+		strings.Replace(extractionPrompt, "{{USER_MSG}}", userTrunc, 1),
+		"{{ASSISTANT_MSG}}", assistTrunc, 1)
 
 	resp, err := e.llm.ChatCompletion(ctx, &llm.ChatRequest{
 		Messages: []models.Message{
