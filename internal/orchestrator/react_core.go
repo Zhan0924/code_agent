@@ -107,6 +107,11 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			messages = append(messages, *meta.AdaptiveReflectionMessage(globalStep, opts.startStep+opts.maxSteps))
 		}
 
+		// Micro-plan: periodically ask LLM to state its plan
+		if plan := microPlanPrompt(step, opts.maxSteps); plan != nil {
+			messages = append(messages, *plan)
+		}
+
 		// Tool learning: inject context hints from adaptive policy
 		if o.toolPolicy != nil && step > 0 {
 			if hint := o.toolPolicy.FormatContextHint(lastToolName); hint != "" {
