@@ -65,6 +65,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	lastToolNames := make(map[string]int) // track tool call frequency for repeat detection
 	var lastToolName string               // most recent tool executed (for sequence hints)
 	var toolSequence []string             // ordered tool names for trajectory recording
+	var verificationAttempted bool        // only attempt low-confidence verification once
 	globalStep := opts.startStep
 
 	// Trigger knowledge distillation and trajectory recording on exit
@@ -185,6 +186,18 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 
 		// No tool calls = final answer
 		if len(resp.ToolCalls) == 0 {
+			// Low confidence verification: ask LLM to reconsider before committing
+			if meta.NeedsReflection() && step > 2 && !verificationAttempted {
+				verificationAttempted = true
+				messages = append(messages, models.Message{
+					Role: models.RoleAssistant, Content: resp.Content,
+				})
+				messages = append(messages, models.Message{
+					Role:    models.RoleSystem,
+					Content: "[VERIFICATION] 当前置信度较低。在给出最终回答前，请确认：(1) 是否已充分使用工具验证信息？(2) 是否有遗漏的关键步骤？如果确定当前答案正确，重复输出即可。",
+				})
+				continue
+			}
 			return reactCoreResult{content: resp.Content, messages: messages, stepsUsed: step + 1, done: true}
 		}
 
