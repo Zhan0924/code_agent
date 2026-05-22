@@ -59,18 +59,31 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	ctx = context.WithValue(ctx, ctxKeySessionID, opts.task.SessionID)
 	messages := opts.messages
 
-	// Trigger knowledge distillation on exit (regardless of success/failure/interrupt)
-	defer func() {
-		if o.toolDistiller != nil {
-			o.toolDistiller.Distill()
-		}
-	}()
 	failTracker := &consecutiveFailureTracker{}
 	adaptiveFB := &agentloop.AdaptiveFeedback{}
 	meta := NewMetacognitiveState()
 	lastToolNames := make(map[string]int) // track tool call frequency for repeat detection
 	var lastToolName string               // most recent tool executed (for sequence hints)
+	var toolSequence []string             // ordered tool names for trajectory recording
 	globalStep := opts.startStep
+
+	// Trigger knowledge distillation and trajectory recording on exit
+	defer func() {
+		if o.toolDistiller != nil {
+			o.toolDistiller.Distill()
+		}
+		if o.trajectoryMem != nil && opts.task.Intent != "" && len(toolSequence) > 0 {
+			success := meta.Confidence >= 0.5
+			o.trajectoryMem.Record(string(opts.task.Intent), toolSequence, success)
+		}
+	}()
+
+	// Inject trajectory hint from historical successful patterns
+	if o.trajectoryMem != nil && opts.task.Intent != "" {
+		if hint := o.trajectoryMem.FormatHint(string(opts.task.Intent)); hint != "" {
+			messages = append(messages, models.Message{Role: models.RoleSystem, Content: hint})
+		}
+	}
 
 	for step := range opts.maxSteps {
 		globalStep++
@@ -287,6 +300,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				messages = append(messages, failTracker.stepBackMessage())
 			}
 			lastToolName = pr.tc.Name
+			toolSequence = append(toolSequence, pr.tc.Name)
 		}
 
 		// Auto-test after file edits

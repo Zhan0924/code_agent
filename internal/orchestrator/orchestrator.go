@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent/code_agent/internal/agentloop"
 	"github.com/agent/code_agent/internal/config"
 	agentctx "github.com/agent/code_agent/internal/context"
 	"github.com/agent/code_agent/internal/llm"
@@ -126,6 +127,9 @@ type Orchestrator struct {
 	memoryStore MemoryRetriever
 	// Optional memory extractor for learning from interactions.
 	memoryExtractor *memory.Extractor
+
+	// Trajectory memory: records successful tool sequences per intent.
+	trajectoryMem *agentloop.TrajectoryMemory
 }
 
 // intentCacheEntry stores a cached intent classification result.
@@ -183,6 +187,7 @@ Always use tools when they would produce better answers. After receiving tool re
 		toolCache:      NewSpeculativeToolCache(0, logger),
 		ruleLoader:     NewRuleLoader(logger),
 		toolRegistry:   tools.NewRegistry(),
+		trajectoryMem:  agentloop.NewTrajectoryMemory(),
 	}
 
 	// Register built-in tools into the unified registry
