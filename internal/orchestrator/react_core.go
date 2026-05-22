@@ -96,6 +96,9 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 
 		sink.Emit(models.ReactStreamEvent{Type: "step_start", Step: globalStep, TaskID: opts.task.ID, MaxSteps: opts.startStep + opts.maxSteps})
 
+		// Proactive context compaction for long-running loops
+		compactEarlyMessages(messages, step)
+
 		// Reflection checkpoint every 10 steps, plus adaptive reflection when confidence drops
 		if reflection := o.reflectionCheckpoint(step, opts.maxSteps); reflection != nil {
 			messages = append(messages, *reflection)
