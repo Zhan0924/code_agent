@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent/code_agent/internal/agentloop"
 	"github.com/agent/code_agent/internal/metrics"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/multiagent"
@@ -52,6 +53,24 @@ func (a *toolDispatcherAdapter) Dispatch(ctx context.Context, toolName string, a
 	return result.Content, nil
 }
 
+// orchToolExecutor adapts the orchestrator's executeTool to agentloop.ToolExecutor.
+type orchToolExecutor struct {
+	orch *Orchestrator
+}
+
+func (e *orchToolExecutor) Execute(ctx context.Context, tc models.ToolCall) (*models.ToolResult, error) {
+	return e.orch.executeTool(ctx, tc)
+}
+
+// orchToolProvider adapts the orchestrator's tool definitions to agentloop.ToolProvider.
+type orchToolProvider struct {
+	orch *Orchestrator
+}
+
+func (p *orchToolProvider) Definitions() []models.ToolDefinition {
+	return p.orch.getAvailableTools()
+}
+
 // AttachSupervisor wires the multi-agent Supervisor into the orchestrator.
 // Call after NewOrchestrator and before the first ProcessMessage.
 func (o *Orchestrator) AttachSupervisor(sup *multiagent.Supervisor) {
@@ -66,6 +85,20 @@ func (o *Orchestrator) AttachSupervisor(sup *multiagent.Supervisor) {
 // the orchestrator's tool execution pipeline.
 func (o *Orchestrator) NewToolDispatcherAdapter() multiagent.ToolDispatcher {
 	return &toolDispatcherAdapter{orch: o}
+}
+
+// NewSupervisorWithReAct creates a Supervisor with full ReAct capabilities
+// injected from the orchestrator's LLM client and tool registry.
+func (o *Orchestrator) NewSupervisorWithReAct(config multiagent.SupervisorConfig) *multiagent.Supervisor {
+	return multiagent.NewSupervisor(
+		o.NewToolDispatcherAdapter(),
+		config,
+		o.logger,
+		multiagent.WithLLM(o.llmClient),
+		multiagent.WithToolExecutor(&orchToolExecutor{orch: o}),
+		multiagent.WithToolProvider(&orchToolProvider{orch: o}),
+		multiagent.WithEventSink(agentloop.NoopSink{}),
+	)
 }
 
 // planHasParallelism checks if a plan's DAG has at least one level with

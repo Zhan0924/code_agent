@@ -7,13 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent/code_agent/internal/agentloop"
 	"github.com/agent/code_agent/internal/planner"
 	"go.uber.org/zap"
 )
 
 // Supervisor orchestrates multiple sub-agents to complete a complex task.
-// It receives a plan (DAG), assigns steps to specialized sub-agents based on
-// step type, and coordinates their execution with bounded parallelism.
 type Supervisor struct {
 	pool             *AgentPool
 	bus              *MessageBus
@@ -22,11 +21,40 @@ type Supervisor struct {
 	roleSelector     *RoleSelector
 	config           SupervisorConfig
 	logger           *zap.Logger
+
+	// Optional dependencies for ReAct-capable sub-agents
+	llmCaller    agentloop.LLMCaller
+	toolExecutor agentloop.ToolExecutor
+	toolProvider agentloop.ToolProvider
+	eventSink    agentloop.EventSink
+}
+
+// SupervisorOption configures optional Supervisor features.
+type SupervisorOption func(*Supervisor)
+
+// WithLLM enables ReAct reasoning in sub-agents.
+func WithLLM(llm agentloop.LLMCaller) SupervisorOption {
+	return func(s *Supervisor) { s.llmCaller = llm }
+}
+
+// WithToolExecutor sets the tool executor for ReAct sub-agents.
+func WithToolExecutor(te agentloop.ToolExecutor) SupervisorOption {
+	return func(s *Supervisor) { s.toolExecutor = te }
+}
+
+// WithToolProvider sets the tool provider for ReAct sub-agents.
+func WithToolProvider(tp agentloop.ToolProvider) SupervisorOption {
+	return func(s *Supervisor) { s.toolProvider = tp }
+}
+
+// WithEventSink sets the event sink for ReAct sub-agents.
+func WithEventSink(sink agentloop.EventSink) SupervisorOption {
+	return func(s *Supervisor) { s.eventSink = sink }
 }
 
 // NewSupervisor creates a multi-agent supervisor.
-func NewSupervisor(dispatcher ToolDispatcher, config SupervisorConfig, logger *zap.Logger) *Supervisor {
-	return &Supervisor{
+func NewSupervisor(dispatcher ToolDispatcher, config SupervisorConfig, logger *zap.Logger, opts ...SupervisorOption) *Supervisor {
+	s := &Supervisor{
 		pool:             NewAgentPool(config.MaxParallel, logger),
 		bus:              NewMessageBus(logger),
 		dispatcher:       dispatcher,
@@ -35,6 +63,10 @@ func NewSupervisor(dispatcher ToolDispatcher, config SupervisorConfig, logger *z
 		config:           config,
 		logger:           logger.With(zap.String("component", "multiagent.supervisor")),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // SupervisorResult holds the outcome of a supervised multi-agent execution.
@@ -110,8 +142,20 @@ func (s *Supervisor) executeLevel(ctx context.Context, steps []planner.Step) ([]
 	return results, nil
 }
 
+// buildAgentDeps constructs AgentDeps if LLM and tool deps are all available.
+func (s *Supervisor) buildAgentDeps() *AgentDeps {
+	if s.llmCaller == nil || s.toolExecutor == nil || s.toolProvider == nil {
+		return nil
+	}
+	return &AgentDeps{
+		LLM:          s.llmCaller,
+		ToolExecutor: s.toolExecutor,
+		ToolProvider: s.toolProvider,
+		EventSink:    s.eventSink,
+	}
+}
+
 func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentResult {
-	// Use dynamic role selection instead of static classification
 	candidates := CandidatesForAction(step.Action)
 	agentType := s.roleSelector.SelectBest(step.Action, candidates)
 	start := time.Now()
@@ -122,7 +166,6 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	agent := s.pool.Acquire(agentType)
 	defer s.pool.Release(agent)
 
-	// Pre-check file conflicts before executing write actions
 	var conflictBlocked bool
 	var conflictMsg string
 	if isFileWriteAction(step.Action) {
@@ -155,13 +198,17 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 		result.Error = conflictMsg
 		result.Duration = time.Since(start)
 	} else {
-		output, err := agent.Execute(stepCtx, DelegationRequest{
-			StepID:     step.ID,
-			AgentType:  agentType,
-			Action:     step.Action,
-			Task:       step.Description,
-			Parameters: step.Parameters,
-		}, s.dispatcher)
+		req := DelegationRequest{
+			StepID:            step.ID,
+			AgentType:         agentType,
+			Action:            step.Action,
+			Task:              step.Description,
+			Parameters:        step.Parameters,
+			ReasoningRequired: step.ReasoningRequired,
+		}
+
+		deps := s.buildAgentDeps()
+		output, err := agent.ExecuteWithDeps(stepCtx, req, s.dispatcher, deps)
 
 		result.Duration = time.Since(start)
 		if err != nil {
@@ -173,7 +220,6 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 		}
 	}
 
-	// Record result for dynamic role selection learning
 	s.roleSelector.RecordResult(agentType, result.Success, result.Duration)
 
 	s.bus.Publish(Message{

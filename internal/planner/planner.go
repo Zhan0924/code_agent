@@ -29,15 +29,16 @@ type Plan struct {
 
 // Step is a single action in the execution plan with dependency tracking.
 type Step struct {
-	ID          string          `json:"id"`
-	Action      string          `json:"action"`      // e.g. "read_file", "write_file", "execute_code", "search_code"
-	Description string          `json:"description"` // human-readable explanation
-	Parameters  json.RawMessage `json:"parameters,omitempty"`
-	DependsOn   []string        `json:"depends_on,omitempty"` // IDs of prerequisite steps
-	Status      StepStatus      `json:"status"`
-	Output      string          `json:"output,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	Duration    time.Duration   `json:"duration,omitempty"`
+	ID                string          `json:"id"`
+	Action            string          `json:"action"`      // e.g. "read_file", "write_file", "execute_code", "search_code"
+	Description       string          `json:"description"` // human-readable explanation
+	Parameters        json.RawMessage `json:"parameters,omitempty"`
+	DependsOn         []string        `json:"depends_on,omitempty"` // IDs of prerequisite steps
+	Status            StepStatus      `json:"status"`
+	Output            string          `json:"output,omitempty"`
+	Error             string          `json:"error,omitempty"`
+	Duration          time.Duration   `json:"duration,omitempty"`
+	ReasoningRequired bool            `json:"reasoning_required,omitempty"`
 }
 
 // StepStatus tracks the lifecycle of a plan step.

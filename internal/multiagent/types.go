@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/agent/code_agent/internal/agentloop"
 )
 
 // AgentType defines the specialization of a sub-agent.
@@ -29,14 +31,23 @@ type AgentResult struct {
 
 // DelegationRequest describes work to be delegated to a sub-agent.
 type DelegationRequest struct {
-	StepID       string          `json:"step_id"`
-	AgentType    AgentType       `json:"agent_type"`
-	Action       string          `json:"action"`
-	Task         string          `json:"task"`
-	Parameters   json.RawMessage `json:"parameters,omitempty"`
-	Context      string          `json:"context,omitempty"`
-	Timeout      time.Duration   `json:"timeout,omitempty"`
-	AllowedTools []string        `json:"allowed_tools,omitempty"`
+	StepID            string          `json:"step_id"`
+	AgentType         AgentType       `json:"agent_type"`
+	Action            string          `json:"action"`
+	Task              string          `json:"task"`
+	Parameters        json.RawMessage `json:"parameters,omitempty"`
+	Context           string          `json:"context,omitempty"`
+	Timeout           time.Duration   `json:"timeout,omitempty"`
+	AllowedTools      []string        `json:"allowed_tools,omitempty"`
+	ReasoningRequired bool            `json:"reasoning_required,omitempty"`
+}
+
+// AgentDeps bundles the dependencies a SubAgent needs for ReAct execution.
+type AgentDeps struct {
+	LLM          agentloop.LLMCaller
+	ToolExecutor agentloop.ToolExecutor
+	ToolProvider agentloop.ToolProvider
+	EventSink    agentloop.EventSink
 }
 
 // SupervisorConfig configures the multi-agent supervisor.
