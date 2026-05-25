@@ -70,6 +70,7 @@ import (
 	"github.com/agent/code_agent/internal/skill"
 	"github.com/agent/code_agent/internal/store"
 	temporalpkg "github.com/agent/code_agent/internal/temporal"
+	"github.com/agent/code_agent/internal/tools"
 	"github.com/agent/code_agent/internal/tracing"
 	"github.com/agent/code_agent/internal/workspace"
 	"github.com/redis/go-redis/v9"
@@ -345,6 +346,34 @@ func main() {
 	orch.SetSkillRegistry(skillReg)
 	apiServer.SetSkillRegistry(skillReg)
 	logger.Info("skill registry initialized and wired into orchestrator + API")
+
+	// ─── Wire Store into API Server (for dynamic tool persistence) ───────
+	if pgStore != nil {
+		apiServer.SetStore(pgStore)
+		logger.Info("PostgreSQL store wired into API server for dynamic tool persistence")
+
+		// Load persisted dynamic tools on startup
+		if records, err := pgStore.LoadDynamicTools(context.Background()); err == nil {
+			for _, rec := range records {
+				dtCfg := tools.DynamicToolConfig{
+					Name:           rec.Name,
+					Description:    rec.Description,
+					Parameters:     rec.Parameters,
+					ExecutorType:   tools.ExecutorType(rec.ExecutorType),
+					ExecutorConfig: rec.ExecutorConfig,
+					RiskLevel:      rec.RiskLevel,
+					CreatedAt:      rec.CreatedAt,
+				}
+				if tool, err := tools.NewDynamicTool(dtCfg); err == nil {
+					if err := orch.RegisterDynamicTool(tool); err == nil {
+						logger.Info("loaded dynamic tool from DB", zap.String("name", rec.Name))
+					}
+				}
+			}
+		} else {
+			logger.Warn("failed to load dynamic tools from DB", zap.Error(err))
+		}
+	}
 
 	// ─── MCP Gateway → API Server ────────────────────────────────────────
 	if mcpGateway != nil {

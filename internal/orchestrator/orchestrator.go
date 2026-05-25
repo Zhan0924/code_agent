@@ -220,7 +220,12 @@ Always use tools when they would produce better answers. After receiving tool re
 //	        execute each tool → append results to messages
 //	    else:
 //	        return response.content  // LLM decided it's done
-func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessage string) (*models.ChatResponse, error) {
+// ProcessOptions holds optional parameters for ProcessMessage and streaming variants.
+type ProcessOptions struct {
+	OutputFormat *models.ResponseFormat
+}
+
+func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessage string, opts ...ProcessOptions) (*models.ChatResponse, error) {
 	task := &models.Task{
 		ID:        uuid.New().String(),
 		SessionID: sessionID,
@@ -228,6 +233,9 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 		State:     models.TaskStatePending,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
+	}
+	if len(opts) > 0 {
+		task.OutputFormat = opts[0].OutputFormat
 	}
 
 	o.logger.Info("processing message", zap.String("task_id", task.ID), zap.String("session_id", sessionID))
@@ -410,12 +418,13 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 
 	// Delegate to shared core loop
 	result := o.reactLoopCore(ctx, reactCoreOpts{
-		task:        task,
-		messages:    messages,
-		tools:       tools,
-		maxSteps:    getMaxSteps(task.Intent),
-		startStep:   0,
-		interruptCh: interruptCh,
+		task:           task,
+		messages:       messages,
+		tools:          tools,
+		maxSteps:       getMaxSteps(task.Intent),
+		startStep:      0,
+		interruptCh:    interruptCh,
+		responseFormat: task.OutputFormat,
 	}, noopSink{})
 
 	if result.done {
@@ -719,7 +728,7 @@ func (o *Orchestrator) ProcessMessageStream(ctx context.Context, sessionID, user
 // ProcessMessageStreamFull processes a message with the full ReAct loop,
 // emitting structured ReactStreamEvent for each step (intent, thinking, tool_call, tool_result, message).
 // This provides the frontend with complete visibility into the agent's reasoning process.
-func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, userMessage string) (<-chan models.ReactStreamEvent, error) {
+func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, userMessage string, opts ...ProcessOptions) (<-chan models.ReactStreamEvent, error) {
 	eventCh := make(chan models.ReactStreamEvent, 64)
 
 	// Store user message
@@ -746,6 +755,9 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			Intent:    intent,
 			State:     models.TaskStatePlanning,
 			CreatedAt: time.Now(),
+		}
+		if len(opts) > 0 {
+			task.OutputFormat = opts[0].OutputFormat
 		}
 
 		if !skipHITL(ctx) && (o.containsSensitiveContent(userMessage) || intent == models.IntentDeploy) {
@@ -815,12 +827,13 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			}
 
 			result := o.reactLoopCore(ctx, reactCoreOpts{
-				task:        task,
-				messages:    messages,
-				tools:       tools,
-				maxSteps:    batchLimit,
-				startStep:   globalStep,
-				interruptCh: interruptCh,
+				task:           task,
+				messages:       messages,
+				tools:          tools,
+				maxSteps:       batchLimit,
+				startStep:      globalStep,
+				interruptCh:    interruptCh,
+				responseFormat: task.OutputFormat,
 			}, sink)
 
 			messages = result.messages
@@ -1527,4 +1540,28 @@ func statusLabel(err error) string {
 		return "error"
 	}
 	return "success"
+}
+
+// RegisterDynamicTool registers a dynamic tool into the tool registry.
+func (o *Orchestrator) RegisterDynamicTool(tool tools.Tool) error {
+	if o.toolRegistry == nil {
+		return fmt.Errorf("tool registry not initialized")
+	}
+	return o.toolRegistry.Register(tool)
+}
+
+// UnregisterDynamicTool removes a dynamic tool from the registry by name.
+func (o *Orchestrator) UnregisterDynamicTool(name string) bool {
+	if o.toolRegistry == nil {
+		return false
+	}
+	return o.toolRegistry.Unregister(name)
+}
+
+// GetTool retrieves a tool by name from the registry.
+func (o *Orchestrator) GetTool(name string) (tools.Tool, bool) {
+	if o.toolRegistry == nil {
+		return nil, false
+	}
+	return o.toolRegistry.Get(name)
 }

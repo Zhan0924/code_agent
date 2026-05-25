@@ -93,6 +93,11 @@ func (p *openaiProvider) ChatCompletion(ctx context.Context, req *ChatRequest) (
 		apiReq.Tools = p.convertTools(req.Tools)
 	}
 
+	// Add response format if provided
+	if req.ResponseFormat != nil {
+		apiReq.ResponseFormat = p.convertResponseFormat(req.ResponseFormat)
+	}
+
 	if apiReq.MaxTokens == 0 {
 		apiReq.MaxTokens = p.cfg.MaxTokens
 	}
@@ -155,6 +160,11 @@ func (p *openaiProvider) ChatCompletionStream(ctx context.Context, req *ChatRequ
 
 	if len(req.Tools) > 0 {
 		apiReq.Tools = p.convertTools(req.Tools)
+	}
+
+	// Add response format if provided
+	if req.ResponseFormat != nil {
+		apiReq.ResponseFormat = p.convertResponseFormat(req.ResponseFormat)
 	}
 
 	if apiReq.MaxTokens == 0 {
@@ -275,5 +285,27 @@ func (p *openaiProvider) convertTools(tools []models.ToolDefinition) []openai.To
 			},
 		})
 	}
+	return result
+}
+
+// convertResponseFormat converts internal ResponseFormat to OpenAI response_format.
+func (p *openaiProvider) convertResponseFormat(rf *models.ResponseFormat) *openai.ChatCompletionResponseFormat {
+	if rf == nil {
+		return nil
+	}
+
+	result := &openai.ChatCompletionResponseFormat{
+		Type: openai.ChatCompletionResponseFormatType(rf.Type),
+	}
+
+	if rf.JSONSchema != nil {
+		result.JSONSchema = &openai.ChatCompletionResponseFormatJSONSchema{
+			Name:        rf.JSONSchema.Name,
+			Description: rf.JSONSchema.Description,
+			Schema:      json.RawMessage(rf.JSONSchema.Schema),
+			Strict:      rf.JSONSchema.Strict,
+		}
+	}
+
 	return result
 }

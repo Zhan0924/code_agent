@@ -75,11 +75,12 @@ type Provider interface {
 
 // ChatRequest is the unified request format sent to any LLM provider.
 type ChatRequest struct {
-	Messages    []models.Message        `json:"messages"`
-	Tools       []models.ToolDefinition `json:"tools,omitempty"`
-	MaxTokens   int                     `json:"max_tokens,omitempty"`
-	Temperature float32                 `json:"temperature,omitempty"`
-	Model       string                  `json:"model,omitempty"`
+	Messages       []models.Message        `json:"messages"`
+	Tools          []models.ToolDefinition `json:"tools,omitempty"`
+	MaxTokens      int                     `json:"max_tokens,omitempty"`
+	Temperature    float32                 `json:"temperature,omitempty"`
+	Model          string                  `json:"model,omitempty"`
+	ResponseFormat *models.ResponseFormat  `json:"response_format,omitempty"`
 }
 
 // ChatResponse is the unified response from an LLM provider.

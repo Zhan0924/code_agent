@@ -79,17 +79,18 @@ const (
 
 // Task represents a single unit of work managed by the orchestrator.
 type Task struct {
-	ID          string          `json:"id"`
-	SessionID   string          `json:"session_id"`
-	UserInput   string          `json:"user_input"`
-	Intent      TaskIntent      `json:"intent"`
-	State       TaskState       `json:"state"`
-	Plan        *ExecutionPlan  `json:"plan,omitempty"`
-	Result      *TaskResult     `json:"result,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at"`
-	CompletedAt *time.Time      `json:"completed_at,omitempty"`
+	ID           string          `json:"id"`
+	SessionID    string          `json:"session_id"`
+	UserInput    string          `json:"user_input"`
+	Intent       TaskIntent      `json:"intent"`
+	State        TaskState       `json:"state"`
+	Plan         *ExecutionPlan  `json:"plan,omitempty"`
+	Result       *TaskResult     `json:"result,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	OutputFormat *ResponseFormat `json:"output_format,omitempty"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+	CompletedAt  *time.Time      `json:"completed_at,omitempty"`
 }
 
 // ExecutionPlan describes the sequence of steps the agent plans to execute.
@@ -254,13 +255,39 @@ type ApprovalResponse struct {
 	Params   json.RawMessage `json:"params,omitempty"` // optional additional parameters
 }
 
+// ─── Structured Output Models ────────────────────────────────────────────────
+
+// ResponseFormatType defines the output format type for LLM responses.
+type ResponseFormatType string
+
+const (
+	ResponseFormatText       ResponseFormatType = "text"
+	ResponseFormatJSONObject ResponseFormatType = "json_object"
+	ResponseFormatJSONSchema ResponseFormatType = "json_schema"
+)
+
+// ResponseFormat defines LLM output format constraints (maps to OpenAI response_format).
+type ResponseFormat struct {
+	Type       ResponseFormatType `json:"type"`
+	JSONSchema *JSONSchemaFormat  `json:"json_schema,omitempty"`
+}
+
+// JSONSchemaFormat defines the JSON Schema constraint for structured output.
+type JSONSchemaFormat struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema"`
+	Strict      bool            `json:"strict"`
+}
+
 // ─── API Request/Response Models ──────────────────────────────────────────────
 
 // ChatRequest is the API request body for the chat endpoint.
 type ChatRequest struct {
-	SessionID string `json:"session_id,omitempty"`
-	Message   string `json:"message" binding:"required"`
-	Stream    bool   `json:"stream"`
+	SessionID    string          `json:"session_id,omitempty"`
+	Message      string          `json:"message" binding:"required"`
+	Stream       bool            `json:"stream"`
+	OutputFormat *ResponseFormat `json:"output_format,omitempty"`
 }
 
 // ChatResponse is the API response for the chat endpoint.

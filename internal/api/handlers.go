@@ -143,7 +143,7 @@ func (s *Server) handleChat(c *gin.Context) {
 	resultCh := make(chan chatResult, 1)
 
 	go func() {
-		resp, err := s.orchestrator.ProcessMessage(agentCtx, sessionID, req.Message)
+		resp, err := s.orchestrator.ProcessMessage(agentCtx, sessionID, req.Message, orchestrator.ProcessOptions{OutputFormat: req.OutputFormat})
 		resultCh <- chatResult{resp: resp, err: err}
 	}()
 
@@ -274,7 +274,7 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 	s.sendSSEEvent(c, models.StreamEvent{Type: "session", Data: sessData})
 
 	// Use full ReAct streaming
-	eventCh, err := s.orchestrator.ProcessMessageStreamFull(c.Request.Context(), sessionID, req.Message)
+	eventCh, err := s.orchestrator.ProcessMessageStreamFull(c.Request.Context(), sessionID, req.Message, orchestrator.ProcessOptions{OutputFormat: req.OutputFormat})
 	if err != nil {
 		errData, _ := json.Marshal(map[string]string{"error": err.Error()})
 		s.sendSSEEvent(c, models.StreamEvent{Type: "error", Data: errData})

@@ -181,6 +181,19 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 		// Plan state persistence (added for existing databases)
 		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_json JSONB`,
+
+		// Dynamic tools table
+		`CREATE TABLE IF NOT EXISTS dynamic_tools (
+			name TEXT PRIMARY KEY,
+			description TEXT NOT NULL,
+			parameters JSONB NOT NULL,
+			executor_type TEXT NOT NULL,
+			executor_config JSONB NOT NULL,
+			risk_level INTEGER NOT NULL DEFAULT 0,
+			ttl BIGINT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_dynamic_tools_ttl ON dynamic_tools(created_at, ttl) WHERE ttl IS NOT NULL`,
 	}
 
 	for _, m := range migrations {
@@ -345,4 +358,74 @@ func (s *Store) GetPendingApprovals(ctx context.Context) ([]*ApprovalRecord, err
 // Ping checks database connectivity.
 func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
+}
+
+// ─── Dynamic Tools CRUD ─────────────────────────────────────────────────────
+
+// DynamicToolRecord represents a persisted dynamic tool configuration.
+type DynamicToolRecord struct {
+	Name           string          `json:"name"`
+	Description    string          `json:"description"`
+	Parameters     json.RawMessage `json:"parameters"`
+	ExecutorType   string          `json:"executor_type"`
+	ExecutorConfig json.RawMessage `json:"executor_config"`
+	RiskLevel      int             `json:"risk_level"`
+	TTLSeconds     *int64          `json:"ttl_seconds,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// SaveDynamicTool persists a dynamic tool configuration (upsert).
+func (s *Store) SaveDynamicTool(ctx context.Context, rec *DynamicToolRecord) error {
+	query := `
+		INSERT INTO dynamic_tools (name, description, parameters, executor_type, executor_config, risk_level, ttl, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (name) DO UPDATE SET
+			description = EXCLUDED.description,
+			parameters = EXCLUDED.parameters,
+			executor_type = EXCLUDED.executor_type,
+			executor_config = EXCLUDED.executor_config,
+			risk_level = EXCLUDED.risk_level,
+			ttl = EXCLUDED.ttl,
+			created_at = EXCLUDED.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		rec.Name, rec.Description, rec.Parameters,
+		rec.ExecutorType, rec.ExecutorConfig, rec.RiskLevel,
+		rec.TTLSeconds, rec.CreatedAt,
+	)
+	return err
+}
+
+// LoadDynamicTools returns all non-expired dynamic tool configurations.
+func (s *Store) LoadDynamicTools(ctx context.Context) ([]*DynamicToolRecord, error) {
+	query := `
+		SELECT name, description, parameters, executor_type, executor_config, risk_level, ttl, created_at
+		FROM dynamic_tools
+		WHERE ttl IS NULL OR (created_at + (ttl || ' seconds')::interval) > NOW()
+	`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []*DynamicToolRecord
+	for rows.Next() {
+		var rec DynamicToolRecord
+		if err := rows.Scan(
+			&rec.Name, &rec.Description, &rec.Parameters,
+			&rec.ExecutorType, &rec.ExecutorConfig, &rec.RiskLevel,
+			&rec.TTLSeconds, &rec.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, &rec)
+	}
+	return results, rows.Err()
+}
+
+// DeleteDynamicTool removes a dynamic tool by name.
+func (s *Store) DeleteDynamicTool(ctx context.Context, name string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM dynamic_tools WHERE name = $1`, name)
+	return err
 }

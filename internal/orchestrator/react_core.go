@@ -34,12 +34,13 @@ func (s *channelSink) Emit(e models.ReactStreamEvent) { s.ch <- e }
 
 // reactCoreOpts configures the shared ReAct loop.
 type reactCoreOpts struct {
-	task        *models.Task
-	messages    []models.Message
-	tools       []models.ToolDefinition
-	maxSteps    int
-	startStep   int // for auto-continue: the global step offset
-	interruptCh chan InterruptSignal
+	task           *models.Task
+	messages       []models.Message
+	tools          []models.ToolDefinition
+	maxSteps       int
+	startStep      int // for auto-continue: the global step offset
+	interruptCh    chan InterruptSignal
+	responseFormat *models.ResponseFormat
 }
 
 // reactCoreResult holds the outcome of a single batch of ReAct steps.
@@ -154,10 +155,13 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		// LLM call with retry
 		var resp *llm.ChatResponse
 		var llmErr error
+		llmReq := &llm.ChatRequest{
+			Messages:       messages,
+			Tools:          opts.tools,
+			ResponseFormat: opts.responseFormat,
+		}
 		for attempt := range 3 {
-			resp, llmErr = o.llmClient.ChatCompletion(ctx, &llm.ChatRequest{
-				Messages: messages, Tools: opts.tools,
-			})
+			resp, llmErr = o.llmClient.ChatCompletion(ctx, llmReq)
 			if llmErr == nil {
 				break
 			}

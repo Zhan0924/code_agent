@@ -55,6 +55,7 @@ import (
 	"github.com/agent/code_agent/internal/security"
 	"github.com/agent/code_agent/internal/session"
 	"github.com/agent/code_agent/internal/skill"
+	"github.com/agent/code_agent/internal/store"
 	"github.com/agent/code_agent/internal/tracing"
 	"github.com/agent/code_agent/internal/workspace"
 	"github.com/gin-gonic/gin"
@@ -81,6 +82,7 @@ type Server struct {
 	apiKeys       *auth.APIKeyStore
 	authEnabled   bool
 	pgHealthPing  func(ctx context.Context) error // 可选 PG 健康检查
+	store         *store.Store                     // 可选 PG 持久化（动态工具等）
 	p0            *P0Probes                       // [P0-debug] 可观测探针（可选）
 	logger        *zap.Logger
 }
@@ -144,6 +146,11 @@ func (s *Server) SetMCPGateway(gw *mcp.Gateway) {
 // SetSkillRegistry injects the skill registry for dynamic skill management.
 func (s *Server) SetSkillRegistry(sr *skill.Registry) {
 	s.skillRegistry = sr
+}
+
+// SetStore injects the PostgreSQL store for persistence (dynamic tools, etc.).
+func (s *Server) SetStore(st *store.Store) {
+	s.store = st
 }
 
 // GetAvailableTools returns all tools from MCP + Skills (used by handlers).
@@ -267,6 +274,15 @@ func (s *Server) setupRoutes() {
 
 		// ─── Unified Tools List ──────────────────────────────────────
 		v1.GET("/tools", s.handleListTools)
+
+		// Dynamic Tool Management
+		toolsGroup := v1.Group("/tools/dynamic")
+		if s.authEnabled {
+			toolsGroup.Use(auth.RequireRole(auth.RoleAdmin, auth.RoleDev))
+		}
+		toolsGroup.POST("", s.handleRegisterDynamicTool)
+		toolsGroup.GET("/:name", s.handleGetDynamicTool)
+		toolsGroup.DELETE("/:name", s.handleUnregisterDynamicTool)
 
 		// ─── P0 优化可观测 / 调试端点 ─────────────────────────────────
 		// 用于集成测试（端口级）验证 P0-1/2/3/4 在 HTTP 服务运行时生效。
