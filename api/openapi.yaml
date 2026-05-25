@@ -231,9 +231,36 @@ components:
         message:
           type: string
         output_format:
-          type: string
-          description: "Optional output format control (e.g., 'json_object', 'json_schema')"
+          $ref: "#/components/schemas/ResponseFormat"
       required: [session_id, message]
+
+    ResponseFormat:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [text, json_object, json_schema]
+          description: "Output format type"
+        json_schema:
+          $ref: "#/components/schemas/JSONSchemaFormat"
+      required: [type]
+
+    JSONSchemaFormat:
+      type: object
+      properties:
+        name:
+          type: string
+          description: "Schema name"
+        description:
+          type: string
+          description: "Schema description"
+        schema:
+          type: object
+          description: "JSON Schema definition"
+        strict:
+          type: boolean
+          description: "Enable strict schema validation"
+      required: [name, schema]
 
     ChatResponse:
       type: object

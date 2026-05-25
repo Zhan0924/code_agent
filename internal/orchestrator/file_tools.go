@@ -160,7 +160,7 @@ func (o *Orchestrator) SetWorkspaceManager(wm *workspace.Manager) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tool Definitions (registered in getAvailableTools)
+// Tool Definitions (registered in RegisterFileTools)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func fileToolDefinitions() []models.ToolDefinition {
