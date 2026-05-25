@@ -43,6 +43,7 @@ import (
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/client"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -289,6 +290,11 @@ func (p *WarmPool) createPooled(ctx context.Context, lang string) (*PooledContai
 	}
 
 	name := fmt.Sprintf("sandbox-warm-%s-%s", lang, uuid.New().String()[:8])
+	pidsLimit := int64(256)
+	workspaceDir := p.sbCfg.WorkspaceDir
+	if workspaceDir == "" {
+		workspaceDir = "/workspace"
+	}
 	resp, err := p.cli.ContainerCreate(ctx,
 		&container.Config{
 			Image:      imageName,
@@ -299,10 +305,18 @@ func (p *WarmPool) createPooled(ctx context.Context, lang string) (*PooledContai
 		&container.HostConfig{
 			NetworkMode: container.NetworkMode(p.sbCfg.NetworkMode),
 			Resources: container.Resources{
-				Memory:   memoryLimit,
-				NanoCPUs: nanoCPUs,
+				Memory:    memoryLimit,
+				NanoCPUs:  nanoCPUs,
+				PidsLimit: &pidsLimit,
 			},
-			AutoRemove: false,
+			SecurityOpt:    []string{"no-new-privileges:true"},
+			CapDrop:        strslice.StrSlice{"ALL"},
+			ReadonlyRootfs: true,
+			AutoRemove:     false,
+			Tmpfs: map[string]string{
+				workspaceDir: "rw,size=128m",
+				"/tmp":       "rw,noexec,nosuid,size=64m",
+			},
 		},
 		nil, nil, name,
 	)
