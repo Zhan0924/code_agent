@@ -27,24 +27,24 @@ type DynamicToolConfig struct {
 	Parameters     json.RawMessage `json:"parameters" binding:"required"` // JSON Schema
 	ExecutorType   ExecutorType    `json:"executor_type" binding:"required"`
 	ExecutorConfig json.RawMessage `json:"executor_config" binding:"required"`
-	RiskLevel      int             `json:"risk_level"` // 0=safe, 1=moderate, 2=high
-	TTL            *time.Duration  `json:"ttl,omitempty"` // 可选过期时间
+	RiskLevel      int             `json:"risk_level"`         // 0=safe, 1=moderate, 2=high
+	TTLSeconds     *int64          `json:"ttl_seconds,omitempty"` // 可选过期秒数
 	CreatedAt      time.Time       `json:"created_at"`
 }
 
 // WebhookExecutorConfig 定义 webhook 执行器配置
 type WebhookExecutorConfig struct {
-	URL     string            `json:"url" binding:"required"`
-	Method  string            `json:"method"` // 默认 POST
-	Headers map[string]string `json:"headers,omitempty"`
-	Timeout time.Duration     `json:"timeout"` // 默认 30s
+	URL            string            `json:"url" binding:"required"`
+	Method         string            `json:"method"` // 默认 POST
+	Headers        map[string]string `json:"headers,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds"` // 默认 30
 }
 
 // InlineExecutorConfig 定义内联代码执行器配置
 type InlineExecutorConfig struct {
-	Language string        `json:"language"` // "bash", "python", "javascript"
-	Code     string        `json:"code" binding:"required"`
-	Timeout  time.Duration `json:"timeout"` // 默认 10s
+	Language       string `json:"language"` // "bash", "python", "javascript"
+	Code           string `json:"code" binding:"required"`
+	TimeoutSeconds int    `json:"timeout_seconds"` // 默认 10
 }
 
 // dynamicTool 实现 Tool 接口
@@ -106,12 +106,13 @@ func createWebhookExecutor(cfg WebhookExecutorConfig) func(context.Context, json
 	if cfg.Method == "" {
 		cfg.Method = "POST"
 	}
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 30 * time.Second
+	timeout := 30 * time.Second
+	if cfg.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
 	}
 
 	return func(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
-		ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, cfg.Method, cfg.URL, bytes.NewReader(args))
@@ -143,9 +144,11 @@ func createWebhookExecutor(cfg WebhookExecutorConfig) func(context.Context, json
 }
 
 func createInlineExecutor(cfg InlineExecutorConfig) func(context.Context, json.RawMessage) (*models.ToolResult, error) {
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 10 * time.Second
+	timeout := 10 * time.Second
+	if cfg.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
 	}
+	_ = timeout
 
 	return func(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
 		// TODO: 集成 sandbox.Manager 执行代码

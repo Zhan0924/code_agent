@@ -50,12 +50,6 @@ func (s *Server) handleRegisterDynamicTool(c *gin.Context) {
 
 	// Persist to database if store is available
 	if s.store != nil {
-		var ttlSeconds *int64
-		if config.TTL != nil {
-			seconds := int64(config.TTL.Seconds())
-			ttlSeconds = &seconds
-		}
-
 		rec := &store.DynamicToolRecord{
 			Name:           config.Name,
 			Description:    config.Description,
@@ -63,7 +57,7 @@ func (s *Server) handleRegisterDynamicTool(c *gin.Context) {
 			ExecutorType:   string(config.ExecutorType),
 			ExecutorConfig: config.ExecutorConfig,
 			RiskLevel:      config.RiskLevel,
-			TTLSeconds:     ttlSeconds,
+			TTLSeconds:     config.TTLSeconds,
 			CreatedAt:      config.CreatedAt,
 		}
 
