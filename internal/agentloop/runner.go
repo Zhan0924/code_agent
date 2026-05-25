@@ -86,7 +86,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOpts, sink EventSink) RunResul
 		// Token budget check
 		totalTokens := 0
 		for _, m := range messages {
-			totalTokens += llm.EstimateTokens(m.Content)
+			totalTokens += llm.ExactTokenCount(m.Content)
 		}
 		if totalTokens > r.config.MaxContextTokens {
 			r.logger.Warn("token budget exceeded, pruning", zap.Int("tokens", totalTokens))
@@ -157,7 +157,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOpts, sink EventSink) RunResul
 			}
 
 			// Smart truncation
-			if llm.EstimateTokens(content) > 8000 {
+			if llm.FastEstimate(content) > 8000 {
 				runes := []rune(content)
 				if len(runes) > 32000 {
 					headSize := 8000

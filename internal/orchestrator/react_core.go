@@ -141,14 +141,17 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			}
 		}
 
-		// Token budget check
-		const maxContextTokens = 128000
+		// Token budget check (use dynamic context window from config)
+		maxContextTokens := o.maxContextTokens
+		if maxContextTokens <= 0 {
+			maxContextTokens = 128000
+		}
 		totalTokens := 0
 		for _, m := range messages {
-			totalTokens += llm.EstimateTokens(m.Content)
+			totalTokens += llm.ExactTokenCount(m.Content)
 		}
 		if totalTokens > maxContextTokens {
-			o.logger.Warn("token budget exceeded, pruning", zap.Int("tokens", totalTokens))
+			o.logger.Warn("token budget exceeded, pruning", zap.Int("tokens", totalTokens), zap.Int("budget", maxContextTokens))
 			messages = o.pruneMessages(messages, maxContextTokens)
 		}
 
@@ -270,7 +273,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			pr := &processed[i]
 
 			// Smart truncation
-			if llm.EstimateTokens(pr.content) > 8000 {
+			if llm.FastEstimate(pr.content) > 8000 {
 				runes := []rune(pr.content)
 				if len(runes) > 32000 {
 					headSize := 8000

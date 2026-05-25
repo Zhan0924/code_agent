@@ -55,9 +55,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"time"
 
 	"github.com/agent/code_agent/internal/config"
+	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/pool"
 	"github.com/google/uuid"
@@ -235,6 +237,11 @@ func (m *Manager) AddMessage(ctx context.Context, sessionID string, msg models.M
 	}
 	msg.ID = uuid.New().String()
 	msg.Timestamp = time.Now()
+
+	// Auto-pin messages that contain critical instructions
+	if !msg.Pinned {
+		msg.Pinned = shouldAutoPin(msg)
+	}
 
 	msgJSON, err := json.Marshal(msg)
 	if err != nil {
@@ -463,12 +470,9 @@ func (m *Manager) compressContext(session *models.Session) {
 	)
 }
 
-// estimateTokens provides a rough token count (~4 chars per token).
+// estimateTokens delegates to the unified tokenizer for fast estimation.
 func estimateTokens(text string) int {
-	if len(text) == 0 {
-		return 0
-	}
-	return len(text)/4 + 1
+	return llm.FastEstimate(text)
 }
 
 // truncate shortens a string to maxLen characters.
@@ -490,4 +494,74 @@ func joinStrings(parts []string, sep string) string {
 		result += sep + p
 	}
 	return result
+}
+
+// shouldAutoPin determines if a message should be automatically pinned based on heuristics.
+func shouldAutoPin(msg models.Message) bool {
+	if msg.Role != models.RoleUser {
+		return false
+	}
+	content := strings.ToLower(msg.Content)
+	// Pin messages containing critical instructions or constraints
+	keywords := []string{
+		"always", "never", "must", "required", "critical",
+		"important:", "note:", "remember:", "constraint:",
+		"do not", "don't forget", "make sure",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(content, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// PinMessage marks a message as pinned so it won't be pruned.
+func (m *Manager) PinMessage(ctx context.Context, sessionID, messageID string) error {
+	return m.updateMessagePinStatus(ctx, sessionID, messageID, true)
+}
+
+// UnpinMessage removes the pin from a message.
+func (m *Manager) UnpinMessage(ctx context.Context, sessionID, messageID string) error {
+	return m.updateMessagePinStatus(ctx, sessionID, messageID, false)
+}
+
+// updateMessagePinStatus updates the Pinned field of a message.
+func (m *Manager) updateMessagePinStatus(ctx context.Context, sessionID, messageID string, pinned bool) error {
+	// Fetch session
+	data, err := m.rdb.Get(ctx, hotKey(sessionID)).Bytes()
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+
+	var session models.Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		return fmt.Errorf("failed to unmarshal session: %w", err)
+	}
+
+	// Find and update message
+	found := false
+	for i := range session.Messages {
+		if session.Messages[i].ID == messageID {
+			session.Messages[i].Pinned = pinned
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// Save back
+	updatedData, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("failed to marshal session: %w", err)
+	}
+
+	if err := m.rdb.Set(ctx, hotKey(sessionID), updatedData, m.cfg.TTL).Err(); err != nil {
+		return fmt.Errorf("failed to save session: %w", err)
+	}
+
+	return nil
 }

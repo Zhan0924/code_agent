@@ -55,6 +55,17 @@ type openaiProvider struct {
 	logger *zap.Logger
 }
 
+// cacheControlJSON is the JSON representation of cache_control for Anthropic-compatible APIs.
+type cacheControlJSON struct {
+	Type string `json:"type"`
+}
+
+// cachedMessage wraps an OpenAI message with optional cache_control for Anthropic providers.
+type cachedMessage struct {
+	openai.ChatCompletionMessage
+	CacheControl *cacheControlJSON `json:"cache_control,omitempty"`
+}
+
 // newOpenAIProvider creates a new OpenAI-compatible provider.
 func newOpenAIProvider(cfg *config.LLMProviderConfig, logger *zap.Logger) (*openaiProvider, error) {
 	clientCfg := openai.DefaultConfig(cfg.APIKey)
@@ -261,6 +272,42 @@ func (p *openaiProvider) convertMessages(msgs []models.Message) []openai.ChatCom
 		}
 
 		result = append(result, msg)
+	}
+	return result
+}
+
+// convertMessagesWithCache converts messages and injects cache_control markers
+// for Anthropic-compatible providers. Returns JSON-serializable messages.
+func (p *openaiProvider) convertMessagesWithCache(msgs []models.Message) []cachedMessage {
+	result := make([]cachedMessage, 0, len(msgs))
+	for _, m := range msgs {
+		msg := openai.ChatCompletionMessage{
+			Role:    string(m.Role),
+			Content: m.Content,
+		}
+
+		if m.ToolCallID != "" {
+			msg.ToolCallID = m.ToolCallID
+		}
+
+		if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				msg.ToolCalls = append(msg.ToolCalls, openai.ToolCall{
+					ID:   tc.ID,
+					Type: openai.ToolTypeFunction,
+					Function: openai.FunctionCall{
+						Name:      tc.Name,
+						Arguments: string(tc.Args),
+					},
+				})
+			}
+		}
+
+		cm := cachedMessage{ChatCompletionMessage: msg}
+		if m.CacheControl != nil {
+			cm.CacheControl = &cacheControlJSON{Type: m.CacheControl.Type}
+		}
+		result = append(result, cm)
 	}
 	return result
 }

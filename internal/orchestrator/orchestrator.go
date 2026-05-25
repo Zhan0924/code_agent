@@ -130,6 +130,9 @@ type Orchestrator struct {
 
 	// Trajectory memory: records successful tool sequences per intent.
 	trajectoryMem *agentloop.TrajectoryMemory
+
+	// Dynamic context window budget (from LLM provider config)
+	maxContextTokens int
 }
 
 // intentCacheEntry stores a cached intent classification result.
@@ -149,6 +152,21 @@ func NewOrchestrator(
 	logger *zap.Logger,
 	pgStore ...*store.Store,
 ) *Orchestrator {
+	return NewOrchestratorWithConfig(llmClient, sessionMgr, ragEngine, sandboxMgr, mcpGateway, securityCfg, nil, logger, pgStore...)
+}
+
+// NewOrchestratorWithConfig creates a new orchestrator with explicit LLM provider config for dynamic budgets.
+func NewOrchestratorWithConfig(
+	llmClient *llm.Client,
+	sessionMgr *session.Manager,
+	ragEngine *rag.Engine,
+	sandboxMgr *sandbox.Manager,
+	mcpGateway *mcp.Gateway,
+	securityCfg *config.SecurityConfig,
+	llmCfg *config.LLMProviderConfig,
+	logger *zap.Logger,
+	pgStore ...*store.Store,
+) *Orchestrator {
 	var rules []*regexp.Regexp
 	for _, pattern := range securityCfg.SensitivePatterns {
 		re, err := regexp.Compile("(?i)" + pattern)
@@ -159,6 +177,17 @@ func NewOrchestrator(
 		rules = append(rules, re)
 	}
 
+	// Determine context window from config or default
+	contextWindow := 128000
+	enableCaching := false
+	if llmCfg != nil {
+		if llmCfg.ContextWindow > 0 {
+			contextWindow = llmCfg.ContextWindow
+		}
+		enableCaching = llmCfg.EnablePromptCaching
+	}
+	maxTokens := contextWindow * 95 / 100 // 5% safety margin
+
 	pb := agentctx.NewPromptBuilder(&agentctx.PromptBuilderConfig{
 		SystemPrompt: `You are a highly capable code intelligence agent. You can:
 1. Answer technical questions about code and architecture
@@ -167,27 +196,29 @@ func NewOrchestrator(
 4. Interact with external tools (GitHub, Jira, etc.) via MCP
 5. Help diagnose and troubleshoot production issues
 Always use tools when they would produce better answers. After receiving tool results, synthesize them into a clear answer.`,
-		MaxTotalTokens: 128000, // ⬆ 8K→128K: Claude Opus has 200K context; use it
+		MaxTotalTokens:      maxTokens,
+		EnablePromptCaching: enableCaching,
 	}, logger)
 
 	orch := &Orchestrator{
-		llmClient:      llmClient,
-		sessionMgr:     sessionMgr,
-		ragEngine:      ragEngine,
-		sandboxMgr:     sandboxMgr,
-		mcpGateway:     mcpGateway,
-		promptBuilder:  pb,
-		securityCfg:    securityCfg,
-		sensitiveRules: rules,
-		logger:         logger.With(zap.String("component", "orchestrator")),
-		approvalCh:     make(map[string]chan models.ApprovalResponse),
-		interruptCh:    make(map[string]chan InterruptSignal),
-		txMap:          make(map[string]*ToolTransaction),
-		intentCache:    make(map[string]intentCacheEntry),
-		toolCache:      NewSpeculativeToolCache(0, logger),
-		ruleLoader:     NewRuleLoader(logger),
-		toolRegistry:   tools.NewRegistry(),
-		trajectoryMem:  agentloop.NewTrajectoryMemory(),
+		llmClient:        llmClient,
+		sessionMgr:       sessionMgr,
+		ragEngine:        ragEngine,
+		sandboxMgr:       sandboxMgr,
+		mcpGateway:       mcpGateway,
+		promptBuilder:    pb,
+		securityCfg:      securityCfg,
+		sensitiveRules:   rules,
+		maxContextTokens: maxTokens,
+		logger:           logger.With(zap.String("component", "orchestrator")),
+		approvalCh:       make(map[string]chan models.ApprovalResponse),
+		interruptCh:      make(map[string]chan InterruptSignal),
+		txMap:            make(map[string]*ToolTransaction),
+		intentCache:      make(map[string]intentCacheEntry),
+		toolCache:        NewSpeculativeToolCache(0, logger),
+		ruleLoader:       NewRuleLoader(logger),
+		toolRegistry:     tools.NewRegistry(),
+		trajectoryMem:    agentloop.NewTrajectoryMemory(),
 	}
 
 	// Register built-in tools into the unified registry

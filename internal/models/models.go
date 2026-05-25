@@ -142,16 +142,26 @@ const (
 	RoleTool      Role = "tool"
 )
 
+// CacheControl specifies prompt caching behavior for a message.
+// When set, the LLM provider marks this message as a cache breakpoint,
+// enabling significant cost savings (40-90%) and latency reduction (up to 10x)
+// for Anthropic-compatible providers.
+type CacheControl struct {
+	Type string `json:"type"` // "ephemeral" — cached for the duration of the request
+}
+
 // Message represents a single message in a conversation session.
 type Message struct {
-	ID         string          `json:"id"`
-	Role       Role            `json:"role"`
-	Content    string          `json:"content"`
-	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
-	Metadata   json.RawMessage `json:"metadata,omitempty"`
-	Timestamp  time.Time       `json:"timestamp"`
-	TokenCount int             `json:"token_count"`
+	ID           string          `json:"id"`
+	Role         Role            `json:"role"`
+	Content      string          `json:"content"`
+	ToolCalls    []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID   string          `json:"tool_call_id,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	Timestamp    time.Time       `json:"timestamp"`
+	TokenCount   int             `json:"token_count"`
+	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+	Pinned       bool            `json:"pinned,omitempty"`
 }
 
 // Session represents a conversation session with sliding window context.

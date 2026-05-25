@@ -72,6 +72,9 @@ type PromptBuilder struct {
 	// Hash of the stable prefix for cache invalidation detection
 	prefixHash string
 
+	// EnablePromptCaching controls whether cache_control markers are added
+	enablePromptCaching bool
+
 	pruner *TokenPruner
 	logger *zap.Logger
 
@@ -81,9 +84,10 @@ type PromptBuilder struct {
 
 // PromptBuilderConfig configures the prompt builder.
 type PromptBuilderConfig struct {
-	SystemPrompt   string
-	MaxTotalTokens int
-	PrunerConfig   *PrunerConfig
+	SystemPrompt        string
+	MaxTotalTokens      int
+	PrunerConfig        *PrunerConfig
+	EnablePromptCaching bool // Send cache_control markers to LLM provider
 }
 
 // NewPromptBuilder creates a KV Cache-friendly prompt builder.
@@ -92,11 +96,19 @@ func NewPromptBuilder(cfg *PromptBuilderConfig, logger *zap.Logger) *PromptBuild
 	if prunerCfg == nil {
 		prunerCfg = DefaultPrunerConfig()
 	}
+	// Scale RAG budget proportionally: 20% of total context window
+	if cfg.MaxTotalTokens > 0 {
+		ragBudget := cfg.MaxTotalTokens * 20 / 100
+		if ragBudget > prunerCfg.MaxTokenBudget {
+			prunerCfg.MaxTokenBudget = ragBudget
+		}
+	}
 
 	pb := &PromptBuilder{
-		systemPrompt: cfg.SystemPrompt,
-		pruner:       NewTokenPruner(prunerCfg, logger),
-		logger:       logger.With(zap.String("component", "prompt_builder")),
+		systemPrompt:        cfg.SystemPrompt,
+		enablePromptCaching: cfg.EnablePromptCaching,
+		pruner:              NewTokenPruner(prunerCfg, logger),
+		logger:              logger.With(zap.String("component", "prompt_builder")),
 		builderPool: sync.Pool{
 			New: func() interface{} {
 				return &strings.Builder{}
@@ -131,17 +143,25 @@ func (pb *PromptBuilder) BuildPrompt(
 	var messages []models.Message
 
 	// ── Region 1: Immutable System Prompt ──
-	messages = append(messages, models.Message{
+	systemMsg := models.Message{
 		Role:    models.RoleSystem,
 		Content: pb.systemPrompt,
-	})
+	}
+	if pb.enablePromptCaching {
+		systemMsg.CacheControl = &models.CacheControl{Type: "ephemeral"}
+	}
+	messages = append(messages, systemMsg)
 
 	// ── Region 2: Semi-Stable Long-Term Memory ──
 	if session != nil && session.Summary != "" {
-		messages = append(messages, models.Message{
+		memoryMsg := models.Message{
 			Role:    models.RoleSystem,
 			Content: fmt.Sprintf("[Conversation History Summary]\n%s", session.Summary),
-		})
+		}
+		if pb.enablePromptCaching {
+			memoryMsg.CacheControl = &models.CacheControl{Type: "ephemeral"}
+		}
+		messages = append(messages, memoryMsg)
 	}
 
 	// ── Region 3: Pruned Code Context ──
@@ -165,10 +185,14 @@ func (pb *PromptBuilder) BuildPrompt(
 				builder.WriteString("\n\n")
 			}
 
-			messages = append(messages, models.Message{
+			ragMsg := models.Message{
 				Role:    models.RoleSystem,
 				Content: builder.String(),
-			})
+			}
+			if pb.enablePromptCaching {
+				ragMsg.CacheControl = &models.CacheControl{Type: "ephemeral"}
+			}
+			messages = append(messages, ragMsg)
 		}
 	}
 

@@ -52,6 +52,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/models"
 	"go.uber.org/zap"
 )
@@ -293,7 +294,7 @@ func itoa(n int) string {
 }
 
 // PruneMessages applies importance-based pruning to conversation messages,
-// keeping system messages and the most recent user/assistant exchanges.
+// keeping system messages, pinned messages, and the most recent user/assistant exchanges.
 // Tool results that exceed MaxToolResultBytes are collapsed in-place before
 // the budget is applied so that one noisy log dump can't evict otherwise
 // important messages.
@@ -317,12 +318,15 @@ func (p *TokenPruner) PruneMessages(messages []models.Message, tokenBudget int) 
 		return messages
 	}
 
-	// Always keep system messages and last 2 exchanges (4 messages)
+	// Always keep system messages, pinned messages, and last 2 exchanges (4 messages)
 	var systemMsgs []models.Message
+	var pinnedMsgs []models.Message
 	var otherMsgs []models.Message
 	for _, msg := range messages {
 		if msg.Role == models.RoleSystem {
 			systemMsgs = append(systemMsgs, msg)
+		} else if msg.Pinned {
+			pinnedMsgs = append(pinnedMsgs, msg)
 		} else {
 			otherMsgs = append(otherMsgs, msg)
 		}
@@ -340,11 +344,15 @@ func (p *TokenPruner) PruneMessages(messages []models.Message, tokenBudget int) 
 	for _, msg := range systemMsgs {
 		systemTokens += estimateTokens(msg.Content)
 	}
+	pinnedTokens := 0
+	for _, msg := range pinnedMsgs {
+		pinnedTokens += estimateTokens(msg.Content)
+	}
 	tailTokens := 0
 	for _, msg := range tail {
 		tailTokens += estimateTokens(msg.Content)
 	}
-	remainingBudget := tokenBudget - systemTokens - tailTokens
+	remainingBudget := tokenBudget - systemTokens - pinnedTokens - tailTokens
 
 	// Fill middle from most recent first
 	middle := otherMsgs[:len(otherMsgs)-keepTail]
@@ -358,9 +366,10 @@ func (p *TokenPruner) PruneMessages(messages []models.Message, tokenBudget int) 
 		}
 	}
 
-	// Assemble: system + middle + tail
-	result := make([]models.Message, 0, len(systemMsgs)+len(keptMiddle)+len(tail))
+	// Assemble: system + pinned + middle + tail
+	result := make([]models.Message, 0, len(systemMsgs)+len(pinnedMsgs)+len(keptMiddle)+len(tail))
 	result = append(result, systemMsgs...)
+	result = append(result, pinnedMsgs...)
 	result = append(result, keptMiddle...)
 	result = append(result, tail...)
 
@@ -402,10 +411,7 @@ func (p *TokenPruner) maxCallFrequency(freq map[string]int) int {
 	return maxF
 }
 
-// estimateTokens provides a rough token count (~4 chars per token for code).
+// estimateTokens delegates to the unified tokenizer for fast estimation.
 func estimateTokens(text string) int {
-	if len(text) == 0 {
-		return 0
-	}
-	return len(text)/4 + 1
+	return llm.FastEstimate(text)
 }

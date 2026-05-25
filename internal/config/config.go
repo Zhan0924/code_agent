@@ -82,13 +82,15 @@ type ServerConfig struct {
 
 // LLMProviderConfig defines settings for a single LLM provider.
 type LLMProviderConfig struct {
-	Provider    string        `mapstructure:"provider"`
-	APIKey      string        `mapstructure:"api_key"`
-	Model       string        `mapstructure:"model"`
-	BaseURL     string        `mapstructure:"base_url"`
-	MaxTokens   int           `mapstructure:"max_tokens"`
-	Temperature float32       `mapstructure:"temperature"`
-	Timeout     time.Duration `mapstructure:"timeout"`
+	Provider           string        `mapstructure:"provider"`
+	APIKey             string        `mapstructure:"api_key"`
+	Model              string        `mapstructure:"model"`
+	BaseURL            string        `mapstructure:"base_url"`
+	MaxTokens          int           `mapstructure:"max_tokens"`
+	Temperature        float32       `mapstructure:"temperature"`
+	Timeout            time.Duration `mapstructure:"timeout"`
+	ContextWindow      int           `mapstructure:"context_window"`       // Model's context window size (0 = auto-detect from model name)
+	EnablePromptCaching bool         `mapstructure:"enable_prompt_caching"` // Send cache_control markers to Anthropic-compatible providers
 }
 
 // CircuitBreakerConfig defines circuit breaker parameters.

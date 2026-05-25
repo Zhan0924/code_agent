@@ -300,72 +300,9 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req *ChatRequest) (<-
 	return nil, fmt.Errorf("LLM stream request failed (no fallback configured): %w", err)
 }
 
-// EstimateTokens provides a rough token count estimate that is accurate
-// enough for budget planning across the mixed content this service sees:
-// English prose, Chinese, source code, JSON tool arguments.
-//
-// The prior implementation returned len(text)/4, which undercounts CJK by
-// ~3x (each multi-byte rune is 1–2 tokens but takes 3 bytes, so len/4
-// approaches 1 token per 1.3 bytes → 0.75 tokens per rune, vs. ~1.3
-// tokens per rune in cl100k_base). It also overcounts ASCII punctuation
-// where each mark is a token. This version splits cost by rune class:
-//
-//	• Non-ASCII runes (CJK, emoji, IPA): 1 rune ≈ 1 token. tiktoken
-//	  averages 1.3 here; we use 1 for a conservative lower bound.
-//	• ASCII letters/digits: 4 chars ≈ 1 token (matches cl100k's English
-//	  average closely enough for budget decisions).
-//	• ASCII punctuation: each mark is effectively its own token. We count
-//	  them separately and add on top.
-//
-// The result is still an estimate, not exact — adopt tiktoken-go if exact
-// counts are ever required. But it is within ~15% of actual tokens for
-// the input shapes this service actually processes, vs. the 2-5x error of
-// the prior implementation.
+// EstimateTokens delegates to FastEstimate for backward compatibility.
 func EstimateTokens(text string) int {
-	if text == "" {
-		return 0
-	}
-	var asciiWord, asciiPunct, nonASCII int
-	for _, r := range text {
-		switch {
-		case r >= 0x80:
-			nonASCII++
-		case isASCIIPunct(r):
-			asciiPunct++
-		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
-			asciiWord++ // whitespace costs roughly the same as a letter
-		default:
-			asciiWord++
-		}
-	}
-	// ceil(asciiWord / 4) so short text still costs >= 1.
-	tokens := (asciiWord + 3) / 4
-	tokens += asciiPunct
-	tokens += nonASCII
-	if tokens == 0 {
-		tokens = 1
-	}
-	return tokens
-}
-
-// isASCIIPunct reports whether r is an ASCII punctuation/symbol character.
-// These are treated as standalone tokens by modern BPE tokenizers, so we
-// count them separately from alphanumeric content.
-func isASCIIPunct(r rune) bool {
-	if r >= 0x80 {
-		return false
-	}
-	switch {
-	case r >= '0' && r <= '9':
-		return false
-	case r >= 'A' && r <= 'Z':
-		return false
-	case r >= 'a' && r <= 'z':
-		return false
-	case r == ' ' || r == '\t' || r == '\n' || r == '\r':
-		return false
-	}
-	return true
+	return FastEstimate(text)
 }
 
 // BuildToolDefinitions converts tool definitions to the format expected by the LLM.

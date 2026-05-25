@@ -73,6 +73,14 @@ func (c *Config) Validate() error {
 	if c.LLM.Primary.Timeout <= 0 {
 		errs = append(errs, "llm.primary.timeout must be positive")
 	}
+
+	// Auto-detect context window from model name if not explicitly set
+	if c.LLM.Primary.ContextWindow == 0 {
+		c.LLM.Primary.ContextWindow = detectContextWindow(c.LLM.Primary.Model)
+	}
+	if c.LLM.Fallback.Model != "" && c.LLM.Fallback.ContextWindow == 0 {
+		c.LLM.Fallback.ContextWindow = detectContextWindow(c.LLM.Fallback.Model)
+	}
 	if c.LLM.CircuitBreaker.MaxFailures <= 0 {
 		errs = append(errs, "llm.circuit_breaker.max_failures must be positive")
 	}
@@ -128,6 +136,47 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// detectContextWindow returns the context window size for a given model name.
+// Returns 128000 as a safe default if the model is not recognized.
+func detectContextWindow(model string) int {
+	modelWindows := map[string]int{
+		"claude-opus-4":        200000,
+		"claude-opus-4-7":      200000,
+		"claude-sonnet-4":      200000,
+		"claude-sonnet-4-6":    200000,
+		"claude-haiku-4":       200000,
+		"claude-haiku-4-5":     200000,
+		"claude-3-opus":        200000,
+		"claude-3-sonnet":      200000,
+		"claude-3-haiku":       200000,
+		"claude-3-5-sonnet":    200000,
+		"claude-3-5-haiku":     200000,
+		"gpt-4-turbo":          128000,
+		"gpt-4-turbo-preview":  128000,
+		"gpt-4o":               128000,
+		"gpt-4o-mini":          128000,
+		"gpt-4":                8192,
+		"gpt-3.5-turbo":        16385,
+		"gpt-3.5-turbo-16k":    16385,
+		"gemini-1.5-pro":       1000000,
+		"gemini-1.5-flash":     1000000,
+		"gemini-pro":           32768,
+	}
+
+	if window, ok := modelWindows[model]; ok {
+		return window
+	}
+
+	// Prefix match for versioned models (e.g., "claude-opus-4-20250514")
+	for prefix, window := range modelWindows {
+		if len(model) > len(prefix) && model[:len(prefix)] == prefix {
+			return window
+		}
+	}
+
+	return 128000
 }
 
 // allowedMCPCommands is the whitelist of safe MCP server commands.

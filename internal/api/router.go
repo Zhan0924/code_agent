@@ -220,6 +220,8 @@ func (s *Server) setupRoutes() {
 		v1.GET("/sessions/:id", s.handleGetSession)
 		v1.GET("/sessions/:id/workspace", s.handleGetSessionWorkspace)
 		v1.DELETE("/sessions/:id", s.handleDeleteSession)
+		v1.POST("/sessions/:id/messages/:message_id/pin", s.handlePinMessage)
+		v1.POST("/sessions/:id/messages/:message_id/unpin", s.handleUnpinMessage)
 
 		// HITL approval (requires admin or dev role)
 		approvalGroup := v1.Group("")

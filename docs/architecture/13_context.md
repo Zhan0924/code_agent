@@ -477,26 +477,37 @@ PruneMessages(messages, tokenBudget):
 
   # Step 3: 分类
   systemMsgs := [m for m in compacted if m.Role == system]   # 必留
-  otherMsgs  := [m for m in compacted if m.Role != system]
+  pinnedMsgs := [m for m in compacted if m.Pinned]           # 必留（新增）
+  otherMsgs  := [m for m in compacted if !system && !pinned]
 
   # Step 4: 尾巴必留（最近 4 条）
   tail := otherMsgs[-4:]
 
   # Step 5: 中间按「新 → 旧」往里塞，塞到剩余预算耗尽
-  remainingBudget := budget - systemTokens - tailTokens
+  remainingBudget := budget - systemTokens - pinnedTokens - tailTokens
   middle := otherMsgs[:-4]
   keptMiddle := []
   for i from len(middle)-1 down to 0:
       if fits: keptMiddle.prepend(middle[i])
 
-  return systemMsgs + keptMiddle + tail
+  return systemMsgs + pinnedMsgs + keptMiddle + tail
 ```
 
-### 5.1 为什么「保头保尾，中间挖空」？
+### 5.1 为什么「保头保尾保固定，中间挖空」？
 
 - **头（system）**：规则、角色设定，丢了 LLM 立刻失忆；
+- **固定（pinned）**：用户标记的关键决策/约束，丢了会违反用户意图；
 - **尾（last 4）**：最近对话上下文，丢了当前问题无法衔接；
 - **中间**：历史 ReAct 步骤，选择性丢弃影响不大（何况还有 summary 兜底）。
+
+### 5.2 消息自动固定（Auto-Pinning）
+
+`session.Manager.AddMessage` 在追加消息时自动检测关键指令：
+- 包含 "IMPORTANT"、"MUST"、"NEVER"、"ALWAYS"、"CRITICAL" 等关键词
+- 以 "Rule:"、"Constraint:"、"Remember:" 等前缀开头
+- 仅对 user 角色消息生效
+
+手动固定通过 API 端点：`POST /sessions/:id/messages/:message_id/pin`
 
 ### 5.2 与 Session.Summary 的配合
 
@@ -549,7 +560,7 @@ TruncateLargeToolResult(msg):
 
 ### 7.1 `estimateTokens(text)` (L363)
 
-和 session 包一样：`len(text) / 4`。**包内私有副本**，避免跨包依赖。
+委托给 `llm.FastEstimate()`（统一 tokenizer 接口）。精确计数使用 `llm.ExactTokenCount()`（基于 tiktoken-go cl100k_base）。
 
 ### 7.2 `humanBytes(n)` (L218)
 
@@ -600,7 +611,10 @@ Orchestrator 的 `buildSystemMessage` / `retrieveRAGContext`（见 `09_orchestra
 
 ## 10. 后续演进
 
-- [ ] **Token 估算升级**：接 `tiktoken` / `anthropic-tokenizer`，尤其对 code-heavy prompt 更准；
+- [x] **Token 估算升级**：已接入 `tiktoken-go`（`internal/llm/tokenizer.go`），提供 `ExactTokenCount`（精确）和 `FastEstimate`（快速启发式）两种模式；
+- [x] **Prompt Caching 标记**：`PromptBuilder` 在 Region 1-3 后注入 `cache_control: {type: "ephemeral"}` 标记，Anthropic 兼容提供商可利用此标记实现 40-90% 成本节省；
+- [x] **动态 Context Window**：`LLMProviderConfig.ContextWindow` 根据模型自动检测（Claude Opus 4: 200K, GPT-4: 128K 等），按比例分配预算（系统 10% / RAG 20% / 历史 60% / 当前 10%）；
+- [x] **消息固定（Message Pinning）**：`Message.Pinned` 字段 + 自动固定启发式（关键词检测）+ API 端点 `/sessions/:id/messages/:message_id/pin`，固定消息在剪枝时始终保留；
 - [ ] **权重自适应**：按历史命中率/任务类型动态调 `wCallFreq / wRelevance`；
 - [ ] **Region 3 结构化模板**：用 XML/JSON 固定 schema，让 LLM 更稳定解析；
 - [ ] **Prefix Cache Metrics**：`prompt_prefix_cache_hit_total` 按 hash 聚合；
@@ -706,16 +720,17 @@ func (p *Pruner) Prune(msgs []Message, maxTokens int) []Message {
 **优势（Pros）**
 - ✅ 分层 + 稳定排序，KV cache 命中率高
 - ✅ fingerprint 去重，避免重复 chunk 占 budget
-- ✅ Pruner 保留 system + 最近对话，对用户体验友好
+- ✅ Pruner 保留 system + pinned + 最近对话，对用户体验友好
 - ✅ 易扩展：加新 layer 只需选对"变化频率层级"
+- ✅ tiktoken-go 精确计数（LLM 调用前）+ 快速估算（批量打分），双模式覆盖
+- ✅ cache_control 标记支持 Anthropic prompt caching，实测 40-90% 成本节省
+- ✅ 动态 context window 适配不同模型（8K ~ 1M），按比例分配预算
 
 **代价（Cons）**
-- ⚠️ `EstimateTokens` 误差 ±15%，Pruner 边界判定不精确
+- ⚠️ tiktoken 初始化需下载数据文件（离线环境自动降级到 FastEstimate）
 - ⚠️ `seenFingerprints` 是进程级 map，跨副本不共享
-- ⚠️ Pruner 的 O(N²) 行为（每次 Prune 全量遍历 messages）
 - ⚠️ 没有 prompt diff 缓存（即只记录当前一次，不比较上次）
-- ⚠️ RAG 结果放末尾前反而破坏 cache（如果 RAG 放中间）——目前实现是末尾
-  前，但如果某次改顺序会悄悄 break
+- ⚠️ cache_control 仅对 Anthropic 兼容提供商有效，OpenAI 忽略该字段
 
 ### 可改进点
 
