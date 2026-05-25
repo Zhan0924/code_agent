@@ -414,7 +414,7 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		messages[0] = o.buildSystemMessage(task.Intent)
 	}
 
-	tools := o.getAvailableTools()
+	tools := o.GetAvailableTools()
 
 	// Delegate to shared core loop
 	result := o.reactLoopCore(ctx, reactCoreOpts{
@@ -816,7 +816,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 		if len(messages) > 0 && messages[0].Role == models.RoleSystem {
 			messages[0] = o.buildSystemMessage(task.Intent)
 		}
-		tools := o.getAvailableTools()
+		tools := o.GetAvailableTools()
 		sink := &channelSink{ch: eventCh}
 
 		globalStep := 0
@@ -1452,7 +1452,8 @@ func (o *Orchestrator) toolSearchCode(ctx context.Context, args json.RawMessage)
 // Tool Registry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func (o *Orchestrator) getAvailableTools() []models.ToolDefinition {
+// GetAvailableTools returns all available tool definitions (builtin + MCP + dynamic + skills)
+func (o *Orchestrator) GetAvailableTools() []models.ToolDefinition {
 	tools := make([]models.ToolDefinition, 0, 16)
 	if o.toolRegistry != nil {
 		tools = append(tools, o.toolRegistry.Definitions()...)

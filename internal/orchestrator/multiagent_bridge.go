@@ -68,7 +68,7 @@ type orchToolProvider struct {
 }
 
 func (p *orchToolProvider) Definitions() []models.ToolDefinition {
-	return p.orch.getAvailableTools()
+	return p.orch.GetAvailableTools()
 }
 
 // AttachSupervisor wires the multi-agent Supervisor into the orchestrator.

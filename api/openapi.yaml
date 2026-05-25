@@ -230,6 +230,9 @@ components:
           type: string
         message:
           type: string
+        output_format:
+          type: string
+          description: "Optional output format control (e.g., 'json_object', 'json_schema')"
       required: [session_id, message]
 
     ChatResponse:

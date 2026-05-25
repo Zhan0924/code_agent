@@ -203,5 +203,18 @@ func (s *Server) handleListTools(c *gin.Context) {
 		}
 	}
 
+	// Dynamic tools from orchestrator registry
+	if s.orchestrator != nil {
+		for _, t := range s.orchestrator.GetAvailableTools() {
+			if t.Source == "dynamic" {
+				tools = append(tools, toolInfo{
+					Name:        t.Name,
+					Description: t.Description,
+					Source:      t.Source,
+				})
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, tools)
 }
