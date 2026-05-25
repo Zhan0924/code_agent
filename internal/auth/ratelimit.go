@@ -37,6 +37,8 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"sync"
 	"time"
@@ -126,16 +128,20 @@ func (rl *PerUserRateLimiter) GinMiddleware() gin.HandlerFunc {
 		if claims := GetClaims(c); claims != nil {
 			key = "user:" + claims.UserID
 		} else if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
-			key = "apikey:" + apiKey
+			key = "apikey:" + hashAPIKeyForRL(apiKey)
 		}
 
 		if !rl.Allow(key) {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": "rate limit exceeded",
-				"key":   key,
 			})
 			return
 		}
 		c.Next()
 	}
+}
+
+func hashAPIKeyForRL(apiKey string) string {
+	h := sha256.Sum256([]byte(apiKey))
+	return hex.EncodeToString(h[:16])
 }
