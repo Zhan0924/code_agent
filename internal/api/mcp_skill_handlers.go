@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"path/filepath"
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/agent/code_agent/internal/mcp"
@@ -27,6 +28,17 @@ func (s *Server) handleAddMCPServer(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate command against whitelist to prevent command injection
+	cmd := filepath.Base(req.Command)
+	if !config.IsAllowedMCPCommand(cmd) {
+		s.logger.Warn("MCP server command rejected",
+			zap.String("command", req.Command),
+			zap.String("ip", c.ClientIP()),
+		)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "command not allowed: " + cmd})
 		return
 	}
 

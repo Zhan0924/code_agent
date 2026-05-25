@@ -39,6 +39,8 @@ package config
 
 import (
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -117,8 +119,53 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// MCP - validate command whitelist
+	if err := c.validateMCPServers(); err != nil {
+		errs = append(errs, err.Error())
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// allowedMCPCommands is the whitelist of safe MCP server commands.
+var allowedMCPCommands = map[string]bool{
+	"npx":     true,
+	"node":    true,
+	"python":  true,
+	"python3": true,
+	"uvx":     true,
+	"deno":    true,
+}
+
+// IsAllowedMCPCommand checks if a command basename is in the MCP whitelist.
+func IsAllowedMCPCommand(cmd string) bool {
+	return allowedMCPCommands[cmd]
+}
+
+// validateMCPServers checks that all MCP server commands are in the whitelist.
+func (c *Config) validateMCPServers() error {
+	for i, srv := range c.MCP.Servers {
+		if srv.Command == "" {
+			return fmt.Errorf("mcp.servers[%d].command is empty", i)
+		}
+
+		// Extract base command (handle absolute paths)
+		cmd := filepath.Base(srv.Command)
+
+		// Check whitelist
+		if !allowedMCPCommands[cmd] {
+			return fmt.Errorf("mcp.servers[%d].command not in whitelist: %s (allowed: npx, node, python, python3, uvx, deno)", i, cmd)
+		}
+
+		// Verify command exists in PATH or is absolute path
+		if !filepath.IsAbs(srv.Command) {
+			if _, err := exec.LookPath(srv.Command); err != nil {
+				return fmt.Errorf("mcp.servers[%d].command not found in PATH: %s", i, srv.Command)
+			}
+		}
 	}
 	return nil
 }
