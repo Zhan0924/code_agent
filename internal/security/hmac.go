@@ -69,27 +69,31 @@ func NewHMACVerifier(cfg *HMACConfig, logger *zap.Logger) *HMACVerifier {
 }
 
 // VerifySignature checks if the given payload matches the provided HMAC-SHA256 signature.
-func (v *HMACVerifier) VerifySignature(payload []byte, signature string) bool {
+// The timestamp is included in the HMAC computation to prevent replay attacks
+// where an attacker modifies the timestamp header without invalidating the signature.
+func (v *HMACVerifier) VerifySignature(payload []byte, signature, timestamp string) bool {
 	// Strip prefix if present
 	sig := strings.TrimPrefix(signature, v.cfg.SignaturePrefix)
 
-	expectedMAC := v.computeHMAC(payload)
+	expectedMAC := v.computeHMAC(payload, timestamp)
 	expectedSig := hex.EncodeToString(expectedMAC)
 
 	// Use constant-time comparison to prevent timing attacks
 	return hmac.Equal([]byte(expectedSig), []byte(sig))
 }
 
-// computeHMAC computes the HMAC-SHA256 of the payload.
-func (v *HMACVerifier) computeHMAC(payload []byte) []byte {
+// computeHMAC computes the HMAC-SHA256 of timestamp + payload.
+func (v *HMACVerifier) computeHMAC(payload []byte, timestamp string) []byte {
 	mac := hmac.New(sha256.New, []byte(v.cfg.Secret))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte("\n"))
 	mac.Write(payload)
 	return mac.Sum(nil)
 }
 
 // SignPayload generates an HMAC-SHA256 signature for outgoing requests.
-func (v *HMACVerifier) SignPayload(payload []byte) string {
-	mac := v.computeHMAC(payload)
+func (v *HMACVerifier) SignPayload(payload []byte, timestamp string) string {
+	mac := v.computeHMAC(payload, timestamp)
 	return v.cfg.SignaturePrefix + hex.EncodeToString(mac)
 }
 
@@ -162,8 +166,9 @@ func (v *HMACVerifier) GinMiddleware() gin.HandlerFunc {
 		}
 		c.Request.Body = io.NopCloser(strings.NewReader(string(body)))
 
-		// Step 4: Verify HMAC signature
-		if !v.VerifySignature(body, signature) {
+		// Step 4: Verify HMAC signature (includes timestamp in computation)
+		tsHeader := c.GetHeader(v.cfg.TimestampHeader)
+		if !v.VerifySignature(body, signature, tsHeader) {
 			v.logger.Warn("HMAC signature verification failed",
 				zap.String("path", c.Request.URL.Path),
 				zap.String("ip", c.ClientIP()),
@@ -201,9 +206,10 @@ func (t *SigningTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		req.Body = io.NopCloser(strings.NewReader(string(body)))
 
-		signature := t.Verifier.SignPayload(body)
+		timestamp := time.Now().UTC().Format(time.RFC3339)
+		signature := t.Verifier.SignPayload(body, timestamp)
 		req.Header.Set(t.Verifier.cfg.HeaderName, signature)
-		req.Header.Set(t.Verifier.cfg.TimestampHeader, time.Now().UTC().Format(time.RFC3339))
+		req.Header.Set(t.Verifier.cfg.TimestampHeader, timestamp)
 	}
 
 	base := t.Base
