@@ -31,6 +31,8 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,6 +43,42 @@ import (
 	"go.uber.org/zap"
 )
 
+// blockedHostPaths are paths that must never be bind-mounted into containers.
+var blockedHostPaths = []string{
+	"/var/run/docker.sock",
+	"/var/run",
+	"/proc",
+	"/sys",
+	"/etc",
+	"/root",
+	"/boot",
+	"/dev",
+}
+
+// validateHostDir checks that a host directory is safe to bind-mount.
+func validateHostDir(hostDir string) error {
+	realPath, err := filepath.EvalSymlinks(hostDir)
+	if err != nil {
+		return fmt.Errorf("invalid host path: %w", err)
+	}
+
+	for _, blocked := range blockedHostPaths {
+		if realPath == blocked || strings.HasPrefix(realPath, blocked+"/") {
+			return fmt.Errorf("host path blocked: %s resolves to %s", hostDir, realPath)
+		}
+	}
+
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return fmt.Errorf("host path not accessible: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("host path must be a directory")
+	}
+
+	return nil
+}
+
 // ExecuteWithVolume runs a command in a Docker container with the given
 // host directory mounted as /workspace. Used by the project generator
 // for build validation inside the generated project.
@@ -48,10 +86,31 @@ func (m *Manager) ExecuteWithVolume(ctx context.Context, language, command, host
 	startTime := time.Now()
 	containerName := fmt.Sprintf("agent-vol-%s", uuid.New().String()[:8])
 
+	// Validate host directory before mounting
+	if err := validateHostDir(hostDir); err != nil {
+		return nil, fmt.Errorf("host directory validation failed: %w", err)
+	}
+
 	// Resolve image
 	imageName := m.imageForLanguage(language)
 	if err := m.ensureImage(ctx, imageName); err != nil {
 		return nil, fmt.Errorf("ensure image %s: %w", imageName, err)
+	}
+
+	// Use buildHostConfig for full security hardening
+	memoryLimit := int64(512 * 1024 * 1024)
+	nanoCPUs := int64(1e9)
+	hostCfg := m.buildHostConfig(memoryLimit, nanoCPUs)
+	// Override tmpfs for /workspace since we're bind-mounting it
+	delete(hostCfg.Tmpfs, m.cfg.WorkspaceDir)
+	delete(hostCfg.Tmpfs, "/workspace")
+	hostCfg.ReadonlyRootfs = false // build validation needs writable fs
+	hostCfg.Mounts = []mount.Mount{
+		{
+			Type:   mount.TypeBind,
+			Source: hostDir,
+			Target: "/workspace",
+		},
 	}
 
 	// Create container with volume mount
@@ -60,19 +119,7 @@ func (m *Manager) ExecuteWithVolume(ctx context.Context, language, command, host
 			Image: imageName,
 			Cmd:   []string{"/bin/sh", "-c", command},
 		},
-		&container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   mount.TypeBind,
-					Source: hostDir,
-					Target: "/workspace",
-				},
-			},
-			Resources: container.Resources{
-				Memory:   512 * 1024 * 1024, // 512MB default
-				NanoCPUs: 1e9,               // 1 CPU default
-			},
-		},
+		hostCfg,
 		nil, nil, containerName,
 	)
 	if err != nil {
