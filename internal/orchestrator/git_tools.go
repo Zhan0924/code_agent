@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -251,8 +252,18 @@ func (o *Orchestrator) runGit(ws *workspace.Workspace, args ...string) (string, 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", args...)
+	// Disable git hooks to prevent malicious repositories from executing arbitrary code
+	fullArgs := append([]string{"-c", "core.hooksPath=/dev/null"}, args...)
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	cmd.Dir = ws.RootDir
+
+	// Minimal environment to prevent hooks from reading sensitive data
+	cmd.Env = []string{
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=echo",
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
