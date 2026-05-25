@@ -10,7 +10,7 @@
 //
 //	Temporal 铁律：**workflow 代码必须是确定性的**（任意重放产生相同结果）。
 //	有副作用的事情一律丢进 activity。本文件里的 activity：
-//	  · ParseIntentActivity    — 调 LLM
+//	  · ParseIntentActivity    — 关键词分类 intent（deploy/conversation）
 //	  · SecurityCheckActivity  — 正则匹配，本身是确定性，但放这里便于独立重试
 //	  · ExecuteTaskActivity    — 调 orchestrator 真正跑任务
 //

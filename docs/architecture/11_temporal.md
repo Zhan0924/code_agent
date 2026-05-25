@@ -139,9 +139,9 @@ Temporal 的卖点是"任意时刻重放 workflow 代码复现状态"。代价�
 ║ AgentTaskWorkflow (确定性代码, 无副作用)                       ║
 ║                                                               ║
 ║  Stage 1: ParseIntentActivity                                ║
-║    → orchestrator.parseIntent(session, msg)                  ║
+║    → classifyIntent(msg) 关键词匹配                          ║
 ║    → RetryPolicy: max 3次, backoff 1s                        ║
-║    → 返回 IntentResult{Intent, IsSensitive}                  ║
+║    → 返回 IntentResult{Intent}                               ║
 ║                                                               ║
 ║  Stage 2: SecurityCheckActivity                              ║
 ║    → 检查 intent 是否需要人工审批                             ║
@@ -370,17 +370,16 @@ type Activities struct {
 NewActivities(orch, secCfg, logger) *Activities
 ```
 
-### 5.1 `ParseIntentActivity` (L42)
+### 5.1 `ParseIntentActivity` (L72)
 
 ```go
 func (a *Activities) ParseIntentActivity(ctx, input AgentTaskInput) (*IntentResult, error) {
-    intent, err := a.orch.ParseIntent(ctx, input.SessionID, input.UserInput)
-    if err != nil { return nil, err }
-    return &IntentResult{Intent: string(intent), Confidence: 0.9}, nil
+    intent := classifyIntent(input.UserMessage) // 关键词匹配: deploy/部署/发布 → IntentDeploy
+    return &IntentResult{Intent: intent}, nil
 }
 ```
 
-**非常薄**的适配层 —— Temporal 的 Activity **就是**普通 Go 函数，加个包装让 orchestrator 的现有方法能被 Workflow 调度。
+基于关键词的 intent 分类器 —— 匹配 deploy/部署/发布/上线等关键词时返回 `IntentDeploy`，触发 SecurityCheckActivity 的审批流程。
 
 ### 5.2 `SecurityCheckActivity` (L53)
 
@@ -597,7 +596,7 @@ if cfg.Temporal.Enabled {
 - [ ] **go.mod**：`go get go.temporal.io/sdk@latest`；
 - [ ] **main.go**：取消注释 Worker 注册段；增加 client Close 到 graceful shutdown；
 - [ ] **api/handlers.go**：按 §8 的双模 if/else 改写 `/chat` 和 `/chat/approve`；
-- [ ] **orchestrator**：暴露 `ParseIntent` 公开方法（当前是 `parseIntent` 私有）；
+- [x] **ParseIntentActivity**：已实现关键词分类器（deploy/部署/发布 → IntentDeploy）；
 - [ ] **观测**：接 Temporal 的 OpenTelemetry interceptor，metrics 进 Prometheus；
 - [ ] **灰度**：`cfg.Temporal.RolloutPercent = 10`，按 session_id 哈希选路；
 - [ ] **回放测试**：用 `replayer.ReplayWorkflowHistory()` 拿一条生产 history 回放，CI 里跑一次；
