@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -43,14 +44,26 @@ func (r *RedisHot) Store(ctx context.Context, m *Memory) error {
 // Retrieve returns recent memories for a user/project from Redis.
 func (r *RedisHot) Retrieve(ctx context.Context, userID, projectID string, limit int) ([]Memory, error) {
 	pattern := r.keyPrefix(userID, projectID) + ":*"
-	keys, err := r.client.Keys(ctx, pattern).Result()
-	if err != nil {
+
+	// Use SCAN instead of KEYS to avoid O(N) blocking on large Redis instances
+	var keys []string
+	iter := r.client.Scan(ctx, 0, pattern, int64(limit*2)).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+		if len(keys) >= limit*2 {
+			break
+		}
+	}
+	if err := iter.Err(); err != nil {
 		return nil, err
 	}
 
 	if len(keys) == 0 {
 		return nil, nil
 	}
+
+	// Sort by key (timestamp embedded) and take most recent
+	sort.Strings(keys)
 	if len(keys) > limit {
 		keys = keys[len(keys)-limit:]
 	}
