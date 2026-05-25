@@ -33,6 +33,7 @@ package temporal
 import (
 	"context"
 	"regexp"
+	"strings"
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/agent/code_agent/internal/models"
@@ -68,15 +69,38 @@ func NewActivities(orch *orchestrator.Orchestrator, secCfg *config.SecurityConfi
 	return a
 }
 
-// ParseIntentActivity classifies the user's intent using the LLM.
+// ParseIntentActivity classifies the user's intent using keyword matching.
 func (a *Activities) ParseIntentActivity(ctx context.Context, input AgentTaskInput) (*IntentResult, error) {
 	a.Logger.Info("parsing intent", zap.String("task_id", input.TaskID))
 
-	// Delegate to orchestrator's intent parsing (simplified for activity)
-	// In production, this would call the LLM directly
+	intent := classifyIntent(input.UserMessage)
+	a.Logger.Info("intent classified",
+		zap.String("task_id", input.TaskID),
+		zap.String("intent", string(intent)),
+	)
+
 	return &IntentResult{
-		Intent: models.IntentConversation, // Default; real impl uses LLM
+		Intent: intent,
 	}, nil
+}
+
+// deployKeywords are phrases that indicate a deployment intent.
+var deployKeywords = []string{
+	"deploy", "部署", "发布", "上线", "rollout", "release to prod",
+	"push to production", "ship it", "go live",
+}
+
+// classifyIntent determines the task intent from the user message.
+func classifyIntent(message string) models.TaskIntent {
+	lower := strings.ToLower(message)
+
+	for _, kw := range deployKeywords {
+		if strings.Contains(lower, kw) {
+			return models.IntentDeploy
+		}
+	}
+
+	return models.IntentConversation
 }
 
 // SecurityCheckActivity checks if the user message contains sensitive operations.
