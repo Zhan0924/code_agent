@@ -269,12 +269,30 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 	if filepath.IsAbs(cleaned) {
 		return "", fmt.Errorf("absolute paths not allowed: %s", relPath)
 	}
+
+	// Construct initial path
 	absPath := filepath.Join(ws.RootDir, cleaned)
-	// Verify the resolved path is still under the workspace root
-	if !strings.HasPrefix(absPath, ws.RootDir+string(filepath.Separator)) && absPath != ws.RootDir {
-		return "", fmt.Errorf("path traversal detected: %s", relPath)
+
+	// Resolve all symlinks to real path
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		// EvalSymlinks fails if file doesn't exist (e.g., WriteFile creating new file)
+		// In this case, check the parent directory
+		parentDir := filepath.Dir(absPath)
+		realParent, err2 := filepath.EvalSymlinks(parentDir)
+		if err2 != nil {
+			return "", fmt.Errorf("parent directory invalid: %w", err2)
+		}
+		// Reconstruct path: real parent + filename
+		realPath = filepath.Join(realParent, filepath.Base(absPath))
 	}
-	return absPath, nil
+
+	// Verify resolved real path is still within workspace
+	if !strings.HasPrefix(realPath, ws.RootDir+string(filepath.Separator)) && realPath != ws.RootDir {
+		return "", fmt.Errorf("path traversal detected (symlink resolved to %s)", realPath)
+	}
+
+	return realPath, nil
 }
 
 // ListWorkspaces returns all currently tracked workspaces.
