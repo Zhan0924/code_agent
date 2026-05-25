@@ -144,15 +144,7 @@ func createWebhookExecutor(cfg WebhookExecutorConfig) func(context.Context, json
 }
 
 func createInlineExecutor(cfg InlineExecutorConfig) func(context.Context, json.RawMessage) (*models.ToolResult, error) {
-	timeout := 10 * time.Second
-	if cfg.TimeoutSeconds > 0 {
-		timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
-	}
-	_ = timeout
-
 	return func(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
-		// TODO: 集成 sandbox.Manager 执行代码
-		// 当前简化实现：返回占位符
 		return &models.ToolResult{
 			Content: fmt.Sprintf("Inline executor not yet implemented (language=%s)", cfg.Language),
 			IsError: true,
