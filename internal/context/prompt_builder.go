@@ -64,9 +64,9 @@ type PromptBuilder struct {
 	// This maximizes KV cache hit rate on the LLM side.
 	systemPrompt string
 
-	// Semi-stable long-term memory region — changes infrequently (only on
-	// summary updates). Placed immediately after system prompt so partial
-	// cache reuse is still effective.
+	// Semi-stable long-term memory region — changes when session summary updates
+	// or when cross-session memories are retrieved for the current query.
+	// Placed immediately after system prompt so partial cache reuse is still effective.
 	longTermMemoryPrefix string
 
 	// Hash of the stable prefix for cache invalidation detection

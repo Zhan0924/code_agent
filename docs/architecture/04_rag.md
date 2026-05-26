@@ -194,7 +194,7 @@ Filter{Must: [{Key: "project", Match: req.ProjectName}]}
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Embedder.Embed(texts) → 【OpenAI /embeddings API】          │
-│  batch size=100, 维度=1536 (ada-002) 或自定义                │
+│  batch size=10, 维度=1536 (DashScope text-embedding-v4)       │
 │  fallback: LocalHashEmbedder (无网络时降级,低精度)            │
 └──────────────────────┬──────────────────────────────────────┘
                        │ ([][]float32: vectors)
@@ -733,7 +733,7 @@ rag:
   embedding_base_url: "https://api.openai.com/v1"
   embedding_api_key: "${OPENAI_API_KEY}"
   embedding_model: "text-embedding-3-small"
-  embedding_batch_size: 100
+  embedding_batch_size: 10
 ```
 
 ---
