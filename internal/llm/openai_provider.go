@@ -40,6 +40,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/agent/code_agent/internal/models"
@@ -67,10 +68,13 @@ type cachedMessage struct {
 }
 
 // newOpenAIProvider creates a new OpenAI-compatible provider.
-func newOpenAIProvider(cfg *config.LLMProviderConfig, logger *zap.Logger) (*openaiProvider, error) {
+func newOpenAIProvider(cfg *config.LLMProviderConfig, httpClient *http.Client, logger *zap.Logger) (*openaiProvider, error) {
 	clientCfg := openai.DefaultConfig(cfg.APIKey)
 	if cfg.BaseURL != "" {
 		clientCfg.BaseURL = cfg.BaseURL
+	}
+	if httpClient != nil {
+		clientCfg.HTTPClient = httpClient
 	}
 
 	return &openaiProvider{

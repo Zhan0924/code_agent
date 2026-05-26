@@ -54,6 +54,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/agent/code_agent/internal/config"
@@ -121,7 +122,7 @@ type Client struct {
 
 // NewClient creates a new LLM client with circuit breaker wrapping the primary provider.
 func NewClient(cfg *config.LLMConfig, logger *zap.Logger) (*Client, error) {
-	return NewClientWithSharedBreaker(cfg, nil, logger)
+	return NewClientWithOptions(cfg, nil, nil, logger)
 }
 
 // NewClientWithSharedBreaker is the same as NewClient but also wires in a
@@ -129,14 +130,20 @@ func NewClient(cfg *config.LLMConfig, logger *zap.Logger) (*Client, error) {
 // then behaves exactly like NewClient. Kept as a separate constructor so
 // existing callers that don't have Redis access don't have to change.
 func NewClientWithSharedBreaker(cfg *config.LLMConfig, shared *SharedCircuitBreaker, logger *zap.Logger) (*Client, error) {
-	primary, err := newOpenAIProvider(&cfg.Primary, logger)
+	return NewClientWithOptions(cfg, shared, nil, logger)
+}
+
+// NewClientWithOptions creates a new LLM client with all optional dependencies.
+// httpClient is used for SSRF-protected outbound requests (pass nil for default).
+func NewClientWithOptions(cfg *config.LLMConfig, shared *SharedCircuitBreaker, httpClient *http.Client, logger *zap.Logger) (*Client, error) {
+	primary, err := newOpenAIProvider(&cfg.Primary, httpClient, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create primary LLM provider: %w", err)
 	}
 
 	var fallback Provider
 	if cfg.Fallback.BaseURL != "" {
-		fallback, err = newOpenAIProvider(&cfg.Fallback, logger)
+		fallback, err = newOpenAIProvider(&cfg.Fallback, httpClient, logger)
 		if err != nil {
 			logger.Warn("failed to create fallback LLM provider, running without fallback",
 				zap.Error(err))
@@ -275,6 +282,17 @@ func (c *Client) recordBreakerState() {
 
 // ChatCompletionStream executes a streaming chat completion.
 func (c *Client) ChatCompletionStream(ctx context.Context, req *ChatRequest) (<-chan StreamChunk, error) {
+	provider := c.primary.Name()
+
+	if c.sharedBreaker != nil && !c.sharedBreaker.Allow(ctx, provider) {
+		c.logger.Warn("shared circuit breaker open for streaming, bypassing primary",
+			zap.String("primary", provider))
+		if c.fallback != nil {
+			return c.fallback.ChatCompletionStream(ctx, req)
+		}
+		return nil, fmt.Errorf("LLM primary tripped by shared circuit breaker (streaming)")
+	}
+
 	// Try primary through circuit breaker
 	result, err := c.breaker.Execute(func() (interface{}, error) {
 		ch, streamErr := c.primary.ChatCompletionStream(ctx, req)
