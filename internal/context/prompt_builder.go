@@ -230,7 +230,8 @@ func (pb *PromptBuilder) BuildPrompt(
 }
 
 // UpdateLongTermMemory updates the semi-stable memory region.
-// This should be called infrequently (only when session summary changes).
+// Called when session summary changes or when cross-session memories are retrieved.
+// The input combines session summary with relevant long-term memories for the current query.
 func (pb *PromptBuilder) UpdateLongTermMemory(summary string) {
 	pb.longTermMemoryPrefix = summary
 	newHash := pb.hashPrefix()
