@@ -76,9 +76,10 @@ import (
 // asynchronously flushed to PostgreSQL or object storage.
 
 const (
-	// maxHotMessages is the maximum number of recent messages kept in Redis.
-	// Older messages are compressed into a summary and archived.
-	maxHotMessages = 10
+	// minHotMessages is the minimum number of messages to keep in hot storage
+	// even if token budget is exceeded. Prevents degenerate case where a single
+	// large message triggers immediate archival.
+	minHotMessages = 2
 
 	// shardCount controls the number of Redis key shards per session.
 	// This distributes a single session's data across multiple keys to avoid
@@ -233,7 +234,7 @@ var addMessageLuaScript = redis.NewScript(`
 
 // AddMessage appends a message to the session atomically via Lua script.
 // [OPT-9] Uses Redis Lua to prevent race conditions from concurrent writes.
-// When hot messages exceed maxHotMessages, older messages are compressed
+// When hot messages exceed token threshold, older messages are compressed
 // and archived to cold storage.
 func (m *Manager) AddMessage(ctx context.Context, sessionID string, msg models.Message) error {
 	// Estimate token count
@@ -257,7 +258,7 @@ func (m *Manager) AddMessage(ctx context.Context, sessionID string, msg models.M
 	nowStr := time.Now().Format(time.RFC3339Nano)
 
 	// Atomic append via Lua
-	result, err := addMessageLuaScript.Run(ctx, m.rdb,
+	_, err = addMessageLuaScript.Run(ctx, m.rdb,
 		[]string{hotKey(sessionID)},
 		string(msgJSON), ttlSeconds, nowStr,
 	).Int()
@@ -266,10 +267,9 @@ func (m *Manager) AddMessage(ctx context.Context, sessionID string, msg models.M
 		return m.addMessageFallback(ctx, sessionID, msg)
 	}
 
-	// Check if hot/cold separation or compression is needed
-	if result > maxHotMessages {
-		go m.performHotColdSeparation(ctx, sessionID)
-	}
+	// Check if hot/cold separation is needed based on token budget
+	// (async — use Background since request ctx may cancel before goroutine runs)
+	go m.checkAndArchive(context.Background(), sessionID)
 
 	return nil
 }
@@ -287,7 +287,26 @@ func (m *Manager) addMessageFallback(ctx context.Context, sessionID string, msg 
 	return m.saveHot(ctx, session)
 }
 
+// checkAndArchive checks if the session exceeds token budget and triggers archival.
+func (m *Manager) checkAndArchive(ctx context.Context, sessionID string) {
+	session, err := m.Get(ctx, sessionID)
+	if err != nil {
+		m.logger.Warn("checkAndArchive: failed to get session", zap.Error(err))
+		return
+	}
+
+	// Calculate total tokens (summary + all messages)
+	totalTokens := m.calculateTotalTokens(session)
+
+	// Trigger archival if we exceed the summary threshold
+	if totalTokens > m.cfg.SummaryThresholdTokens && len(session.Messages) > minHotMessages {
+		m.performHotColdSeparation(ctx, sessionID)
+	}
+}
+
 // performHotColdSeparation runs asynchronously to archive old messages.
+// Archives messages until total tokens fall below SummaryThresholdTokens,
+// while keeping at least minHotMessages in hot storage.
 func (m *Manager) performHotColdSeparation(ctx context.Context, sessionID string) {
 	session, err := m.Get(ctx, sessionID)
 	if err != nil {
@@ -295,14 +314,56 @@ func (m *Manager) performHotColdSeparation(ctx context.Context, sessionID string
 		return
 	}
 
-	if len(session.Messages) <= maxHotMessages {
+	if len(session.Messages) <= minHotMessages {
 		return
 	}
 
-	archiveCount := len(session.Messages) - maxHotMessages
+	// Calculate how many messages to archive based on token budget
+	totalTokens := m.calculateTotalTokens(session)
+	if totalTokens <= m.cfg.SummaryThresholdTokens {
+		return
+	}
+
+	// Find the split point: keep recent messages within token budget
+	targetTokens := m.cfg.SummaryThresholdTokens * 3 / 4 // Leave 25% headroom
+	runningTokens := estimateTokens(session.Summary)
+	keepFrom := len(session.Messages)
+
+	// Scan from newest to oldest, accumulating tokens
+	for i := len(session.Messages) - 1; i >= minHotMessages; i-- {
+		msgTokens := session.Messages[i].TokenCount
+		if msgTokens == 0 {
+			msgTokens = estimateTokens(session.Messages[i].Content)
+		}
+		runningTokens += msgTokens
+		if runningTokens > targetTokens {
+			keepFrom = i + 1
+			break
+		}
+		keepFrom = i
+	}
+
+	// Ensure we keep at least minHotMessages
+	if keepFrom < minHotMessages {
+		keepFrom = minHotMessages
+	}
+
+	// If even the newest messages exceed budget, still archive older ones
+	maxKeepFrom := len(session.Messages) - minHotMessages
+	if keepFrom > maxKeepFrom {
+		keepFrom = maxKeepFrom
+	}
+
+	// Nothing to archive
+	if keepFrom <= 0 {
+		return
+	}
+
+	archiveCount := keepFrom
 	m.logger.Info("archiving cold messages",
 		zap.String("session_id", sessionID),
 		zap.Int("archive_count", archiveCount),
+		zap.Int("total_tokens_before", totalTokens),
 	)
 
 	coldMsgs := session.Messages[:archiveCount]
@@ -311,8 +372,8 @@ func (m *Manager) performHotColdSeparation(ctx context.Context, sessionID string
 	session.Summary = m.buildSummary(session.Summary, coldMsgs)
 	session.Messages = session.Messages[archiveCount:]
 
-	// Token budget check
-	totalTokens := m.calculateTotalTokens(session)
+	// Double-check: if still over budget, apply sliding window compression
+	totalTokens = m.calculateTotalTokens(session)
 	if totalTokens > m.cfg.SummaryThresholdTokens {
 		m.compressContext(session)
 	}
