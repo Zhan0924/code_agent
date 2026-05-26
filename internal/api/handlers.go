@@ -180,7 +180,7 @@ func (s *Server) handleChatStream(c *gin.Context) {
 
 	sessionID := req.SessionID
 	if sessionID == "" {
-		sess, err := s.sessionMgr.Create(c.Request.Context(), "anonymous")
+		sess, err := s.sessionMgr.Create(c.Request.Context(), "anonymous", "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 			return
@@ -255,7 +255,7 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 
 	sessionID := req.SessionID
 	if sessionID == "" {
-		sess, err := s.sessionMgr.Create(c.Request.Context(), "anonymous")
+		sess, err := s.sessionMgr.Create(c.Request.Context(), "anonymous", "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 			return
@@ -299,13 +299,14 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 
 func (s *Server) handleCreateSession(c *gin.Context) {
 	var req struct {
-		UserID string `json:"user_id"`
+		UserID    string `json:"user_id"`
+		ProjectID string `json:"project_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		req.UserID = "anonymous"
 	}
 
-	sess, err := s.sessionMgr.Create(c.Request.Context(), req.UserID)
+	sess, err := s.sessionMgr.Create(c.Request.Context(), req.UserID, req.ProjectID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 		return
@@ -475,7 +476,7 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 	s.logger.Info("websocket connection established", zap.String("remote", conn.RemoteAddr().String()))
 
 	// Create a session for this WebSocket connection
-	sess, err := s.sessionMgr.Create(c.Request.Context(), "ws-user")
+	sess, err := s.sessionMgr.Create(c.Request.Context(), "ws-user", "")
 	if err != nil {
 		s.logger.Error("failed to create session for websocket", zap.Error(err))
 		return

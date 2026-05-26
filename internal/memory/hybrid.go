@@ -7,12 +7,18 @@ import (
 	"go.uber.org/zap"
 )
 
+// Embedder generates vector embeddings from text.
+type Embedder interface {
+	Embed(ctx context.Context, texts []string) ([][]float32, error)
+}
+
 // HybridStore combines Redis (hot) and PostgreSQL (cold) memory stores.
 // Reads check Redis first, falling back to PG. Writes go to both.
 type HybridStore struct {
-	hot    *RedisHot
-	cold   *PGCold
-	logger *zap.Logger
+	hot      *RedisHot
+	cold     *PGCold
+	embedder Embedder
+	logger   *zap.Logger
 }
 
 // NewHybridStore creates a hybrid memory store.
@@ -24,8 +30,52 @@ func NewHybridStore(hot *RedisHot, cold *PGCold, logger *zap.Logger) *HybridStor
 	}
 }
 
+// SetEmbedder injects an embedder for semantic operations.
+func (h *HybridStore) SetEmbedder(e Embedder) {
+	h.embedder = e
+}
+
+// embedText generates an embedding for a single text, returning nil on failure.
+func (h *HybridStore) embedText(ctx context.Context, text string) []float32 {
+	if h.embedder == nil {
+		return nil
+	}
+	vecs, err := h.embedder.Embed(ctx, []string{text})
+	if err != nil || len(vecs) == 0 {
+		h.logger.Debug("embedding failed", zap.Error(err))
+		return nil
+	}
+	return vecs[0]
+}
+
 // Store writes a memory to both hot and cold stores.
+// Generates embedding if an embedder is available, and resolves conflicts
+// with existing memories before inserting.
 func (h *HybridStore) Store(ctx context.Context, m *Memory) error {
+	if len(m.Embedding) == 0 {
+		m.Embedding = h.embedText(ctx, m.Content)
+	}
+
+	// Conflict resolution: check if a highly similar memory already exists
+	if h.cold != nil && len(m.Embedding) > 0 {
+		candidates, err := h.cold.RetrieveByVector(m.Embedding, m.UserID, m.ProjectID, 3)
+		if err == nil && len(candidates) > 0 {
+			resolver := NewConflictResolver(h.cold)
+			conflicts := resolver.FindConflicts(m, candidates)
+			if len(conflicts) > 0 {
+				resolved := resolver.Resolve(&conflicts[0], m)
+				if err := h.cold.Update(resolved); err != nil {
+					h.logger.Debug("conflict resolution update failed", zap.Error(err))
+				} else {
+					if h.hot != nil {
+						_ = h.hot.Store(ctx, resolved)
+					}
+					return nil
+				}
+			}
+		}
+	}
+
 	if h.hot != nil {
 		if err := h.hot.Store(ctx, m); err != nil {
 			h.logger.Debug("hot store write failed", zap.Error(err))
@@ -39,16 +89,29 @@ func (h *HybridStore) Store(ctx context.Context, m *Memory) error {
 	return nil
 }
 
-// Retrieve searches hot store first, falls back to cold store.
+// Retrieve searches memories using semantic similarity when possible,
+// falling back to text-based search.
 func (h *HybridStore) Retrieve(ctx context.Context, userID, projectID, query string, limit int) ([]Memory, error) {
-	if h.hot != nil {
+	queryEmbedding := h.embedText(ctx, query)
+
+	// Try hot layer semantic search first
+	if h.hot != nil && queryEmbedding != nil {
+		memories, err := h.hot.RetrieveByQuery(ctx, userID, projectID, queryEmbedding, limit)
+		if err == nil && len(memories) >= limit {
+			return memories, nil
+		}
+	} else if h.hot != nil {
 		memories, err := h.hot.Retrieve(ctx, userID, projectID, limit)
 		if err == nil && len(memories) >= limit {
 			return memories, nil
 		}
 	}
 
+	// Fall back to cold layer
 	if h.cold != nil {
+		if queryEmbedding != nil {
+			return h.cold.RetrieveByVector(queryEmbedding, userID, projectID, limit)
+		}
 		return h.cold.Retrieve(userID, projectID, query, limit)
 	}
 	return nil, nil

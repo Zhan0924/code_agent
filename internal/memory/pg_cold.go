@@ -2,6 +2,8 @@ package memory
 
 import (
 	"database/sql"
+	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -40,20 +42,28 @@ func (p *PGCold) Migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_memories_user_project ON memories(user_id, project_id);
 		CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 		CREATE INDEX IF NOT EXISTS idx_memories_score ON memories(score DESC);
+		CREATE INDEX IF NOT EXISTS idx_memories_embedding
+			ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 	`)
 	return err
 }
 
-// Store persists a memory to PostgreSQL.
+// Store persists a memory to PostgreSQL, including embedding if present.
 func (p *PGCold) Store(m *Memory) error {
+	var embeddingStr *string
+	if len(m.Embedding) > 0 {
+		s := formatVector(m.Embedding)
+		embeddingStr = &s
+	}
 	_, err := p.db.Exec(`
-		INSERT INTO memories (id, user_id, project_id, type, content, score, access_count, created_at, last_accessed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO memories (id, user_id, project_id, type, content, embedding, score, access_count, created_at, last_accessed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (id) DO UPDATE SET
 			content = EXCLUDED.content,
+			embedding = EXCLUDED.embedding,
 			score = EXCLUDED.score,
 			last_accessed_at = NOW()
-	`, m.ID, m.UserID, m.ProjectID, m.Type, m.Content, m.Score, m.AccessCount, m.CreatedAt, m.LastAccessedAt)
+	`, m.ID, m.UserID, m.ProjectID, m.Type, m.Content, embeddingStr, m.Score, m.AccessCount, m.CreatedAt, m.LastAccessedAt)
 	return err
 }
 
@@ -103,4 +113,84 @@ func (p *PGCold) Decay(olderThan time.Duration, factor float64) (int, error) {
 	}
 	n, _ := result.RowsAffected()
 	return int(n), nil
+}
+
+// RetrieveByVector searches memories using pgvector cosine distance.
+func (p *PGCold) RetrieveByVector(embedding []float32, userID, projectID string, limit int) ([]Memory, error) {
+	vecStr := formatVector(embedding)
+	rows, err := p.db.Query(`
+		SELECT id, user_id, project_id, type, content, embedding, score, access_count, created_at, last_accessed_at
+		FROM memories
+		WHERE user_id = $1 AND project_id = $2 AND embedding IS NOT NULL
+		ORDER BY embedding <=> $3
+		LIMIT $4
+	`, userID, projectID, vecStr, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var memories []Memory
+	for rows.Next() {
+		var m Memory
+		var embeddingStr *string
+		if err := rows.Scan(&m.ID, &m.UserID, &m.ProjectID, &m.Type, &m.Content,
+			&embeddingStr, &m.Score, &m.AccessCount, &m.CreatedAt, &m.LastAccessedAt); err != nil {
+			continue
+		}
+		if embeddingStr != nil {
+			m.Embedding = parseVector(*embeddingStr)
+		}
+		memories = append(memories, m)
+	}
+	return memories, rows.Err()
+}
+
+// Update modifies an existing memory's content, embedding, and score.
+func (p *PGCold) Update(m *Memory) error {
+	var embeddingStr *string
+	if len(m.Embedding) > 0 {
+		s := formatVector(m.Embedding)
+		embeddingStr = &s
+	}
+	_, err := p.db.Exec(`
+		UPDATE memories SET content = $1, embedding = $2, score = $3, last_accessed_at = NOW()
+		WHERE id = $4
+	`, m.Content, embeddingStr, m.Score, m.ID)
+	return err
+}
+
+// formatVector converts a float32 slice to pgvector's text format: [0.1,0.2,...]
+func formatVector(v []float32) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, f := range v {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%g", f)
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+// parseVector converts pgvector's text format [0.1,0.2,...] to float32 slice.
+func parseVector(s string) []float32 {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return nil
+	}
+	s = s[1 : len(s)-1]
+	if s == "" {
+		return []float32{}
+	}
+	parts := strings.Split(s, ",")
+	vec := make([]float32, 0, len(parts))
+	for _, p := range parts {
+		var f float32
+		if _, err := fmt.Sscanf(strings.TrimSpace(p), "%f", &f); err == nil {
+			vec = append(vec, f)
+		}
+	}
+	return vec
 }

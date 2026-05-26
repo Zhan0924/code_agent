@@ -168,6 +168,7 @@ type Message struct {
 type Session struct {
 	ID        string    `json:"id"`
 	UserID    string    `json:"user_id"`
+	ProjectID string    `json:"project_id,omitempty"`
 	Messages  []Message `json:"messages"`
 	Summary   string    `json:"summary,omitempty"` // compressed history summary
 	CreatedAt time.Time `json:"created_at"`

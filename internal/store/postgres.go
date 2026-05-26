@@ -124,6 +124,12 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// DB returns the underlying *sql.DB for advanced use cases.
+// Only use this when necessary (e.g., memory module needs direct DB access).
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 // Migrate runs database migrations to create required tables.
 func (s *Store) Migrate(ctx context.Context) error {
 	migrations := []string{

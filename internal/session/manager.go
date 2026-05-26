@@ -150,10 +150,14 @@ func sessionShard(sessionID string) uint32 {
 // ─── CRUD Operations ─────────────────────────────────────────────────────────
 
 // Create initializes a new session.
-func (m *Manager) Create(ctx context.Context, userID string) (*models.Session, error) {
+func (m *Manager) Create(ctx context.Context, userID, projectID string) (*models.Session, error) {
+	if projectID == "" {
+		projectID = "default"
+	}
 	session := &models.Session{
 		ID:        uuid.New().String(),
 		UserID:    userID,
+		ProjectID: projectID,
 		Messages:  make([]models.Message, 0),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -165,6 +169,7 @@ func (m *Manager) Create(ctx context.Context, userID string) (*models.Session, e
 
 	m.logger.Info("session created",
 		zap.String("session_id", session.ID),
+		zap.String("project_id", projectID),
 		zap.Uint32("shard", sessionShard(session.ID)),
 	)
 	return session, nil

@@ -32,14 +32,26 @@ func (a *memoryAdapter) Retrieve(ctx context.Context, userID, projectID, query s
 	return entries, nil
 }
 
-// NewMemoryAdapter creates a memory adapter backed by Redis hot tier.
-// PG cold tier can be added later once store.Store exposes the underlying sql.DB.
-func NewMemoryAdapter(rdb *redis.Client, _ *store.Store, logger *zap.Logger) orchestrator.MemoryRetriever {
+// NewMemoryAdapter creates a memory adapter backed by Redis hot tier and PG cold tier.
+func NewMemoryAdapter(rdb *redis.Client, pgStore *store.Store, embedder memory.Embedder, logger *zap.Logger) orchestrator.MemoryRetriever {
 	if rdb == nil {
 		return nil
 	}
 
 	hot := memory.NewRedisHot(rdb, logger)
-	hybrid := memory.NewHybridStore(hot, nil, logger)
+
+	var cold *memory.PGCold
+	if pgStore != nil {
+		cold = memory.NewPGCold(pgStore.DB(), logger)
+		if err := cold.Migrate(); err != nil {
+			logger.Warn("memory cold store migration failed", zap.Error(err))
+			cold = nil
+		}
+	}
+
+	hybrid := memory.NewHybridStore(hot, cold, logger)
+	if embedder != nil {
+		hybrid.SetEmbedder(embedder)
+	}
 	return &memoryAdapter{store: hybrid}
 }

@@ -338,7 +338,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	})
 
 	// Extract memories from this interaction (async, non-blocking)
-	o.extractMemoriesAsync(sessionID, userMessage, response)
+	o.extractMemoriesAsync(ctx, sessionID, userMessage, response)
 
 	return &models.ChatResponse{
 		SessionID: sessionID, TaskID: task.ID,
@@ -436,8 +436,13 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		if sess != nil {
 			summary = sess.Summary
 		}
-		// Inject long-term memory alongside session summary
-		return o.buildLongTermMemory(ctx, summary, task.SessionID, "", task.UserInput)
+		userID := ""
+		projectID := ""
+		if sess != nil {
+			userID = sess.UserID
+			projectID = sess.ProjectID
+		}
+		return o.buildLongTermMemory(ctx, summary, userID, projectID, task.UserInput)
 	}())
 
 	messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
@@ -840,7 +845,13 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			if sess != nil {
 				summary = sess.Summary
 			}
-			return o.buildLongTermMemory(ctx, summary, sessionID, "", task.UserInput)
+			userID := ""
+			projectID := ""
+			if sess != nil {
+				userID = sess.UserID
+				projectID = sess.ProjectID
+			}
+			return o.buildLongTermMemory(ctx, summary, userID, projectID, task.UserInput)
 		}())
 
 		messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
@@ -881,7 +892,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 					_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
 						Role: models.RoleAssistant, Content: result.content,
 					})
-					o.extractMemoriesAsync(sessionID, task.UserInput, result.content)
+					o.extractMemoriesAsync(ctx, sessionID, task.UserInput, result.content)
 				}
 				eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
 				return

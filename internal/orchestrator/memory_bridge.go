@@ -34,14 +34,22 @@ func (o *Orchestrator) SetMemoryExtractor(ext *memory.Extractor) {
 }
 
 // extractMemoriesAsync runs memory extraction in a background goroutine.
-func (o *Orchestrator) extractMemoriesAsync(sessionID, userMsg, assistantMsg string) {
+func (o *Orchestrator) extractMemoriesAsync(ctx context.Context, sessionID, userMsg, assistantMsg string) {
 	if o.memoryExtractor == nil {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), memoryExtractionTimeout)
+		bgCtx, cancel := context.WithTimeout(context.Background(), memoryExtractionTimeout)
 		defer cancel()
-		o.memoryExtractor.ExtractFromInteraction(ctx, sessionID, "", userMsg, assistantMsg)
+
+		// Fetch session to get real userID and projectID
+		sess, err := o.sessionMgr.Get(bgCtx, sessionID)
+		if err != nil {
+			o.logger.Debug("failed to get session for memory extraction", zap.Error(err))
+			return
+		}
+
+		o.memoryExtractor.ExtractFromInteraction(bgCtx, sess.UserID, sess.ProjectID, userMsg, assistantMsg)
 	}()
 }
 

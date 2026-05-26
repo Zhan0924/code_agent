@@ -166,12 +166,12 @@ func main() {
 	// ─── Initialize RAG Engine (optional - depends on Qdrant) ────────────
 	// [OPT-2] Wire the OpenAI Embedder to prevent nil pointer on IndexCode/Retrieve.
 	var ragEngine *rag.Engine
+	var embedder rag.Embedder // Shared embedder for RAG and memory systems
 	qdrantStore, err := rag.NewQdrantStore(&cfg.Qdrant, logger)
 	if err != nil {
 		logger.Warn("Qdrant not available, RAG disabled", zap.Error(err))
 	} else {
 		// Select embedding provider based on config
-		var embedder rag.Embedder
 		provider := cfg.RAG.EmbeddingProvider
 		if provider == "" {
 			// Auto-detect: use openai if credentials are available, else local
@@ -316,7 +316,7 @@ func main() {
 	logger.Info("multi-agent supervisor attached")
 
 	// ─── Wire Memory Store (optional) ───────────────────────────────────
-	memoryAdapter := NewMemoryAdapter(rdb, pgStore, logger)
+	memoryAdapter := NewMemoryAdapter(rdb, pgStore, embedder, logger)
 	if memoryAdapter != nil {
 		orch.SetMemoryStore(memoryAdapter)
 		logger.Info("long-term memory store wired into orchestrator")

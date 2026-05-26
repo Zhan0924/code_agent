@@ -94,3 +94,65 @@ func (r *RedisHot) Delete(ctx context.Context, userID, projectID, memoryID strin
 	key := fmt.Sprintf("%s:%s", r.keyPrefix(userID, projectID), memoryID)
 	return r.client.Del(ctx, key).Err()
 }
+
+// RetrieveByQuery returns memories ranked by cosine similarity to the query embedding.
+// Since hot layer is small (< 50 items with 24h TTL), in-memory ranking is acceptable.
+func (r *RedisHot) RetrieveByQuery(ctx context.Context, userID, projectID string, queryEmbedding []float32, limit int) ([]Memory, error) {
+	pattern := r.keyPrefix(userID, projectID) + ":*"
+
+	var keys []string
+	iter := r.client.Scan(ctx, 0, pattern, 100).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+		if len(keys) >= 50 {
+			break
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	pipe := r.client.Pipeline()
+	cmds := make([]*redis.StringCmd, len(keys))
+	for i, key := range keys {
+		cmds[i] = pipe.Get(ctx, key)
+	}
+	_, _ = pipe.Exec(ctx)
+
+	type scored struct {
+		memory Memory
+		sim    float64
+	}
+	var results []scored
+	for _, cmd := range cmds {
+		data, err := cmd.Result()
+		if err != nil {
+			continue
+		}
+		var m Memory
+		if json.Unmarshal([]byte(data), &m) != nil {
+			continue
+		}
+		if len(m.Embedding) == 0 {
+			continue
+		}
+		sim := CosineSimilarity(queryEmbedding, m.Embedding)
+		results = append(results, scored{memory: m, sim: sim})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].sim > results[j].sim
+	})
+
+	memories := make([]Memory, 0, limit)
+	for i := range results {
+		if i >= limit {
+			break
+		}
+		memories = append(memories, results[i].memory)
+	}
+	return memories, nil
+}

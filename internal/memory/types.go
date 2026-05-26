@@ -30,6 +30,8 @@ type Memory struct {
 type MemoryStore interface {
 	Store(m *Memory) error
 	Retrieve(userID, projectID string, query string, limit int) ([]Memory, error)
+	RetrieveByVector(embedding []float32, userID, projectID string, limit int) ([]Memory, error)
+	Update(m *Memory) error
 	Touch(id string) error
 	Decay(olderThan time.Duration, factor float64) (int, error)
 }
