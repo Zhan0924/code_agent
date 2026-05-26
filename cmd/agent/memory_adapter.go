@@ -32,8 +32,13 @@ func (a *memoryAdapter) Retrieve(ctx context.Context, userID, projectID, query s
 	return entries, nil
 }
 
+// HybridStore returns the underlying store for use by the memory extractor.
+func (a *memoryAdapter) HybridStore() *memory.HybridStore {
+	return a.store
+}
+
 // NewMemoryAdapter creates a memory adapter backed by Redis hot tier and PG cold tier.
-func NewMemoryAdapter(rdb *redis.Client, pgStore *store.Store, embedder memory.Embedder, logger *zap.Logger) orchestrator.MemoryRetriever {
+func NewMemoryAdapter(rdb *redis.Client, pgStore *store.Store, embedder memory.Embedder, logger *zap.Logger) *memoryAdapter {
 	if rdb == nil {
 		return nil
 	}

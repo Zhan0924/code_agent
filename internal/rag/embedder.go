@@ -67,7 +67,7 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 		return nil, nil
 	}
 
-	const maxBatchSize = 128 // OpenAI batch limit
+	const maxBatchSize = 10 // DashScope batch limit (text-embedding-v4)
 	var allEmbeddings [][]float32
 
 	for i := 0; i < len(texts); i += maxBatchSize {
@@ -79,8 +79,9 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 
 		// Convert to EmbeddingRequestStrings
 		req := openai.EmbeddingRequest{
-			Input: batch,
-			Model: openai.EmbeddingModel(e.model),
+			Input:      batch,
+			Model:      openai.EmbeddingModel(e.model),
+			Dimensions: 1536, // Match pgvector column size
 		}
 
 		resp, err := e.client.CreateEmbeddings(ctx, req)

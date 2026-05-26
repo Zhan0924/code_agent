@@ -60,6 +60,7 @@ import (
 	"github.com/agent/code_agent/internal/indexer"
 	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/mcp"
+	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/multiagent"
 	"github.com/agent/code_agent/internal/orchestrator"
@@ -167,34 +168,33 @@ func main() {
 	// [OPT-2] Wire the OpenAI Embedder to prevent nil pointer on IndexCode/Retrieve.
 	var ragEngine *rag.Engine
 	var embedder rag.Embedder // Shared embedder for RAG and memory systems
+
+	// Create embedder independently of Qdrant — memory system needs it even without RAG
+	embeddingProvider := cfg.RAG.EmbeddingProvider
+	if embeddingProvider == "" {
+		if cfg.RAG.EmbeddingAPIKey != "" && cfg.RAG.EmbeddingBaseURL != "" {
+			embeddingProvider = "openai"
+		} else if cfg.LLM.Primary.APIKey != "" {
+			embeddingProvider = "openai"
+		} else {
+			embeddingProvider = "local"
+		}
+		logger.Info("embedding provider auto-detected", zap.String("provider", embeddingProvider))
+	}
+	switch embeddingProvider {
+	case "openai":
+		embedder = rag.NewOpenAIEmbedder(&cfg.RAG, &cfg.LLM.Primary, logger)
+	case "local":
+		embedder = rag.NewLocalHashEmbedder(cfg.Qdrant.VectorSize, logger)
+	default:
+		logger.Warn("unknown embedding_provider, using local", zap.String("provider", embeddingProvider))
+		embedder = rag.NewLocalHashEmbedder(cfg.Qdrant.VectorSize, logger)
+	}
+
 	qdrantStore, err := rag.NewQdrantStore(&cfg.Qdrant, logger)
 	if err != nil {
 		logger.Warn("Qdrant not available, RAG disabled", zap.Error(err))
 	} else {
-		// Select embedding provider based on config
-		provider := cfg.RAG.EmbeddingProvider
-		if provider == "" {
-			// Auto-detect: use openai if credentials are available, else local
-			if cfg.RAG.EmbeddingAPIKey != "" && cfg.RAG.EmbeddingBaseURL != "" {
-				provider = "openai"
-			} else if cfg.LLM.Primary.APIKey != "" {
-				provider = "openai" // fallback to LLM primary credentials
-			} else {
-				provider = "local"
-			}
-			logger.Info("embedding provider auto-detected", zap.String("provider", provider))
-		}
-
-		switch provider {
-		case "openai":
-			embedder = rag.NewOpenAIEmbedder(&cfg.RAG, &cfg.LLM.Primary, logger)
-		case "local":
-			embedder = rag.NewLocalHashEmbedder(cfg.Qdrant.VectorSize, logger)
-		default:
-			logger.Warn("unknown embedding_provider, using local", zap.String("provider", provider))
-			embedder = rag.NewLocalHashEmbedder(cfg.Qdrant.VectorSize, logger)
-		}
-
 		// Initialize reranker if configured
 		var reranker rag.Reranker
 		if cfg.RAG.RerankEnabled && cfg.RAG.RerankModel != "" && cfg.RAG.RerankBaseURL != "" {
@@ -205,7 +205,7 @@ func main() {
 		defer qdrantStore.Close()
 		logger.Info("RAG engine initialized",
 			zap.String("collection", cfg.Qdrant.Collection),
-			zap.String("embedding_provider", provider),
+			zap.String("embedding_provider", embeddingProvider),
 			zap.String("embedding_model", cfg.RAG.EmbeddingModel),
 		)
 	}
@@ -316,10 +316,19 @@ func main() {
 	logger.Info("multi-agent supervisor attached")
 
 	// ─── Wire Memory Store (optional) ───────────────────────────────────
-	memoryAdapter := NewMemoryAdapter(rdb, pgStore, embedder, logger)
-	if memoryAdapter != nil {
-		orch.SetMemoryStore(memoryAdapter)
+	memAdapter := NewMemoryAdapter(rdb, pgStore, embedder, logger)
+	if memAdapter != nil {
+		orch.SetMemoryStore(memAdapter)
 		logger.Info("long-term memory store wired into orchestrator")
+	}
+
+	// ─── Wire Memory Extractor (optional) ────────────────────────────────
+	if memAdapter != nil {
+		// Get the underlying HybridStore from adapter to create extractor
+		// The extractor needs the store interface and LLM client
+		memoryExtractor := memory.NewExtractor(memAdapter.HybridStore(), llmClient, logger)
+		orch.SetMemoryExtractor(memoryExtractor)
+		logger.Info("memory extractor wired into orchestrator")
 	}
 
 	// ─── Initialize API Server ───────────────────────────────────────────

@@ -58,6 +58,12 @@ const memoryExtractionTimeout = 30 * time.Second
 // buildLongTermMemory combines session summary with relevant memories
 // for injection into the prompt's semi-stable region.
 func (o *Orchestrator) buildLongTermMemory(ctx context.Context, sessionSummary, userID, projectID, query string) string {
+	o.logger.Debug("buildLongTermMemory called",
+		zap.String("user_id", userID),
+		zap.String("project_id", projectID),
+		zap.String("query", query),
+		zap.Bool("has_memory_store", o.memoryStore != nil))
+
 	var parts []string
 
 	if sessionSummary != "" {
@@ -65,15 +71,22 @@ func (o *Orchestrator) buildLongTermMemory(ctx context.Context, sessionSummary, 
 	}
 
 	if o.memoryStore != nil && query != "" {
+		o.logger.Debug("retrieving long-term memories",
+			zap.String("user_id", userID),
+			zap.String("project_id", projectID),
+			zap.String("query", query))
 		memories, err := o.memoryStore.Retrieve(ctx, userID, projectID, query, 5)
 		if err != nil {
 			o.logger.Debug("memory retrieval failed", zap.Error(err))
 		} else if len(memories) > 0 {
+			o.logger.Debug("memories retrieved", zap.Int("count", len(memories)))
 			var memParts []string
 			for _, m := range memories {
 				memParts = append(memParts, fmt.Sprintf("[%s] %s", m.Type, m.Content))
 			}
 			parts = append(parts, "[Long-Term Memory]\n"+strings.Join(memParts, "\n"))
+		} else {
+			o.logger.Debug("no memories found for query")
 		}
 	}
 

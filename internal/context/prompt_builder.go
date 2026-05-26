@@ -153,10 +153,16 @@ func (pb *PromptBuilder) BuildPrompt(
 	messages = append(messages, systemMsg)
 
 	// ── Region 2: Semi-Stable Long-Term Memory ──
-	if session != nil && session.Summary != "" {
+	// longTermMemoryPrefix is set by UpdateLongTermMemory() and contains both
+	// session summary and cross-session long-term memories.
+	memoryContent := pb.longTermMemoryPrefix
+	if memoryContent == "" && session != nil && session.Summary != "" {
+		memoryContent = fmt.Sprintf("[Conversation History Summary]\n%s", session.Summary)
+	}
+	if memoryContent != "" {
 		memoryMsg := models.Message{
 			Role:    models.RoleSystem,
-			Content: fmt.Sprintf("[Conversation History Summary]\n%s", session.Summary),
+			Content: memoryContent,
 		}
 		if pb.enablePromptCaching {
 			memoryMsg.CacheControl = &models.CacheControl{Type: "ephemeral"}

@@ -2079,10 +2079,10 @@ RAG 检索 1000 chunks × 5μs  = 5ms   ← 可接受
 
 **当前实现的四维指标**:
 ```
-1. 请求计数:  llm_request_total{provider, model, status}
-2. 延迟分布:  llm_request_duration_seconds{provider, model}
-3. Token 消耗: llm_tokens_used_total{provider, type}
-4. 熔断状态:  llm_circuit_breaker_state{provider}
+1. 请求计数:  code_agent_llm_request_total{provider, model, status}
+2. 延迟分布:  code_agent_llm_request_duration_seconds{provider, model}
+3. Token 消耗: code_agent_llm_tokens_used_total{provider, type}
+4. 熔断状态:  code_agent_llm_circuit_breaker_state{provider}
 ```
 
 **完整可观测性架构**:
@@ -2135,17 +2135,17 @@ RAG 检索 1000 chunks × 5μs  = 5ms   ← 可接受
 ```yaml
 # 错误率 > 10% 持续 5 分钟
 - alert: LLMHighErrorRate
-  expr: rate(llm_request_total{status="error"}[5m]) / rate(llm_request_total[5m]) > 0.1
+  expr: rate(code_agent_llm_request_total{status="error"}[5m]) / rate(code_agent_llm_request_total[5m]) > 0.1
   for: 5m
 
 # 熔断器打开
 - alert: LLMCircuitBreakerOpen
-  expr: llm_circuit_breaker_state > 0
+  expr: code_agent_llm_circuit_breaker_state > 0
   for: 1m
 
 # Token 消耗异常
 - alert: LLMTokenSpike
-  expr: rate(llm_tokens_used_total[5m]) > 2 * avg_over_time(rate(llm_tokens_used_total[5m])[1h:5m])
+  expr: rate(code_agent_llm_tokens_used_total[5m]) > 2 * avg_over_time(rate(code_agent_llm_tokens_used_total[5m])[1h:5m])
 ```
 
 </details>

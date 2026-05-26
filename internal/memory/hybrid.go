@@ -38,6 +38,7 @@ func (h *HybridStore) SetEmbedder(e Embedder) {
 // embedText generates an embedding for a single text, returning nil on failure.
 func (h *HybridStore) embedText(ctx context.Context, text string) []float32 {
 	if h.embedder == nil {
+		h.logger.Debug("embedder is nil, skipping embedding generation")
 		return nil
 	}
 	vecs, err := h.embedder.Embed(ctx, []string{text})
