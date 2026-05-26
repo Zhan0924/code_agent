@@ -23,6 +23,8 @@
 //	  · requestID 在最外层打，整个请求生命周期共用同一个 ID；
 //	  · metrics 要看到"最终"的 status code，所以必须在认证之后；
 //	  · rateLimit 比认证更外是故意的：rl 失败不应消耗 auth 的 Redis 查询预算；
+//	    当 Redis 客户端已配置时使用分布式限流器（跨副本共享），否则回退到进程内限流。
+//	    注意：Redis 限流器在 Redis 错误时 fail-open（允许请求通过），不会回退到内存版本；
 //	  · logging 最内，handler 已处理完后精确记录 status。
 //
 // 【分组策略】
@@ -47,6 +49,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/agent/code_agent/internal/auth"
 	"github.com/agent/code_agent/internal/mcp"
@@ -60,6 +63,7 @@ import (
 	"github.com/agent/code_agent/internal/workspace"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
@@ -81,6 +85,7 @@ type Server struct {
 	jwtMgr        *auth.JWTManager
 	apiKeys       *auth.APIKeyStore
 	authEnabled   bool
+	rdb           *redis.Client            // Redis client for distributed rate limiting
 	pgHealthPing  func(ctx context.Context) error // 可选 PG 健康检查
 	store         *store.Store                     // 可选 PG 持久化（动态工具等）
 	p0            *P0Probes                       // [P0-debug] 可观测探针（可选）
@@ -99,6 +104,7 @@ type ServerOptions struct {
 	JWTManager   *auth.JWTManager
 	APIKeyStore  *auth.APIKeyStore
 	AuthEnabled  bool
+	RedisClient  *redis.Client                    // For distributed rate limiting
 	PGHealthPing func(ctx context.Context) error // PostgreSQL health check (store.Ping)
 }
 
@@ -129,6 +135,7 @@ func NewServer(
 			s.apiKeys = opts[0].APIKeyStore
 			s.authEnabled = opts[0].AuthEnabled
 		}
+		s.rdb = opts[0].RedisClient
 		s.pgHealthPing = opts[0].PGHealthPing
 	}
 
@@ -178,13 +185,19 @@ func (s *Server) Handler() http.Handler {
 
 // setupMiddleware configures global middleware with observability and security.
 func (s *Server) setupMiddleware(logger *zap.Logger) {
-	rl := newRateLimiter(DefaultRateLimiterConfig(), logger)
+	// Use Redis rate limiter if available, otherwise fall back to in-memory
+	if s.rdb != nil {
+		redisRL := auth.NewRedisRateLimiter(s.rdb, "ratelimit:api", 10, time.Second, logger)
+		s.router.Use(redisRL.GinMiddleware())
+	} else {
+		rl := newRateLimiter(DefaultRateLimiterConfig(), logger)
+		s.router.Use(rateLimiterMiddleware(rl))
+	}
 
 	s.router.Use(recoveryMiddleware(logger))
 	s.router.Use(requestIDMiddleware())
 	s.router.Use(tracing.GinMiddleware("code-agent"))
 	s.router.Use(metricsMiddleware())
-	s.router.Use(rateLimiterMiddleware(rl))
 	s.router.Use(s.loggingMiddleware())
 	s.router.Use(s.corsMiddleware())
 }

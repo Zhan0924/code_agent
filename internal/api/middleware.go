@@ -22,12 +22,12 @@
 //	Gin worker goroutine（虽然不至于崩服务，因为 Gin 每个连接都有独立
 //	goroutine，但会丢掉当前请求的响应）。
 //
-// 【限流设计（当前 in-memory 版）】
+// 【限流设计】
 //
-//	这里的 rateLimiter 是进程内 token bucket，以 client IP 为 key。
-//	局限：N 个副本彼此不同步，实际 RPS 上限是 N*limit。真正的分布式限流
-//	见 internal/auth/redis_ratelimit.go（P0 #22）。要切换：在 setupMiddleware
-//	里把 rateLimiterMiddleware(rl) 替换为 redisRL.GinMiddleware()。
+//	当 Server 构造时传入 Redis 客户端，setupMiddleware 使用
+//	internal/auth/redis_ratelimit.go 的分布式限流器（跨副本共享计数）。
+//	未配置 Redis 时使用此进程内 token bucket（以 client IP 为 key）。
+//	进程内版本局限：N 个副本彼此不同步，实际 RPS 上限是 N*limit。
 //
 // 【metrics 中间件注意事项】
 //

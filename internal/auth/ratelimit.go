@@ -24,8 +24,11 @@
 // 【进程内的局限】
 //
 //	N 个副本各自独立计数，实际限流是 N × rate。分布式限流见
-//	internal/auth/redis_ratelimit.go（P0 #22）。这里的实现仍然保留是因为：
-//	  · Redis 故障时的 fallback（fail-open 后退回本地限流）；
+//	internal/auth/redis_ratelimit.go。API 层在 Redis 客户端可用时
+//	使用 Redis 限流器；否则使用此进程内实现。
+//	注意：Redis 限流器在 Redis 错误时 fail-open（允许请求通过），
+//	不会回退到进程内限流器。此实现保留的原因：
+//	  · 未配置 Redis 客户端时的唯一限流手段；
 //	  · 本地测试 / 单副本部署不需要 Redis 就能限流。
 //
 // 【cleanup goroutine】

@@ -340,6 +340,7 @@ func main() {
 		JWTManager:   jwtMgr,
 		APIKeyStore:  apiKeyStore,
 		AuthEnabled:  authEnabled,
+		RedisClient:  rdb,
 		PGHealthPing: pgPingFn,
 	})
 
