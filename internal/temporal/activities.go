@@ -32,10 +32,12 @@ package temporal
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/agent/code_agent/internal/config"
+	"github.com/agent/code_agent/internal/llm"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/orchestrator"
 	"go.uber.org/zap"
@@ -45,9 +47,15 @@ import (
 type Activities struct {
 	Orchestrator *orchestrator.Orchestrator
 	SecurityCfg  *config.SecurityConfig
+	LLMClient    LLMClient // Optional: for LLM-based intent classification
 	Logger       *zap.Logger
 	// [OPT-20] Pre-compiled regex patterns to avoid re-compilation per call.
 	sensitivePatterns []*regexp.Regexp
+}
+
+// LLMClient is a minimal interface for LLM calls needed by activities.
+type LLMClient interface {
+	ChatCompletion(ctx context.Context, req *llm.ChatRequest) (*llm.ChatResponse, error)
 }
 
 // NewActivities creates Activities with pre-compiled sensitive patterns.
@@ -69,11 +77,27 @@ func NewActivities(orch *orchestrator.Orchestrator, secCfg *config.SecurityConfi
 	return a
 }
 
-// ParseIntentActivity classifies the user's intent using keyword matching.
+// ParseIntentActivity classifies the user's intent using LLM (if available) or keyword matching.
 func (a *Activities) ParseIntentActivity(ctx context.Context, input AgentTaskInput) (*IntentResult, error) {
 	a.Logger.Info("parsing intent", zap.String("task_id", input.TaskID))
 
-	intent := classifyIntent(input.UserMessage)
+	var intent models.TaskIntent
+	var err error
+
+	// Try LLM classification first if available
+	if a.LLMClient != nil {
+		intent, err = a.classifyIntentWithLLM(ctx, input.UserMessage)
+		if err != nil {
+			a.Logger.Warn("LLM intent classification failed, falling back to keywords",
+				zap.String("task_id", input.TaskID),
+				zap.Error(err))
+			intent = classifyIntent(input.UserMessage)
+		}
+	} else {
+		// Fallback: keyword matching
+		intent = classifyIntent(input.UserMessage)
+	}
+
 	a.Logger.Info("intent classified",
 		zap.String("task_id", input.TaskID),
 		zap.String("intent", string(intent)),
@@ -82,6 +106,28 @@ func (a *Activities) ParseIntentActivity(ctx context.Context, input AgentTaskInp
 	return &IntentResult{
 		Intent: intent,
 	}, nil
+}
+
+func (a *Activities) classifyIntentWithLLM(ctx context.Context, message string) (models.TaskIntent, error) {
+	prompt := fmt.Sprintf(`Classify the user's intent as either "deploy" or "conversation".
+
+User message: %s
+
+Respond with ONLY one word: "deploy" or "conversation".`, message)
+
+	resp, err := a.LLMClient.ChatCompletion(ctx, &llm.ChatRequest{
+		Messages:  []models.Message{{Role: models.RoleUser, Content: prompt}},
+		MaxTokens: 10,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	content := strings.ToLower(strings.TrimSpace(resp.Content))
+	if strings.Contains(content, "deploy") {
+		return models.IntentDeploy, nil
+	}
+	return models.IntentConversation, nil
 }
 
 // deployKeywords are phrases that indicate a deployment intent.
