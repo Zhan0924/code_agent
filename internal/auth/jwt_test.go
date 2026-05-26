@@ -19,7 +19,7 @@ func TestJWTManager_GenerateAndValidate(t *testing.T) {
 	}
 	mgr := NewJWTManager(cfg, logger)
 
-	token, err := mgr.GenerateToken("user-123", RoleDev, "test@example.com")
+	token, err := mgr.GenerateToken("user-123", "", RoleDev, "test@example.com")
 	if err != nil {
 		t.Fatalf("GenerateToken failed: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestJWTManager_ExpiredToken(t *testing.T) {
 	}
 	mgr := NewJWTManager(cfg, logger)
 
-	token, err := mgr.GenerateToken("user-123", RoleDev, "")
+	token, err := mgr.GenerateToken("user-123", "", RoleDev, "")
 	if err != nil {
 		t.Fatalf("GenerateToken failed: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestJWTManager_RevokedToken(t *testing.T) {
 	}
 	mgr := NewJWTManager(cfg, logger)
 
-	token, _ := mgr.GenerateToken("user-123", RoleDev, "")
+	token, _ := mgr.GenerateToken("user-123", "", RoleDev, "")
 	claims, _ := mgr.ValidateToken(token)
 
 	mgr.RevokeToken(claims.ID)
@@ -173,7 +173,7 @@ func TestAuthMiddleware_ValidBearer(t *testing.T) {
 	mgr := NewJWTManager(cfg, logger)
 	keys := NewAPIKeyStore()
 
-	token, _ := mgr.GenerateToken("user-1", RoleDev, "")
+	token, _ := mgr.GenerateToken("user-1", "", RoleDev, "")
 
 	r := gin.New()
 	r.Use(AuthMiddleware(mgr, keys, logger))
@@ -224,8 +224,8 @@ func TestRequireRole_Admin(t *testing.T) {
 	mgr := NewJWTManager(cfg, logger)
 	keys := NewAPIKeyStore()
 
-	adminToken, _ := mgr.GenerateToken("admin-1", RoleAdmin, "")
-	readonlyToken, _ := mgr.GenerateToken("reader-1", RoleReadOnly, "")
+	adminToken, _ := mgr.GenerateToken("admin-1", "", RoleAdmin, "")
+	readonlyToken, _ := mgr.GenerateToken("reader-1", "", RoleReadOnly, "")
 
 	r := gin.New()
 	r.Use(AuthMiddleware(mgr, keys, logger))

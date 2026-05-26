@@ -69,7 +69,7 @@
 //   │  │  cfg       *JWTConfig    (secret / issuer / ttl)              │   │
 //   │  │  revoked   map[jti]time  (in-mem 黑名单，备份在 Redis)          │   │
 //   │  │                                                               │   │
-//   │  │  + GenerateToken(userID, role, email) (token, error)          │   │
+//   │  │  + GenerateToken(userID, tenantID, role, email) (token, error) │   │
 //   │  │  + ValidateToken(token) (*Claims, error)                      │   │
 //   │  │  + RevokeToken(jti)                                           │   │
 //   │  └──────────────────────────────────────────────────────────────┘   │
@@ -159,7 +159,7 @@
 //     client              api/login           JWTManager        Redis (rev)
 //        │ POST /login        │                   │                  │
 //        ├───────────────────▶│ 校验密码           │                  │
-//        │                    │  ok → GenerateToken(u,role,email)    │
+//        │                    │  ok → GenerateToken(u,tid,role,email)  │
 //        │                    │──────────────────▶│                  │
 //        │                    │◀── signed token ──│                  │
 //        │◀── {token} ────────│                   │                  │

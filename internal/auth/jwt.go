@@ -78,9 +78,10 @@ const (
 // Claims extends JWT standard claims with agent-specific fields.
 type Claims struct {
 	jwt.RegisteredClaims
-	UserID string `json:"user_id"`
-	Role   Role   `json:"role"`
-	Email  string `json:"email,omitempty"`
+	UserID   string `json:"user_id"`
+	TenantID string `json:"tenant_id,omitempty"`
+	Role     Role   `json:"role"`
+	Email    string `json:"email,omitempty"`
 }
 
 // JWTConfig holds JWT configuration.
@@ -96,7 +97,7 @@ func DefaultJWTConfig() *JWTConfig {
 	return &JWTConfig{
 		SecretKey:     mustGenerateSecret(),
 		Issuer:        "code-agent",
-		TokenExpiry:   24 * time.Hour,
+		TokenExpiry:   15 * time.Minute,
 		RefreshExpiry: 7 * 24 * time.Hour,
 	}
 }
@@ -117,19 +118,51 @@ type JWTManager struct {
 	// Revoked token tracking (in production, use Redis)
 	revokedMu sync.RWMutex
 	revoked   map[string]time.Time
+
+	stopGC chan struct{}
 }
 
 // NewJWTManager creates a new JWT manager.
 func NewJWTManager(cfg *JWTConfig, logger *zap.Logger) *JWTManager {
-	return &JWTManager{
+	m := &JWTManager{
 		cfg:     cfg,
 		logger:  logger.With(zap.String("component", "jwt")),
 		revoked: make(map[string]time.Time),
+		stopGC:  make(chan struct{}),
+	}
+	go m.cleanupExpiredRevocations()
+	return m
+}
+
+// Close stops the background GC goroutine.
+func (m *JWTManager) Close() {
+	close(m.stopGC)
+}
+
+func (m *JWTManager) cleanupExpiredRevocations() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.revokedMu.Lock()
+			now := time.Now()
+			maxAge := m.cfg.TokenExpiry + m.cfg.RefreshExpiry
+			for jti, revokedAt := range m.revoked {
+				if now.Sub(revokedAt) > maxAge {
+					delete(m.revoked, jti)
+				}
+			}
+			m.revokedMu.Unlock()
+		case <-m.stopGC:
+			return
+		}
 	}
 }
 
 // GenerateToken creates a new JWT token for a user.
-func (m *JWTManager) GenerateToken(userID string, role Role, email string) (string, error) {
+func (m *JWTManager) GenerateToken(userID, tenantID string, role Role, email string) (string, error) {
 	now := time.Now()
 	claims := Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -139,9 +172,10 @@ func (m *JWTManager) GenerateToken(userID string, role Role, email string) (stri
 			ExpiresAt: jwt.NewNumericDate(now.Add(m.cfg.TokenExpiry)),
 			ID:        fmt.Sprintf("%s-%d", userID, now.UnixNano()),
 		},
-		UserID: userID,
-		Role:   role,
-		Email:  email,
+		UserID:   userID,
+		TenantID: tenantID,
+		Role:     role,
+		Email:    email,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

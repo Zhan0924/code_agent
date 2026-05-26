@@ -9,9 +9,10 @@ import (
 
 // tokenRequest represents a token generation request.
 type tokenRequest struct {
-	UserID string `json:"user_id" binding:"required"`
-	Role   string `json:"role" binding:"required"`
-	Email  string `json:"email"`
+	UserID   string `json:"user_id" binding:"required"`
+	TenantID string `json:"tenant_id"`
+	Role     string `json:"role" binding:"required"`
+	Email    string `json:"email"`
 }
 
 // handleGenerateToken creates a new JWT token for a user.
@@ -50,7 +51,7 @@ func (s *Server) handleGenerateToken(c *gin.Context) {
 		return
 	}
 
-	token, err := s.jwtMgr.GenerateToken(req.UserID, role, req.Email)
+	token, err := s.jwtMgr.GenerateToken(req.UserID, req.TenantID, role, req.Email)
 	if err != nil {
 		s.logger.Error("failed to generate token")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
