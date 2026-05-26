@@ -188,6 +188,13 @@ type ServerConnection struct {
 
 // newServerConnection starts an MCP server process and establishes communication.
 func newServerConnection(cfg *config.MCPServerConfig, logger *zap.Logger) (*ServerConnection, error) {
+	if err := ValidateCommand(cfg.Command); err != nil {
+		return nil, fmt.Errorf("invalid MCP command: %w", err)
+	}
+	if err := ValidateArgs(cfg.Args); err != nil {
+		return nil, fmt.Errorf("invalid MCP args: %w", err)
+	}
+
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 
 	// Set environment variables
@@ -219,6 +226,8 @@ func newServerConnection(cfg *config.MCPServerConfig, logger *zap.Logger) (*Serv
 		progress: make(map[string]chan *progressNotification),
 		logger:   logger.With(zap.String("mcp_server", cfg.Name)),
 	}
+	// Set 4MB max token size to handle large JSON-RPC responses (matches test path)
+	conn.scanner.Buffer(make([]byte, 1<<14), 1<<22)
 
 	// Start response reader goroutine
 	go conn.readResponses()
@@ -328,6 +337,25 @@ func (sc *ServerConnection) readResponses() {
 
 		// Case 3: 其他通知（忽略）
 		sc.logger.Debug("unhandled mcp notification", zap.String("method", resp.Method))
+	}
+
+	// Check for scanner errors after loop exits
+	if err := sc.scanner.Err(); err != nil {
+		sc.logger.Error("MCP scanner error", zap.Error(err))
+		// Notify all pending requests with error
+		sc.mu.Lock()
+		for id, ch := range sc.pending {
+			resp := &JSONRPCResponse{
+				ID: id,
+				Error: &JSONRPCError{
+					Code:    -32603,
+					Message: fmt.Sprintf("scanner error: %v", err),
+				},
+			}
+			ch <- resp
+			delete(sc.pending, id)
+		}
+		sc.mu.Unlock()
 	}
 }
 
@@ -636,6 +664,13 @@ type ServerStatus struct {
 // AddServer connects a new MCP server at runtime. The server's tools become
 // immediately available to the LLM on the next ReAct step.
 func (gw *Gateway) AddServer(cfg *config.MCPServerConfig) (*ServerStatus, error) {
+	if err := ValidateCommand(cfg.Command); err != nil {
+		return nil, fmt.Errorf("invalid MCP server command: %w", err)
+	}
+	if err := ValidateArgs(cfg.Args); err != nil {
+		return nil, fmt.Errorf("invalid MCP server args: %w", err)
+	}
+
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 

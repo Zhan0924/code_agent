@@ -39,7 +39,6 @@ package config
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -186,7 +185,10 @@ var allowedMCPCommands = map[string]bool{
 	"python":  true,
 	"python3": true,
 	"uvx":     true,
+	"uv":      true,
 	"deno":    true,
+	"bun":     true,
+	"docker":  true,
 }
 
 // IsAllowedMCPCommand checks if a command basename is in the MCP whitelist.
@@ -194,25 +196,63 @@ func IsAllowedMCPCommand(cmd string) bool {
 	return allowedMCPCommands[cmd]
 }
 
-// validateMCPServers checks that all MCP server commands are in the whitelist.
+// validateMCPServers checks that all MCP server commands pass security validation.
 func (c *Config) validateMCPServers() error {
 	for i, srv := range c.MCP.Servers {
 		if srv.Command == "" {
 			return fmt.Errorf("mcp.servers[%d].command is empty", i)
 		}
 
-		// Extract base command (handle absolute paths)
-		cmd := filepath.Base(srv.Command)
-
-		// Check whitelist
-		if !allowedMCPCommands[cmd] {
-			return fmt.Errorf("mcp.servers[%d].command not in whitelist: %s (allowed: npx, node, python, python3, uvx, deno)", i, cmd)
+		// Use the same validation logic as runtime AddServer
+		if err := validateMCPCommand(srv.Command); err != nil {
+			return fmt.Errorf("mcp.servers[%d]: %w", i, err)
 		}
 
-		// Verify command exists in PATH or is absolute path
-		if !filepath.IsAbs(srv.Command) {
-			if _, err := exec.LookPath(srv.Command); err != nil {
-				return fmt.Errorf("mcp.servers[%d].command not found in PATH: %s", i, srv.Command)
+		if err := validateMCPArgs(srv.Args); err != nil {
+			return fmt.Errorf("mcp.servers[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// validateMCPCommand mirrors internal/mcp/validation.go ValidateCommand
+func validateMCPCommand(cmd string) error {
+	// Reject relative paths with directory separators
+	if !filepath.IsAbs(cmd) && strings.ContainsRune(cmd, filepath.Separator) {
+		return fmt.Errorf("relative paths with directory separators not allowed: %s", cmd)
+	}
+
+	cleaned := filepath.Clean(cmd)
+	base := filepath.Base(cleaned)
+	if !allowedMCPCommands[base] {
+		return fmt.Errorf("command not in whitelist: %s (allowed: npx, node, python, python3, uvx, uv, deno, bun, docker)", base)
+	}
+
+	// For absolute paths, verify they're in allowed directories
+	if filepath.IsAbs(cleaned) {
+		allowed := false
+		allowedDirs := []string{"/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/"}
+		for _, dir := range allowedDirs {
+			if strings.HasPrefix(cleaned, dir) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("absolute command path not in allowed directories: %s", cleaned)
+		}
+	}
+
+	return nil
+}
+
+// validateMCPArgs mirrors internal/mcp/validation.go ValidateArgs
+func validateMCPArgs(args []string) error {
+	dangerousArgs := []string{"--eval", "-e", "-c", "eval", "exec"}
+	for _, arg := range args {
+		for _, dangerous := range dangerousArgs {
+			if arg == dangerous || strings.HasPrefix(arg, dangerous+"=") {
+				return fmt.Errorf("dangerous argument not allowed: %s", arg)
 			}
 		}
 	}
