@@ -134,7 +134,21 @@ func (s *Supervisor) executeLevel(ctx context.Context, steps []planner.Step) ([]
 	for i, step := range steps {
 		wg.Add(1)
 		go func(idx int, st planner.Step) {
-			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error("sub-agent panic recovered",
+						zap.Int("step_index", idx),
+						zap.String("step_id", st.ID),
+						zap.Any("panic", r),
+						zap.Stack("stack"))
+					results[idx] = AgentResult{
+						StepID:  st.ID,
+						Success: false,
+						Error:   fmt.Sprintf("agent panic: %v", r),
+					}
+				}
+				wg.Done()
+			}()
 			results[idx] = s.executeStep(ctx, st)
 		}(i, step)
 	}
