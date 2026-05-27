@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/agent/code_agent/internal/rag"
+	"github.com/agent/code_agent/internal/store"
 	"go.uber.org/zap"
 )
 
@@ -69,21 +70,37 @@ type Indexer struct {
 	ragEngine *rag.Engine
 	cfg       *config.RAGConfig
 	logger    *zap.Logger
+	store     *store.Store // optional persistent store
 
-	// checksums stores file hashes for incremental indexing.
-	// In production, this would be backed by a persistent store.
-	checksumMu sync.RWMutex
-	checksums  map[string]FileChecksum
+	// checksums stores file hashes for incremental indexing (write-through cache).
+	checksumMu       sync.RWMutex
+	checksums        map[string]FileChecksum
+	pendingChecksums map[string]string // filePath -> hash, pending flush to DB
+}
+
+// IndexerOption configures the Indexer.
+type IndexerOption func(*Indexer)
+
+// WithStore attaches a persistent store for checksum persistence.
+func WithStore(s *store.Store) IndexerOption {
+	return func(idx *Indexer) {
+		idx.store = s
+	}
 }
 
 // NewIndexer creates a new code repository indexer.
-func NewIndexer(ragEngine *rag.Engine, cfg *config.RAGConfig, logger *zap.Logger) *Indexer {
-	return &Indexer{
-		ragEngine: ragEngine,
-		cfg:       cfg,
-		logger:    logger.With(zap.String("component", "indexer")),
-		checksums: make(map[string]FileChecksum),
+func NewIndexer(ragEngine *rag.Engine, cfg *config.RAGConfig, logger *zap.Logger, opts ...IndexerOption) *Indexer {
+	idx := &Indexer{
+		ragEngine:        ragEngine,
+		cfg:              cfg,
+		logger:           logger.With(zap.String("component", "indexer")),
+		checksums:        make(map[string]FileChecksum),
+		pendingChecksums: make(map[string]string),
 	}
+	for _, opt := range opts {
+		opt(idx)
+	}
+	return idx
 }
 
 // IndexRepository scans a directory tree, parses code files, generates embeddings,
@@ -97,6 +114,26 @@ func (idx *Indexer) IndexRepository(ctx context.Context, repoPath string, projec
 		zap.String("path", repoPath),
 		zap.String("project", projectName),
 	)
+
+	// Warm up in-memory checksum cache from DB
+	if idx.store != nil {
+		if records, err := idx.store.GetAllChecksums(ctx, projectName); err != nil {
+			idx.logger.Warn("failed to load checksums from DB, proceeding with empty cache", zap.Error(err))
+		} else {
+			idx.checksumMu.Lock()
+			for filePath, rec := range records {
+				if _, exists := idx.checksums[filePath]; !exists {
+					idx.checksums[filePath] = FileChecksum{
+						Path:      filePath,
+						Hash:      rec.Hash,
+						IndexedAt: rec.IndexedAt,
+					}
+				}
+			}
+			idx.checksumMu.Unlock()
+			idx.logger.Info("loaded checksums from DB", zap.Int("count", len(records)))
+		}
+	}
 
 	// Collect files to index
 	var filesToIndex []string
@@ -208,6 +245,25 @@ func (idx *Indexer) IndexRepository(ctx context.Context, repoPath string, projec
 
 	wg.Wait()
 
+	// Flush pending checksums to DB
+	if idx.store != nil {
+		idx.checksumMu.Lock()
+		toFlush := make(map[string]string, len(idx.pendingChecksums))
+		for k, v := range idx.pendingChecksums {
+			toFlush[k] = v
+		}
+		idx.pendingChecksums = make(map[string]string) // clear pending
+		idx.checksumMu.Unlock()
+
+		if len(toFlush) > 0 {
+			if err := idx.store.BatchUpsertChecksums(ctx, projectName, toFlush); err != nil {
+				idx.logger.Error("failed to flush checksums to DB", zap.Error(err), zap.Int("count", len(toFlush)))
+			} else {
+				idx.logger.Info("flushed checksums to DB", zap.Int("count", len(toFlush)))
+			}
+		}
+	}
+
 	stats.Duration = time.Since(start)
 
 	idx.logger.Info("repository indexing complete",
@@ -232,7 +288,7 @@ func (idx *Indexer) hasContentChanged(filePath string, content []byte) bool {
 	return !ok || existing.Hash != hash
 }
 
-// updateChecksum stores the current file hash in the cache.
+// updateChecksum stores the current file hash in the cache and marks it pending for DB flush.
 func (idx *Indexer) updateChecksum(filePath string, content []byte) {
 	hash := fmt.Sprintf("%x", sha256.Sum256(content))
 
@@ -241,6 +297,9 @@ func (idx *Indexer) updateChecksum(filePath string, content []byte) {
 		Path:      filePath,
 		Hash:      hash,
 		IndexedAt: time.Now(),
+	}
+	if idx.store != nil {
+		idx.pendingChecksums[filePath] = hash
 	}
 	idx.checksumMu.Unlock()
 }
@@ -258,4 +317,89 @@ func (idx *Indexer) GetStats() map[string]int {
 	return map[string]int{
 		"indexed_files": len(idx.checksums),
 	}
+}
+
+// IndexFile indexes a single file incrementally (for file watcher integration).
+// It reads the file, checks if content changed, and indexes through RAG if needed.
+func (idx *Indexer) IndexFile(ctx context.Context, repoPath, filePath string) error {
+	fullPath := filepath.Join(repoPath, filePath)
+
+	// Check if file exists and is supported
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return fmt.Errorf("stat file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("path is a directory, not a file")
+	}
+
+	ext := strings.ToLower(filepath.Ext(fullPath))
+	lang, ok := supportedExtensions[ext]
+	if !ok {
+		return fmt.Errorf("unsupported file extension: %s", ext)
+	}
+
+	// Skip large files
+	if info.Size() > 1024*1024 {
+		return fmt.Errorf("file too large (>1MB)")
+	}
+
+	// Read file content
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	// Check if content changed
+	if !idx.hasContentChanged(fullPath, content) {
+		idx.logger.Debug("file unchanged, skipping", zap.String("file", filePath))
+		return nil
+	}
+
+	// Index through RAG engine
+	projectName := filepath.Base(repoPath)
+	err = idx.ragEngine.IndexCode(ctx, filePath, lang, string(content), map[string]string{
+		"project": projectName,
+	})
+	if err != nil {
+		return fmt.Errorf("index code: %w", err)
+	}
+
+	// Update checksum
+	idx.updateChecksum(fullPath, content)
+
+	// Flush to DB if store is available
+	if idx.store != nil {
+		hash := fmt.Sprintf("%x", sha256.Sum256(content))
+		checksums := map[string]string{fullPath: hash}
+		if err := idx.store.BatchUpsertChecksums(ctx, projectName, checksums); err != nil {
+			idx.logger.Warn("failed to persist checksum", zap.Error(err), zap.String("file", filePath))
+		}
+	}
+
+	idx.logger.Info("file indexed incrementally", zap.String("file", filePath), zap.String("lang", lang))
+	return nil
+}
+
+// DeleteFile removes a file from the index (for file watcher integration).
+// repoPath is the repository root, filePath is relative to it.
+func (idx *Indexer) DeleteFile(ctx context.Context, repoPath, filePath string) error {
+	fullPath := filepath.Join(repoPath, filePath)
+	projectName := filepath.Base(repoPath)
+
+	// Remove from checksum cache using the same key form as updateChecksum
+	idx.checksumMu.Lock()
+	delete(idx.checksums, fullPath)
+	delete(idx.pendingChecksums, fullPath)
+	idx.checksumMu.Unlock()
+
+	// Remove from DB if store is available
+	if idx.store != nil {
+		if err := idx.store.DeleteChecksums(ctx, projectName, []string{fullPath}); err != nil {
+			idx.logger.Warn("failed to delete checksum from DB", zap.Error(err), zap.String("file", filePath))
+		}
+	}
+
+	idx.logger.Info("file removed from index", zap.String("file", filePath))
+	return nil
 }

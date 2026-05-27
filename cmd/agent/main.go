@@ -50,6 +50,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -66,6 +68,7 @@ import (
 	"github.com/agent/code_agent/internal/orchestrator"
 	"github.com/agent/code_agent/internal/planner"
 	"github.com/agent/code_agent/internal/rag"
+	"github.com/agent/code_agent/internal/repomap"
 	"github.com/agent/code_agent/internal/sandbox"
 	"github.com/agent/code_agent/internal/session"
 	"github.com/agent/code_agent/internal/skill"
@@ -346,9 +349,75 @@ func main() {
 
 	// ─── Wire Indexer into API Server ────────────────────────────────────
 	if ragEngine != nil {
-		idx := indexer.NewIndexer(ragEngine, &cfg.RAG, logger)
+		var idxOpts []indexer.IndexerOption
+		if pgStore != nil {
+			idxOpts = append(idxOpts, indexer.WithStore(pgStore))
+		}
+		idx := indexer.NewIndexer(ragEngine, &cfg.RAG, logger, idxOpts...)
 		apiServer.SetIndexer(idx)
 		logger.Info("indexer wired into API server")
+
+		// ─── File Watcher → RAG Incremental Indexing ────────────────────
+		if cfg.RAG.WatchEnabled && cfg.RAG.WatchPath != "" {
+			watchPath := cfg.RAG.WatchPath
+			if !filepath.IsAbs(watchPath) {
+				if abs, err := filepath.Abs(watchPath); err == nil {
+					watchPath = abs
+				}
+			}
+
+			gen := repomap.NewGenerator(logger)
+			watcher := repomap.NewWatcher(watchPath, gen, logger)
+
+			var (
+				batchMu    sync.Mutex
+				batchFiles = make(map[string]struct{})
+				batchTimer *time.Timer
+			)
+
+			watcher.SetOnChange(func(filePath string) {
+				batchMu.Lock()
+				batchFiles[filePath] = struct{}{}
+				if batchTimer != nil {
+					batchTimer.Stop()
+				}
+				batchTimer = time.AfterFunc(2*time.Second, func() {
+					batchMu.Lock()
+					files := make([]string, 0, len(batchFiles))
+					for f := range batchFiles {
+						files = append(files, f)
+					}
+					batchFiles = make(map[string]struct{})
+					batchMu.Unlock()
+
+					for _, f := range files {
+						fullPath := filepath.Join(watchPath, f)
+						fCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						if _, statErr := os.Stat(fullPath); os.IsNotExist(statErr) {
+							if err := idx.DeleteFile(fCtx, watchPath, f); err != nil {
+								logger.Warn("incremental delete failed",
+									zap.String("file", f), zap.Error(err))
+							}
+						} else {
+							if err := idx.IndexFile(fCtx, watchPath, f); err != nil {
+								logger.Warn("incremental index failed",
+									zap.String("file", f), zap.Error(err))
+							}
+						}
+						cancel()
+					}
+					if len(files) > 0 {
+						logger.Info("incremental index batch completed",
+							zap.Int("files", len(files)))
+					}
+				})
+				batchMu.Unlock()
+			})
+
+			go watcher.Start(context.Background())
+			logger.Info("file watcher started for RAG incremental indexing",
+				zap.String("watch_path", watchPath))
+		}
 	}
 
 	// ─── Skill Registry ──────────────────────────────────────────────────

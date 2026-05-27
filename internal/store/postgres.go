@@ -200,6 +200,16 @@ func (s *Store) Migrate(ctx context.Context) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_dynamic_tools_ttl ON dynamic_tools(created_at, ttl) WHERE ttl IS NOT NULL`,
+
+		// File checksums for indexer persistence
+		`CREATE TABLE IF NOT EXISTS file_checksums (
+			project_name TEXT NOT NULL,
+			file_path TEXT NOT NULL,
+			hash TEXT NOT NULL,
+			indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (project_name, file_path)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_file_checksums_project ON file_checksums(project_name)`,
 	}
 
 	for _, m := range migrations {
@@ -434,4 +444,92 @@ func (s *Store) LoadDynamicTools(ctx context.Context) ([]*DynamicToolRecord, err
 func (s *Store) DeleteDynamicTool(ctx context.Context, name string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM dynamic_tools WHERE name = $1`, name)
 	return err
+}
+
+// ─── File Checksums ─────────────────────────────────────────────────────────
+
+// ChecksumRecord represents a persisted file checksum.
+type ChecksumRecord struct {
+	Hash      string
+	IndexedAt time.Time
+}
+
+// BatchUpsertChecksums stores or updates multiple file checksums in one transaction.
+func (s *Store) BatchUpsertChecksums(ctx context.Context, projectName string, checksums map[string]string) error {
+	if len(checksums) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO file_checksums (project_name, file_path, hash, indexed_at)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (project_name, file_path) DO UPDATE SET hash = EXCLUDED.hash, indexed_at = EXCLUDED.indexed_at`)
+	if err != nil {
+		return fmt.Errorf("prepare stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	now := time.Now()
+	for filePath, hash := range checksums {
+		if _, err := stmt.ExecContext(ctx, projectName, filePath, hash, now); err != nil {
+			return fmt.Errorf("upsert checksum for %s: %w", filePath, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetAllChecksums loads all checksums for a project.
+func (s *Store) GetAllChecksums(ctx context.Context, projectName string) (map[string]ChecksumRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT file_path, hash, indexed_at FROM file_checksums WHERE project_name = $1`, projectName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]ChecksumRecord)
+	for rows.Next() {
+		var filePath, hash string
+		var indexedAt time.Time
+		if err := rows.Scan(&filePath, &hash, &indexedAt); err != nil {
+			return nil, err
+		}
+		result[filePath] = ChecksumRecord{Hash: hash, IndexedAt: indexedAt}
+	}
+	return result, rows.Err()
+}
+
+// DeleteChecksums removes checksums for given file paths.
+func (s *Store) DeleteChecksums(ctx context.Context, projectName string, filePaths []string) error {
+	if len(filePaths) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`DELETE FROM file_checksums WHERE project_name = $1 AND file_path = $2`)
+	if err != nil {
+		return fmt.Errorf("prepare stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, fp := range filePaths {
+		if _, err := stmt.ExecContext(ctx, projectName, fp); err != nil {
+			return fmt.Errorf("delete checksum for %s: %w", fp, err)
+		}
+	}
+
+	return tx.Commit()
 }
