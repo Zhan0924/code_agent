@@ -215,8 +215,10 @@ type Indexer struct {
     ragEngine  *rag.Engine
     cfg        *config.RAGConfig
     logger     *zap.Logger
+    store      *store.Store             // 可选，持久化 checksum 到 PostgreSQL
     checksumMu sync.RWMutex
-    checksums  map[string]FileChecksum    // 内存保存，重启会丢（见 §7 演进）
+    checksums  map[string]FileChecksum  // write-through cache（DB 为持久层）
+    pendingChecksums map[string]string   // 待批量写入 DB 的 checksum
 }
 ```
 
@@ -276,7 +278,11 @@ hasContentChanged(path, content) bool:
   return old.Hash != newHash
 ```
 
-注意：**只在内存里存** —— 进程重启后所有文件都"视为新"，会做一次全量重索引。这在启动时间可接受（大仓 30-60s），但生产环境应落盘，见 §7。
+**Checksum 持久化**（已实现）：
+- 启动时从 PostgreSQL `file_checksums` 表预热内存 cache
+- 索引完成后批量写入 DB（`BatchUpsertChecksums`）
+- 重启后增量索引生效，避免全量重索引
+- Store 可选（nil 时回退到纯内存行为）
 
 ### 3.5 `ctx.Done()` 只做**提交 gate**
 
@@ -505,11 +511,11 @@ systemMsg += "\n[Project Structure]\n" + repoMap
 Watcher.onChange(path)
     │
     ├──▶ Generator.InvalidateCache(rootDir)     # repomap 下次重生成
-    ├──▶ (演进) Indexer.ReIndexFile(path)       # 增量喂 RAG
+    ├──▶ Indexer.IndexFile(repoPath, path)      # 增量喂 RAG（已实现）
     └──▶ (演进) 前端 WebSocket 推送（热更新）
 ```
 
-当前 `onChange` 回调**用户自己注入**，是否触发 indexer/WebSocket 由 caller 决定 —— 解耦。
+`onChange` 回调由 `main.go` 注入。当 `rag.watch_enabled: true` 时，watcher 启动并通过 2 秒批处理防抖后调用 `IndexFile`（文件存在）或 `DeleteFile`（文件已删除）。
 
 ---
 
@@ -519,7 +525,7 @@ Watcher.onChange(path)
 |---|---|
 | **indexer + repomap 拆成两个包** | 职责不同（语义 vs 结构）；缓存策略不同；演进速度不同 |
 | Indexer **基于 SHA-256 增量**而非 mtime | mtime 可被 `touch` 骗；hash 绝对可靠 |
-| Indexer checksums **内存存**（非落盘） | 简单；进程重启全量重刷在可接受范围；真要落盘用 Redis/SQLite 见演进 |
+| Indexer checksums **持久化到 PostgreSQL** | write-through cache + 批量 DB 写入；重启后从 DB 预热，避免全量重索引 |
 | **[OPT-17] 合并 `ReadFile` 与 hash 检查** | 省一次 I/O；大仓库下 QPS 显著提升 |
 | 并发硬编码 **8** | I/O 主导场景下 4-16 差异不大；8 防打爆 FD |
 | 大文件阈值 **1 MB** | 超过基本是 minified / 生成文件；切块收益低 |

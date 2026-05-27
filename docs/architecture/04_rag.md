@@ -84,19 +84,19 @@ Filter{Must: [{Key: "project", Match: req.ProjectName}]}
 ```
 **必**而不是 should——不允许跨项目召回。
 
-### D5 — 增量更新与稀疏索引的 TTL
+### D5 — 增量更新与稀疏索引
 
 **文本场景**：全量重建一次，索引半天不变。
 
 **代码场景**：一次 IDE 保存就可能让几个 chunk 失效。dense 索引可以
-逐条 upsert 到 Qdrant；**sparse 索引是进程内的**（BM25Index），upsert
-之后要么重建要么标记 dirty。
+逐条 upsert 到 Qdrant；**sparse 索引是进程内的**（BM25Index），需要
+增量维护以保持同步。
 
-**对策**：
-- Dense：upsert 即生效
-- Sparse：5min TTL + `InvalidateSparseIndex()` 显式清空（IDE 保存后调）
-- 容忍窗口：搜索在 TTL 内可能命中过期 chunk；对"代码改完立刻搜"场景
-  不够即时，要求即时的调 Invalidate
+**对策**（已实现）：
+- Dense：upsert 即生效（Qdrant 原生支持）
+- Sparse：`AddChunks`/`RemoveChunks` 增量更新，`Upsert`/`Delete` 后立即同步
+- 首次查询时从 Qdrant 全量 scroll 构建 BM25 索引，后续增量维护
+- 文件 watcher 集成：文件变更自动触发增量索引（可选，通过 `watch_enabled` 配置）
 
 ### 核心决策树
 

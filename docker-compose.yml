@@ -17,6 +17,9 @@ services:
       - CODE_AGENT_TEMPORAL_HOST=temporal:7233
       - CODE_AGENT_TRACING_ENDPOINT=jaeger:4317
       - CODE_AGENT_SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock
+      # Bypass proxy for internal services
+      - NO_PROXY=redis,postgres,qdrant,temporal,jaeger,localhost,127.0.0.1
+      - no_proxy=redis,postgres,qdrant,temporal,jaeger,localhost,127.0.0.1
       # LLM config (can also override via env)
       # - CODE_AGENT_LLM_PRIMARY_API_KEY=sk-xxx
     volumes:
