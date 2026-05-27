@@ -207,6 +207,10 @@ type RAGConfig struct {
 	RerankAPIKey  string `mapstructure:"rerank_api_key"`  // Reranker API key
 	TopK          int    `mapstructure:"top_k"`
 	RerankTopN    int    `mapstructure:"rerank_top_n"`
+
+	// File watcher for incremental indexing
+	WatchEnabled bool   `mapstructure:"watch_enabled"` // Enable file watcher for auto-reindexing
+	WatchPath    string `mapstructure:"watch_path"`    // Path to watch (defaults to current repo)
 }
 
 // SessionConfig holds session management settings.

@@ -98,6 +98,11 @@ rag:
   top_k: 10
   rerank_top_n: 3
 
+  # File watcher — watches for source file changes and triggers incremental RAG re-indexing.
+  # Requires ragEngine to be available. Debounces batch changes (2s window).
+  watch_enabled: false
+  watch_path: "."       # Path to watch; relative paths resolved from CWD
+
 session:
   max_history_tokens: 32000       # ⬆ 4K→32K: Opus has 200K context; keep rich multi-turn history
   summary_threshold_tokens: 28000  # ⬆ 3.5K→28K: only summarize when truly approaching budget
