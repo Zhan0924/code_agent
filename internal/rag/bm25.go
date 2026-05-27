@@ -108,6 +108,121 @@ func (b *BM25Index) Size() int {
 	return b.numDocs
 }
 
+// AddChunks incrementally adds new chunks to the index.
+// If a chunk with the same ID already exists, it is replaced.
+// Updates df, docs, avgLen, and numDocs without rebuilding.
+func (b *BM25Index) AddChunks(chunks []models.CodeChunk) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// First pass: remove existing chunks with the same IDs
+	if len(chunks) > 0 {
+		idSet := make(map[string]struct{}, len(chunks))
+		for _, c := range chunks {
+			idSet[c.ID] = struct{}{}
+		}
+
+		kept := make([]bm25Doc, 0, len(b.docs))
+		totalLen := 0
+		for _, d := range b.docs {
+			if _, replace := idSet[d.chunk.ID]; replace {
+				// Decrement df for terms in the old version
+				seen := make(map[string]struct{})
+				for term := range d.tf {
+					if _, ok := seen[term]; !ok {
+						seen[term] = struct{}{}
+						b.df[term]--
+						if b.df[term] <= 0 {
+							delete(b.df, term)
+						}
+					}
+				}
+				continue
+			}
+			kept = append(kept, d)
+			totalLen += d.length
+		}
+		b.docs = kept
+		b.numDocs = len(kept)
+		if b.numDocs > 0 {
+			b.avgLen = float64(totalLen) / float64(b.numDocs)
+		} else {
+			b.avgLen = 0
+		}
+	}
+
+	// Second pass: add new chunks
+	for _, c := range chunks {
+		tokens := tokenizeForBM25(c.Content)
+		if len(tokens) == 0 {
+			tokens = tokenizeForBM25(c.SymbolName)
+			if len(tokens) == 0 {
+				continue
+			}
+		}
+		tf := make(map[string]int, len(tokens))
+		seen := make(map[string]struct{}, len(tokens))
+		for _, t := range tokens {
+			tf[t]++
+			if _, ok := seen[t]; !ok {
+				seen[t] = struct{}{}
+				b.df[t]++
+			}
+		}
+		b.docs = append(b.docs, bm25Doc{chunk: c, length: len(tokens), tf: tf})
+		// Update running average
+		totalLen := b.avgLen*float64(b.numDocs) + float64(len(tokens))
+		b.numDocs++
+		b.avgLen = totalLen / float64(b.numDocs)
+	}
+}
+
+// RemoveChunks removes chunks by their IDs from the index.
+// Updates df, docs, avgLen, and numDocs.
+func (b *BM25Index) RemoveChunks(ids []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(ids) == 0 || b.numDocs == 0 {
+		return
+	}
+
+	idSet := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		idSet[id] = struct{}{}
+	}
+
+	// Filter out removed docs and adjust df
+	kept := make([]bm25Doc, 0, len(b.docs))
+	totalLen := 0
+	for _, d := range b.docs {
+		if _, remove := idSet[d.chunk.ID]; remove {
+			// Decrement df for all terms in this doc
+			seen := make(map[string]struct{})
+			for term := range d.tf {
+				if _, ok := seen[term]; !ok {
+					seen[term] = struct{}{}
+					b.df[term]--
+					if b.df[term] <= 0 {
+						delete(b.df, term)
+					}
+				}
+			}
+			continue
+		}
+		kept = append(kept, d)
+		totalLen += d.length
+	}
+
+	b.docs = kept
+	b.numDocs = len(kept)
+	if b.numDocs > 0 {
+		b.avgLen = float64(totalLen) / float64(b.numDocs)
+	} else {
+		b.avgLen = 0
+	}
+}
+
 // Search returns the top-K chunks by BM25 score for the query. Returns an
 // empty slice (not nil) if the index is empty or the query has no matching
 // tokens; callers can pass that straight through to Retrieve without a

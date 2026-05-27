@@ -28,11 +28,11 @@
 //	   ↑ 这是 P0 #18 的修复——之前 SearchSparse 只做 symbol_name 的子串
 //	  匹配，硬编码 score=0.5，基本没用。
 //
-// 【稀疏索引懒构建 + TTL 刷新】
+// 【稀疏索引懒构建 + 增量更新】
 //
-//	第一次调 SearchSparse 时触发 scrollAllChunks + BM25.Build；之后在 5min
-//	TTL 内复用。调用方 upsert 新 chunk 后应 InvalidateSparseIndex，否则要等
-//	TTL 到期才能搜到。sparseMu 保证同一时刻只有一次重建。
+//	第一次调 SearchSparse 时触发 scrollAllChunks + BM25.Build；之后通过
+//	Upsert/Delete 中的 AddChunks/RemoveChunks 增量维护，新数据立即可搜。
+//	sparseMu 保证同一时刻只有一次初始构建。
 //
 // 【payload <-> CodeChunk 转换】
 //
@@ -83,14 +83,11 @@ type QdrantStore struct {
 	cfg        *config.QdrantConfig
 	logger     *zap.Logger
 
-	// BM25 sparse index, rebuilt lazily and refreshed on a TTL. The prior
-	// SearchSparse implementation did a substring match on symbol_name with
-	// a hardcoded score; this replaces it with a real in-process BM25 index
-	// over all indexed chunks.
+	// BM25 sparse index, built once on first SearchSparse call and then
+	// maintained incrementally via AddChunks/RemoveChunks on Upsert/Delete.
 	sparseMu      sync.Mutex
 	sparseIndex   *BM25Index
 	sparseBuiltAt time.Time
-	sparseTTL     time.Duration // how stale the index can get before rebuild
 }
 
 // NewQdrantStore creates a new Qdrant-backed vector store.
@@ -110,7 +107,6 @@ func NewQdrantStore(cfg *config.QdrantConfig, logger *zap.Logger) (*QdrantStore,
 		cfg:         cfg,
 		logger:      logger.With(zap.String("component", "qdrant")),
 		sparseIndex: NewBM25Index(),
-		sparseTTL:   5 * time.Minute, // rebuild sparse index every 5min on demand
 	}
 
 	// Ensure collection exists
@@ -212,6 +208,11 @@ func (s *QdrantStore) Upsert(ctx context.Context, chunks []models.CodeChunk) err
 		return fmt.Errorf("failed to upsert points: %w", err)
 	}
 
+	// Update BM25 index incrementally (only if index has been initialized)
+	if !s.sparseBuiltAt.IsZero() {
+		s.sparseIndex.AddChunks(chunks)
+	}
+
 	return nil
 }
 
@@ -238,10 +239,10 @@ func (s *QdrantStore) SearchDense(ctx context.Context, vector []float32, topK in
 }
 
 // SearchSparse performs BM25 keyword retrieval over all indexed chunks.
-// The index is built lazily on the first call and refreshed on a TTL; callers
-// pay the rebuild cost only when the cached index is stale. Post-ranking we
-// apply the caller's filters (tenant_id, project, etc.) — BM25 itself is
-// filter-agnostic so we over-fetch and filter in-memory.
+// The index is built once on the first call from a full Qdrant scroll; subsequent
+// updates are incremental via AddChunks/RemoveChunks called from Upsert/Delete.
+// Post-ranking we apply the caller's filters (tenant_id, project, etc.) — BM25
+// itself is filter-agnostic so we over-fetch and filter in-memory.
 //
 // Scale: see BM25Index — suitable for ≤100k chunks. Beyond that, migrate
 // to Qdrant sparse vectors or a dedicated keyword engine.
@@ -285,14 +286,13 @@ func (s *QdrantStore) SearchSparse(ctx context.Context, query string, topK int, 
 	return filtered, nil
 }
 
-// ensureSparseIndex rebuilds the BM25 index if it's stale. Uses a per-store
-// mutex so concurrent queries serialise on rebuild rather than each doing
-// their own scroll.
+// ensureSparseIndex builds the BM25 index once on first call. Subsequent
+// updates are incremental via AddChunks/RemoveChunks in Upsert/Delete.
 func (s *QdrantStore) ensureSparseIndex(ctx context.Context) error {
 	s.sparseMu.Lock()
 	defer s.sparseMu.Unlock()
 
-	if !s.sparseBuiltAt.IsZero() && time.Since(s.sparseBuiltAt) < s.sparseTTL {
+	if !s.sparseBuiltAt.IsZero() {
 		return nil
 	}
 
@@ -302,19 +302,9 @@ func (s *QdrantStore) ensureSparseIndex(ctx context.Context) error {
 	}
 	s.sparseIndex.Build(chunks)
 	s.sparseBuiltAt = time.Now()
-	s.logger.Info("bm25 index rebuilt",
-		zap.Int("chunks", len(chunks)),
-		zap.Duration("ttl", s.sparseTTL))
+	s.logger.Info("bm25 index built (initial)",
+		zap.Int("chunks", len(chunks)))
 	return nil
-}
-
-// InvalidateSparseIndex forces the next SearchSparse call to rebuild.
-// Callers that upsert chunks and want fresh results immediately (tests,
-// manual reindex paths) should call this after Upsert.
-func (s *QdrantStore) InvalidateSparseIndex() {
-	s.sparseMu.Lock()
-	s.sparseBuiltAt = time.Time{}
-	s.sparseMu.Unlock()
 }
 
 // scrollAllChunks pages through every point in the collection and returns
@@ -384,7 +374,16 @@ func (s *QdrantStore) Delete(ctx context.Context, ids []string) error {
 			},
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Update BM25 index incrementally (only if index has been initialized)
+	if !s.sparseBuiltAt.IsZero() {
+		s.sparseIndex.RemoveChunks(ids)
+	}
+
+	return nil
 }
 
 // Close releases Qdrant connection resources.
