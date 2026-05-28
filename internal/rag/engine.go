@@ -34,12 +34,13 @@ type Reranker interface {
 
 // Engine is the main RAG engine that orchestrates parsing, indexing, and retrieval.
 type Engine struct {
-	embedder Embedder
-	store    VectorStore
-	reranker Reranker
-	depGraph *DepGraph
-	cfg      *config.RAGConfig
-	logger   *zap.Logger
+	embedder      Embedder
+	store         VectorStore
+	reranker      Reranker
+	queryRewriter QueryRewriter
+	depGraph      *DepGraph
+	cfg           *config.RAGConfig
+	logger        *zap.Logger
 }
 
 // NewEngine creates a new RAG engine with the given components.
@@ -52,6 +53,12 @@ func NewEngine(embedder Embedder, store VectorStore, reranker Reranker, cfg *con
 		cfg:      cfg,
 		logger:   logger.With(zap.String("component", "rag")),
 	}
+}
+
+// SetQueryRewriter sets the query rewriter for the engine.
+// This is a setter to avoid circular dependencies (rewriter may need LLM client).
+func (e *Engine) SetQueryRewriter(rewriter QueryRewriter) {
+	e.queryRewriter = rewriter
 }
 
 // IndexCode parses and indexes code files into the vector store.
@@ -107,8 +114,19 @@ func (e *Engine) DepGraph() *DepGraph {
 
 // Retrieve performs dual-recall retrieval followed by reranking.
 func (e *Engine) Retrieve(ctx context.Context, query string, filters map[string]string) ([]models.RetrievalResult, error) {
-	// Generate query embedding for dense retrieval
-	embeddings, err := e.embedder.Embed(ctx, []string{query})
+	// Apply query rewriting for dense embedding (HyDE or keyword expansion)
+	embeddingQuery := query
+	if e.queryRewriter != nil {
+		rewritten, err := e.queryRewriter.Rewrite(ctx, query)
+		if err != nil {
+			e.logger.Warn("query rewrite failed, using original", zap.Error(err))
+		} else {
+			embeddingQuery = rewritten
+		}
+	}
+
+	// Generate query embedding for dense retrieval (using rewritten query)
+	embeddings, err := e.embedder.Embed(ctx, []string{embeddingQuery})
 	if err != nil {
 		return nil, fmt.Errorf("failed to embed query: %w", err)
 	}
@@ -123,13 +141,13 @@ func (e *Engine) Retrieve(ctx context.Context, query string, filters map[string]
 	}
 	resultCh := make(chan searchResult, 2)
 
-	// Dense vector search (semantic)
+	// Dense vector search (semantic) — uses rewritten embedding
 	go func() {
 		results, err := e.store.SearchDense(ctx, embeddings[0], topK, filters)
 		resultCh <- searchResult{results: results, err: err, source: "dense"}
 	}()
 
-	// Sparse search (BM25 - exact variable name matching)
+	// Sparse search (BM25) — uses original query for exact matching
 	go func() {
 		results, err := e.store.SearchSparse(ctx, query, topK, filters)
 		resultCh <- searchResult{results: results, err: err, source: "sparse"}

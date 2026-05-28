@@ -104,7 +104,10 @@ func (e *PlanEvaluator) checkFeasibility(plan *Plan, q *PlanQuality) {
 		}
 	}
 
-	if invalidCount > 0 {
+	if invalidCount > len(plan.Steps)/2 {
+		q.Feasibility = 0.0
+		q.Weaknesses = append(q.Weaknesses, "Majority of actions are unknown — plan rejected")
+	} else if invalidCount > 0 {
 		q.Feasibility = 1.0 - (float64(invalidCount) / float64(len(plan.Steps)))
 	}
 

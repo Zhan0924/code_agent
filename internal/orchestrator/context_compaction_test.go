@@ -56,3 +56,28 @@ func TestCompactEarlyMessages_NoOp(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactEarlyMessages_SummarizeFallback(t *testing.T) {
+	longContent := strings.Repeat("y", 3000)
+
+	messages := []models.Message{
+		{Role: models.RoleTool, Content: longContent, ToolCallID: "1"},
+		{Role: models.RoleTool, Content: longContent, ToolCallID: "2"},
+		{Role: models.RoleTool, Content: longContent, ToolCallID: "3"},
+		{Role: models.RoleTool, Content: longContent, ToolCallID: "4"},
+		{Role: models.RoleTool, Content: longContent, ToolCallID: "5"},
+	}
+
+	// With summarize mode but nil client, should fallback to truncation
+	compactEarlyMessages(messages, 5, withSummarizeMode(nil, nil))
+
+	compactedCount := 0
+	for _, m := range messages {
+		if m.Role == models.RoleTool && strings.Contains(m.Content, "[compacted") {
+			compactedCount++
+		}
+	}
+	if compactedCount != 2 {
+		t.Errorf("expected 2 compacted messages (fallback to truncation), got %d", compactedCount)
+	}
+}

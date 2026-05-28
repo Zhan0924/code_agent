@@ -211,6 +211,19 @@ type RAGConfig struct {
 	// File watcher for incremental indexing
 	WatchEnabled bool   `mapstructure:"watch_enabled"` // Enable file watcher for auto-reindexing
 	WatchPath    string `mapstructure:"watch_path"`    // Path to watch (defaults to current repo)
+
+	// Embedding cache mode:
+	//   "memory" - in-memory LRU only (default, no Redis dependency)
+	//   "redis"  - Redis-backed cache (persistent, cross-instance)
+	//   "tiered" - L1 memory + L2 Redis (best performance + persistence)
+	//   ""       - disabled (no caching, always call embedding API)
+	EmbeddingCacheMode string `mapstructure:"embedding_cache_mode"`
+
+	// Query rewrite mode:
+	//   "none"   - no rewriting (default)
+	//   "hyde"   - HyDE (Hypothetical Document Embeddings) via LLM
+	//   "expand" - keyword expansion (camelCase/snake_case variants)
+	QueryRewriteMode string `mapstructure:"query_rewrite_mode"`
 }
 
 // SessionConfig holds session management settings.
@@ -218,12 +231,15 @@ type SessionConfig struct {
 	MaxHistoryTokens       int           `mapstructure:"max_history_tokens"`
 	SummaryThresholdTokens int           `mapstructure:"summary_threshold_tokens"`
 	TTL                    time.Duration `mapstructure:"ttl"`
+	CompactionMode         string        `mapstructure:"compaction_mode"` // "truncate" (default) or "summarize"
 }
 
 // SecurityConfig holds security rule settings.
 type SecurityConfig struct {
 	SensitivePatterns       []string `mapstructure:"sensitive_patterns"`
 	RequireApprovalCommands []string `mapstructure:"require_approval_commands"`
+	EgressEnabled           bool     `mapstructure:"egress_enabled"`
+	EgressAllowedHosts      []string `mapstructure:"egress_allowed_hosts"`
 }
 
 // LoggingConfig holds logging settings.

@@ -133,6 +133,9 @@ type Orchestrator struct {
 
 	// Dynamic context window budget (from LLM provider config)
 	maxContextTokens int
+
+	// Compaction mode: "truncate" (default) or "summarize" (LLM-based)
+	compactionMode string
 }
 
 // intentCacheEntry stores a cached intent classification result.
@@ -1517,6 +1520,11 @@ func (o *Orchestrator) SetSkillRegistry(sr interface {
 	Execute(context.Context, string, json.RawMessage) (*models.ToolResult, error)
 }) {
 	o.skillRegistry = sr
+}
+
+// SetCompactionMode sets the context compaction mode ("truncate" or "summarize").
+func (o *Orchestrator) SetCompactionMode(mode string) {
+	o.compactionMode = mode
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

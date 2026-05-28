@@ -136,14 +136,29 @@ func NewClientWithSharedBreaker(cfg *config.LLMConfig, shared *SharedCircuitBrea
 // NewClientWithOptions creates a new LLM client with all optional dependencies.
 // httpClient is used for SSRF-protected outbound requests (pass nil for default).
 func NewClientWithOptions(cfg *config.LLMConfig, shared *SharedCircuitBreaker, httpClient *http.Client, logger *zap.Logger) (*Client, error) {
-	primary, err := newOpenAIProvider(&cfg.Primary, httpClient, logger)
+	var primary Provider
+	var err error
+
+	// Dispatch to the appropriate provider based on configuration
+	switch cfg.Primary.Provider {
+	case "anthropic":
+		primary, err = newAnthropicProvider(&cfg.Primary, httpClient, logger)
+	default:
+		// Default to OpenAI-compatible provider (supports openai, ollama, vllm, etc.)
+		primary, err = newOpenAIProvider(&cfg.Primary, httpClient, logger)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create primary LLM provider: %w", err)
 	}
 
 	var fallback Provider
 	if cfg.Fallback.BaseURL != "" {
-		fallback, err = newOpenAIProvider(&cfg.Fallback, httpClient, logger)
+		switch cfg.Fallback.Provider {
+		case "anthropic":
+			fallback, err = newAnthropicProvider(&cfg.Fallback, httpClient, logger)
+		default:
+			fallback, err = newOpenAIProvider(&cfg.Fallback, httpClient, logger)
+		}
 		if err != nil {
 			logger.Warn("failed to create fallback LLM provider, running without fallback",
 				zap.Error(err))

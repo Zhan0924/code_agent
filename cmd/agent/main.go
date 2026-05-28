@@ -70,6 +70,7 @@ import (
 	"github.com/agent/code_agent/internal/rag"
 	"github.com/agent/code_agent/internal/repomap"
 	"github.com/agent/code_agent/internal/sandbox"
+	"github.com/agent/code_agent/internal/security"
 	"github.com/agent/code_agent/internal/session"
 	"github.com/agent/code_agent/internal/skill"
 	"github.com/agent/code_agent/internal/store"
@@ -140,7 +141,24 @@ func main() {
 	logger.Info("session manager initialized")
 
 	// ─── Initialize LLM Client ───────────────────────────────────────────
-	llmClient, err := llm.NewClient(&cfg.LLM, logger)
+	var egressHTTPClient *http.Client
+	if cfg.Security.EgressEnabled {
+		policy := &security.EgressPolicy{
+			Enabled:       true,
+			DefaultAction: "deny",
+			AllowedHosts:  cfg.Security.EgressAllowedHosts,
+			DNSAllowed:    true,
+		}
+		egressValidator, egressErr := security.NewEgressValidator(policy, logger)
+		if egressErr != nil {
+			logger.Fatal("failed to create egress validator", zap.Error(egressErr))
+		}
+		egressHTTPClient = security.NewEgressHTTPClient(egressValidator, cfg.LLM.Primary.Timeout)
+		logger.Info("egress-protected HTTP client enabled for LLM",
+			zap.Int("allowed_hosts", len(cfg.Security.EgressAllowedHosts)),
+		)
+	}
+	llmClient, err := llm.NewClientWithOptions(&cfg.LLM, nil, egressHTTPClient, logger)
 	if err != nil {
 		logger.Fatal("failed to initialize LLM client", zap.Error(err))
 	}
@@ -194,6 +212,37 @@ func main() {
 		embedder = rag.NewLocalHashEmbedder(cfg.Qdrant.VectorSize, logger)
 	}
 
+	// Wrap embedder with cache if configured
+	cacheMode := cfg.RAG.EmbeddingCacheMode
+	if cacheMode == "" {
+		cacheMode = "memory" // default to memory cache
+	}
+	namespace := cfg.RAG.EmbeddingModel
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	switch cacheMode {
+	case "memory":
+		memCache := rag.NewMemoryEmbeddingCache(10000, namespace, logger)
+		embedder = rag.NewCachedEmbedder(embedder, memCache, logger)
+		logger.Info("embedding cache enabled", zap.String("mode", "memory"), zap.Int("capacity", 10000))
+	case "redis":
+		redisCache := rag.NewRedisEmbeddingCache(rdb, namespace, logger)
+		embedder = rag.NewCachedEmbedder(embedder, redisCache, logger)
+		logger.Info("embedding cache enabled", zap.String("mode", "redis"))
+	case "tiered":
+		memCache := rag.NewMemoryEmbeddingCache(10000, namespace, logger)
+		redisCache := rag.NewRedisEmbeddingCache(rdb, namespace, logger)
+		tieredCache := rag.NewTieredCache(memCache, redisCache, logger)
+		embedder = rag.NewCachedEmbedder(embedder, tieredCache, logger)
+		logger.Info("embedding cache enabled", zap.String("mode", "tiered"), zap.Int("l1_capacity", 10000))
+	case "disabled", "":
+		logger.Info("embedding cache disabled")
+	default:
+		logger.Warn("unknown embedding_cache_mode, cache disabled", zap.String("mode", cacheMode))
+	}
+
 	qdrantStore, err := rag.NewQdrantStore(&cfg.Qdrant, logger)
 	if err != nil {
 		logger.Warn("Qdrant not available, RAG disabled", zap.Error(err))
@@ -206,6 +255,37 @@ func main() {
 
 		ragEngine = rag.NewEngine(embedder, qdrantStore, reranker, &cfg.RAG, logger)
 		defer qdrantStore.Close()
+
+		// Wire query rewriter if configured
+		queryRewriteMode := cfg.RAG.QueryRewriteMode
+		if queryRewriteMode != "" && queryRewriteMode != "none" {
+			var rewriter rag.QueryRewriter
+			switch queryRewriteMode {
+			case "hyde":
+				// Create LLM function for HyDE
+				llmFunc := func(ctx context.Context, messages []models.Message) (string, error) {
+					resp, err := llmClient.ChatCompletion(ctx, &llm.ChatRequest{
+						Messages:    messages,
+						MaxTokens:   500,
+						Temperature: 0.7,
+					})
+					if err != nil {
+						return "", err
+					}
+					return resp.Content, nil
+				}
+				rewriter = rag.NewHyDERewriter(llmFunc, logger)
+			case "expand":
+				rewriter = rag.NewKeywordExpander(logger)
+			default:
+				logger.Warn("unknown query_rewrite_mode, rewriter disabled", zap.String("mode", queryRewriteMode))
+			}
+			if rewriter != nil {
+				ragEngine.SetQueryRewriter(rewriter)
+				logger.Info("query rewriter enabled", zap.String("mode", queryRewriteMode))
+			}
+		}
+
 		logger.Info("RAG engine initialized",
 			zap.String("collection", cfg.Qdrant.Collection),
 			zap.String("embedding_provider", embeddingProvider),
@@ -278,11 +358,27 @@ func main() {
 	var apiKeyStore *auth.APIKeyStore
 	authEnabled := cfg.Auth.Enabled
 	if authEnabled {
+		tokenExpiry := 15 * time.Minute
+		if cfg.Auth.TokenExpiry != "" {
+			if d, err := time.ParseDuration(cfg.Auth.TokenExpiry); err == nil {
+				tokenExpiry = d
+			} else {
+				logger.Warn("invalid token_expiry, using default 15m", zap.String("value", cfg.Auth.TokenExpiry), zap.Error(err))
+			}
+		}
+		refreshExpiry := 7 * 24 * time.Hour
+		if cfg.Auth.RefreshExpiry != "" {
+			if d, err := time.ParseDuration(cfg.Auth.RefreshExpiry); err == nil {
+				refreshExpiry = d
+			} else {
+				logger.Warn("invalid refresh_expiry, using default 7d", zap.String("value", cfg.Auth.RefreshExpiry), zap.Error(err))
+			}
+		}
 		jwtCfg := &auth.JWTConfig{
 			SecretKey:     cfg.Auth.JWTSecret,
 			Issuer:        cfg.Auth.JWTIssuer,
-			TokenExpiry:   24 * time.Hour,
-			RefreshExpiry: 7 * 24 * time.Hour,
+			TokenExpiry:   tokenExpiry,
+			RefreshExpiry: refreshExpiry,
 		}
 		if jwtCfg.SecretKey == "" {
 			jwtCfg = auth.DefaultJWTConfig()
@@ -306,6 +402,9 @@ func main() {
 		logger,
 		pgStore,
 	)
+	if cfg.Session.CompactionMode != "" {
+		orch.SetCompactionMode(cfg.Session.CompactionMode)
+	}
 	// Wire Planner for complex task DAG execution
 	plannerAdapter := orchestrator.NewLLMCallerAdapter(llmClient)
 	p := planner.NewPlanner(plannerAdapter, logger)

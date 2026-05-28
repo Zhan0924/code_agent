@@ -115,6 +115,13 @@ services:
       - POSTGRES_SEEDS=postgres
       # Use a separate database for Temporal to avoid schema conflicts
       - DBNAME=temporal
+      # Bypass proxy for internal gRPC communication
+      - NO_PROXY=redis,postgres,qdrant,temporal,jaeger,localhost,127.0.0.1,0.0.0.0,172.16.0.0/12
+      - no_proxy=redis,postgres,qdrant,temporal,jaeger,localhost,127.0.0.1,0.0.0.0,172.16.0.0/12
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
     depends_on:
       postgres:
         condition: service_healthy
