@@ -64,10 +64,14 @@ func (m *Manager) CreateForSession(id, sessionID, projectName string) (*Workspac
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create workspace dir: %w", err)
 	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace dir: %w", err)
+	}
 	ws := &Workspace{
 		ID:        id,
 		SessionID: sessionID,
-		RootDir:   dir,
+		RootDir:   realDir,
 		Project:   projectName,
 		CreatedAt: time.Now(),
 	}
@@ -129,6 +133,10 @@ func (m *Manager) restore() {
 		}
 		// Fix root dir to match current baseDir (in case of mount changes)
 		ws.RootDir = filepath.Join(m.baseDir, e.Name())
+		// Resolve symlinks to match CreateForSession behavior (P0-1 fix)
+		if realDir, err := filepath.EvalSymlinks(ws.RootDir); err == nil {
+			ws.RootDir = realDir
+		}
 		m.workspaces.Store(ws.ID, &ws)
 		restored++
 	}
