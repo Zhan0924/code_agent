@@ -177,12 +177,14 @@ Activity 配置：StartToCloseTimeout=5min, RetryPolicy{Initial=1s, Backoff=2.0,
 `internal/workspace/`，1 个文件。本地文件系统管理器。
 
 - 基础目录 + `sync.Map`（id → *Workspace）
-- 路径遍历防护：`filepath.Clean` + 前缀检查
+- 路径遍历防护：`filepath.Clean` + `filepath.EvalSymlinks` + 前缀检查
 - `.workspace.json` manifest 持久化，重启时 `restore()` 扫描恢复
 - `CreateForSession`：幂等（相同 ID 返回已有）
 - `Archive`：tar.gz 导出
 - `GetBySession`：线性扫描 sync.Map
 - 文件操作：WriteFile, ReadFile, DeleteFile, ListFiles, ListDir, MkdirAll
+
+**EvalSymlinks 规范化**：`CreateForSession` 和 `restore` 在存储 `ws.RootDir` 前调用 `filepath.EvalSymlinks` 解析符号链接。这解决了 macOS 上 `/tmp` → `/private/tmp` 导致的路径遍历误报——`isPathSafe` 的 `strings.HasPrefix` 检查要求 workspace root 和目标路径都是规范化后的真实路径。修复前，macOS 集成测试会因 symlink 差异触发安全拒绝。
 
 ## Indexer
 

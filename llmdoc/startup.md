@@ -5,7 +5,7 @@
 ## 必读文档（按顺序）
 
 1. `llmdoc/must/project-basics.md` — 项目身份、双项目布局、必选/可选子系统、构建与测试
-2. `llmdoc/must/working-agreement.md` — DI 模式、KV-cache prompt 结构、工具分发拆分、死代码清单、测试惯例
+2. `llmdoc/must/working-agreement.md` — DI 模式、KV-cache prompt 结构、工具分发拆分（含 9 处分布式白名单）、死代码清单、测试惯例
 3. `llmdoc/must/doc-routing.md` — 如何找到正确的文档：architecture / guides / reference / memory 分类指引
 
 ## 升级阅读

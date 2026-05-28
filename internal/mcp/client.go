@@ -181,6 +181,7 @@ type ServerConnection struct {
 	progress map[string]chan *progressNotification
 	tools    []MCPTool // 通过 tools/list 获得的工具列表
 	logger   *zap.Logger
+	readerWg sync.WaitGroup // 跟踪 readResponses goroutine 生命周期
 
 	// testHook 让 mock server 在进程外用 io.Pipe 注入响应流而无需真正 fork 进程。
 	// 生产路径下永远为 nil；仅单元测试使用。
@@ -231,6 +232,7 @@ func newServerConnection(cfg *config.MCPServerConfig, logger *zap.Logger) (*Serv
 	conn.scanner.Buffer(make([]byte, 1<<14), 1<<22)
 
 	// Start response reader goroutine
+	conn.readerWg.Add(1)
 	go conn.readResponses()
 
 	return conn, nil
@@ -260,6 +262,7 @@ func newInMemoryConnection(name string, writerToClient *io.PipeWriter, readerFro
 	}
 	// 让 scanner 支持长帧（默认 64KB 不够写大 payload）
 	conn.scanner.Buffer(make([]byte, 1<<14), 1<<22)
+	conn.readerWg.Add(1)
 	go conn.readResponses()
 	return conn
 }
@@ -282,6 +285,7 @@ func newInMemoryConnection(name string, writerToClient *io.PipeWriter, readerFro
 //  2. method=="notifications/progress" 的推送 ——> 按 progressToken 路由（chunked streaming）
 //  3. 其他通知（log/messages 等）——> 丢弃，debug 级别日志记录
 func (sc *ServerConnection) readResponses() {
+	defer sc.readerWg.Done()
 	for sc.scanner.Scan() {
 		line := sc.scanner.Bytes()
 		if len(line) == 0 {
@@ -469,6 +473,7 @@ func (sc *ServerConnection) close() error {
 	if sc.stdout != nil {
 		_ = sc.stdout.Close()
 	}
+	sc.readerWg.Wait()
 	if sc.cmd != nil && sc.cmd.Process != nil {
 		return sc.cmd.Process.Kill()
 	}

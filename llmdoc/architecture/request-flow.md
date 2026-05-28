@@ -80,7 +80,9 @@
 
 ### 流式变体（ProcessMessageStreamFull）
 
-外层自动续接循环（`absoluteMaxSteps = 200` 硬上限），内层批次循环使用 `getMaxSteps(intent)`。每个 ReAct 步骤发射 `ReactStreamEvent`（step_start / thinking / tool_call / tool_result / final / done）。
+外层自动续接循环（`absoluteMaxSteps = 200` 硬上限），内层批次循环使用 `getMaxSteps(intent)`。每个 ReAct 步骤发射 `ReactStreamEvent`（step_start / thinking / tool_call / tool_result / tool_progress / final / done）。
+
+**tool_progress 事件**：长时间运行的工具（如 `run_workspace_cmd`）通过 context 注入的 `ProgressCallback` 逐行流式输出 stdout，生成 `tool_progress` SSE 事件（含 step/toolCallID/toolName/content）。当前仅 `run_workspace_cmd` 支持此机制。定义见 `internal/orchestrator/tool_progress.go`。
 
 ## PromptBuilder 5 区域结构
 
@@ -123,8 +125,10 @@
 `executeTool()` (line 1281) 按以下优先级分发：
 
 1. **MCP Gateway** — `FindServerForTool()` 匹配 → `CallTool()`
-2. **内置 switch** — `execute_code`, `search_code`, `read_file`, `write_file`, `patch_file`, `edit_file`, `list_files`, `create_directory`, `run_tests`, `run_workspace_cmd`
+2. **内置 switch** — `execute_code`, `search_code`, `read_file`, `write_file`, `patch_file`, `edit_file`, `apply_diff`, `list_files`, `create_directory`, `run_tests`, `run_workspace_cmd`
 3. **Skill Registry** — 回退到技能注册表
+
+**注意**：新增内置工具需在 9 处注册点更新（见 `must/working-agreement.md` "分布式工具白名单"节）。
 
 ### 内置工具行为
 
@@ -134,6 +138,7 @@
 | `write_file` | 写入后触发 `autoDepManagement`（go mod tidy / npm install / pip install） |
 | `patch_file` | 字符串替换，仅首次出现 |
 | `edit_file` | 委托 EditEngine：唯一匹配验证 → .bak 备份 → lint 检查 → 失败自动回滚 |
+| `apply_diff` | 委托 EditEngine：解析 unified diff (`sourcegraph/go-diff`) → 逐 hunk 应用 → .bak 备份 → lint 检查 → 失败回滚 |
 | `run_tests` | Docker sandbox 内执行，卷挂载 |
 | `run_workspace_cmd` | 宿主机 `sh -c` 执行，2 分钟超时，环境变量白名单，禁止命令检查 |
 | `execute_code` | Sandbox 隔离执行 |

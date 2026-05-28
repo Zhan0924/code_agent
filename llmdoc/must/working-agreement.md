@@ -41,6 +41,26 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 
 **不变量**：核心 ReAct 循环不走 `tools.Registry.Execute()`，而是走 orchestrator 自己的 switch。修改工具分发时需同时考虑两套机制。
 
+### 分布式工具白名单（新增工具时必查）
+
+内置工具名称分散在 9 个注册点。新增工具时必须逐一检查并更新：
+
+| # | 位置 | 用途 |
+|---|------|------|
+| 1 | `internal/orchestrator/builtin_tools.go` (`fileHandlers` map) | handler 分发 |
+| 2 | `internal/orchestrator/file_tools.go` (`fileToolDefinitions`) | LLM 可见的工具定义 |
+| 3 | `internal/orchestrator/orchestrator.go` (`captureForTransaction`) | 事务回滚捕获 |
+| 4 | `internal/orchestrator/react_core.go` (auto-test tracking) | 文件修改后自动跑测试 |
+| 5 | `internal/planner/planner.go` (`defaultActions` + system prompt) | Planner 动作白名单 |
+| 6 | `internal/multiagent/sub_agent.go` (`allowedTools`) | 子 Agent 允许工具列表 |
+| 7 | `internal/multiagent/supervisor.go` (`isFileWriteAction`) | 冲突检测（文件写入判定） |
+| 8 | `internal/api/dynamic_tool_handlers.go` (builtin conflict list) | 动态工具名称碰撞检查 |
+| 9 | `internal/api/mcp_skill_handlers.go` (`handleListTools` builtin list) | 工具列表枚举 |
+
+**验证命令**：`rg -l 'apply_diff\|write_file\|edit_file' internal/ | sort` — 确认新工具名出现在所有预期位置。
+
+**教训**：`apply_diff` 工具初次添加时仅注册了 #1/#2，审计后发现遗漏其余 7 处，导致额外返工提交。
+
 ## 死代码清单
 
 以下功能已完整实现但未接线——它们编译但从不被调用：

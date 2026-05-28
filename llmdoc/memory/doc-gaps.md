@@ -47,6 +47,13 @@
 
 Session 层使用低精度版本，可能导致上下文窗口管理偏差。
 
+## 流程缺口
+
+| 缺口 | 说明 |
+|------|------|
+| macOS CI matrix 缺失 | CI 仅在 Linux (Docker alpine) 执行。macOS 特有的 symlink 行为（`/tmp` → `/private/tmp`）未被 CI 覆盖，导致 workspace 路径遍历误报 bug 长期存在（已修复，但 CI 仍未覆盖 macOS） |
+| 工具注册清单指南 | 新增内置工具需在 9 处注册（见 `must/working-agreement.md`），但缺少完整的分步操作指南（`guides/` 待创建） |
+
 ## 未调查领域
 
 - `configs/config.allinone.yaml` 具体内容
@@ -55,7 +62,6 @@ Session 层使用低精度版本，可能导致上下文窗口管理偏差。
 - Warm Pool 与 Manager.Execute 的集成点
 - Store 从 Orchestrator 的实际调用路径
 - `_principles.go` 设计文档中描述的理想架构 vs 当前实现的差异全貌
-- Indexer 校验和存储持久化（当前仅内存，重启丢失）
 - Repomap 正则提取的精度限制（多行 receiver、Python decorator 等）
 - Distiller 策略持久化（`pg_store.go` 已存在但 main.go 未接线确认）
 - MultiAgent Supervisor 在 Orchestrator 中的集成路径（`main.go` 接线状态未确认）

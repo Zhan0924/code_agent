@@ -9,7 +9,7 @@
 | 文档 | 内容 |
 |------|------|
 | `must/project-basics.md` | 项目身份、双项目布局、必选/可选子系统、构建测试命令 |
-| `must/working-agreement.md` | DI 模式、KV-cache prompt 结构、工具分发拆分、死代码清单、测试惯例 |
+| `must/working-agreement.md` | DI 模式、KV-cache prompt 结构、工具分发拆分（含 9 处分布式白名单）、死代码清单、测试惯例 |
 | `must/doc-routing.md` | 如何按任务类型找到正确文档 |
 
 ## overview/ — 项目全景
@@ -40,6 +40,7 @@
 |------|------|
 | `memory/doc-gaps.md` | 已知文档缺口、死代码清单、需要未来调查的领域 |
 | `memory/reflections/2026-05-21-new-subsystems.md` | 反思：multiagent/toollearn/metacognition/planner-evaluator 新增未及时记录 |
+| `memory/reflections/2026-05-28-quality-improvements.md` | 反思：P0-P2 全量质量修复（8 commits）——工具注册分散问题、macOS 路径误报、Provider 测试债务、apply_diff 工具、tool_progress 流式 |
 
 ---
 
