@@ -70,7 +70,7 @@ type Planner struct {
 func NewPlanner(llm LLMCaller, logger *zap.Logger) *Planner {
 	defaultActions := []string{
 		"read_file", "write_file", "edit_file", "execute_code",
-		"search_code", "run_tests", "think", "patch_file",
+		"search_code", "run_tests", "think", "patch_file", "apply_diff",
 		"list_files", "create_directory", "run_workspace_cmd",
 	}
 	return &Planner{
@@ -85,7 +85,7 @@ const plannerSystemPrompt = `You are a planning agent. Given a user's coding tas
 Rules:
 1. Break the task into discrete steps. Each step has an "id" (like "step_1"), "action" (tool name), "description", optional "parameters", and "depends_on" (list of prerequisite step IDs).
 2. Steps with no dependencies can run in parallel.
-3. Use actions: read_file, write_file, edit_file, patch_file, execute_code, search_code, run_tests, run_workspace_cmd, list_files, create_directory, think.
+3. Use actions: read_file, write_file, edit_file, patch_file, apply_diff, execute_code, search_code, run_tests, run_workspace_cmd, list_files, create_directory, think.
 4. The plan should be minimal but complete — don't add unnecessary steps.
 5. Output ONLY valid JSON matching this schema:
 {
@@ -136,7 +136,17 @@ func (p *Planner) CreatePlan(ctx context.Context, task string, contextInfo strin
 			improved, improveErr := p.improvePlan(ctx, plan, task, &quality)
 			if improveErr == nil && improved != nil {
 				plan = improved
+				// Re-evaluate after improvement
+				quality = p.evaluator.Evaluate(plan, task)
+			} else if quality.Feasibility == 0.0 {
+				// Improvement failed and plan is infeasible
+				return nil, fmt.Errorf("plan is infeasible: %s", strings.Join(quality.Weaknesses, "; "))
 			}
+		}
+
+		// Final feasibility check
+		if quality.Feasibility == 0.0 {
+			return nil, fmt.Errorf("plan is infeasible: %s", strings.Join(quality.Weaknesses, "; "))
 		}
 	}
 

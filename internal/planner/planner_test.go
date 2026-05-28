@@ -370,6 +370,30 @@ func TestPlanner_CreatePlan(t *testing.T) {
 	}
 }
 
+func TestPlanner_CreatePlan_InfeasiblePlanRejected(t *testing.T) {
+	// Plan with majority unknown actions → Feasibility == 0.0
+	mockResponse := `{
+		"goal": "Do something",
+		"reasoning": "approach",
+		"steps": [
+			{"id": "step_1", "action": "fly_to_moon", "description": "Launch rocket"},
+			{"id": "step_2", "action": "teleport", "description": "Beam down", "depends_on": ["step_1"]},
+			{"id": "step_3", "action": "magic", "description": "Cast spell", "depends_on": ["step_2"]}
+		]
+	}`
+
+	llm := &mockLLM{response: mockResponse}
+	p := NewPlanner(llm, zapNop())
+
+	_, err := p.CreatePlan(context.Background(), "Do something", "")
+	if err == nil {
+		t.Fatal("expected error for infeasible plan")
+	}
+	if !contains(err.Error(), "infeasible") {
+		t.Errorf("expected 'infeasible' in error, got: %v", err)
+	}
+}
+
 func TestPlanner_CreatePlan_LLMError(t *testing.T) {
 	llm := &mockLLM{err: fmt.Errorf("API timeout")}
 	p := NewPlanner(llm, zapNop())
