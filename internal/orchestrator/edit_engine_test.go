@@ -460,3 +460,161 @@ func TestUnifiedDiff_IdenticalFiles(t *testing.T) {
 		t.Errorf("expected identical-file sentinel, got: %q", d)
 	}
 }
+
+// ─── Unified Diff Application Tests ─────────────────────────────────────────
+
+func TestEditEngine_ApplyUnifiedDiff_AddLines(t *testing.T) {
+	wm, ws := setupTestWorkspace(t)
+	engine := NewEditEngine(wm, zap.NewNop())
+
+	original := "line1\nline2\nline3\nline4\n"
+	if err := wm.WriteFile(ws, "target.txt", original); err != nil {
+		t.Fatal(err)
+	}
+
+	unifiedDiff := `--- a/target.txt
++++ b/target.txt
+@@ -1,4 +1,6 @@
+ line1
+ line2
++added_a
++added_b
+ line3
+ line4
+`
+	result := engine.ApplyEdit(context.Background(), ws, EditOperation{
+		Path:        "target.txt",
+		UnifiedDiff: unifiedDiff,
+	})
+
+	if !result.Success {
+		t.Fatalf("expected success, got: %s", result.Message)
+	}
+
+	content, _ := wm.ReadFile(ws, "target.txt")
+	expected := "line1\nline2\nadded_a\nadded_b\nline3\nline4\n"
+	if content != expected {
+		t.Errorf("unexpected content:\ngot:  %q\nwant: %q", content, expected)
+	}
+}
+
+func TestEditEngine_ApplyUnifiedDiff_RemoveLines(t *testing.T) {
+	wm, ws := setupTestWorkspace(t)
+	engine := NewEditEngine(wm, zap.NewNop())
+
+	original := "line1\nline2\nline3\nline4\n"
+	if err := wm.WriteFile(ws, "target.txt", original); err != nil {
+		t.Fatal(err)
+	}
+
+	unifiedDiff := `--- a/target.txt
++++ b/target.txt
+@@ -1,4 +1,2 @@
+ line1
+-line2
+-line3
+ line4
+`
+	result := engine.ApplyEdit(context.Background(), ws, EditOperation{
+		Path:        "target.txt",
+		UnifiedDiff: unifiedDiff,
+	})
+
+	if !result.Success {
+		t.Fatalf("expected success, got: %s", result.Message)
+	}
+
+	content, _ := wm.ReadFile(ws, "target.txt")
+	expected := "line1\nline4\n"
+	if content != expected {
+		t.Errorf("unexpected content:\ngot:  %q\nwant: %q", content, expected)
+	}
+}
+
+func TestEditEngine_ApplyUnifiedDiff_ModifyLines(t *testing.T) {
+	wm, ws := setupTestWorkspace(t)
+	engine := NewEditEngine(wm, zap.NewNop())
+
+	original := "func hello() {\n\treturn \"hello\"\n}\n"
+	if err := wm.WriteFile(ws, "main.txt", original); err != nil {
+		t.Fatal(err)
+	}
+
+	unifiedDiff := `--- a/main.txt
++++ b/main.txt
+@@ -1,3 +1,3 @@
+ func hello() {
+-	return "hello"
++	return "world"
+ }
+`
+	result := engine.ApplyEdit(context.Background(), ws, EditOperation{
+		Path:        "main.txt",
+		UnifiedDiff: unifiedDiff,
+	})
+
+	if !result.Success {
+		t.Fatalf("expected success, got: %s", result.Message)
+	}
+
+	content, _ := wm.ReadFile(ws, "main.txt")
+	expected := "func hello() {\n\treturn \"world\"\n}\n"
+	if content != expected {
+		t.Errorf("unexpected content:\ngot:  %q\nwant: %q", content, expected)
+	}
+}
+
+func TestEditEngine_ApplyUnifiedDiff_MismatchFails(t *testing.T) {
+	wm, ws := setupTestWorkspace(t)
+	engine := NewEditEngine(wm, zap.NewNop())
+
+	original := "line1\nline2\nline3\n"
+	if err := wm.WriteFile(ws, "target.txt", original); err != nil {
+		t.Fatal(err)
+	}
+
+	// Diff references "wrong_line" which doesn't exist in the file
+	unifiedDiff := `--- a/target.txt
++++ b/target.txt
+@@ -1,3 +1,3 @@
+ line1
+-wrong_line
++replacement
+ line3
+`
+	result := engine.ApplyEdit(context.Background(), ws, EditOperation{
+		Path:        "target.txt",
+		UnifiedDiff: unifiedDiff,
+	})
+
+	if result.Success {
+		t.Fatal("expected failure for mismatched diff")
+	}
+	if !strings.Contains(result.Message, "mismatch") && !strings.Contains(result.Message, "Failed to apply") {
+		t.Errorf("expected mismatch error, got: %s", result.Message)
+	}
+
+	// File should be unchanged
+	content, _ := wm.ReadFile(ws, "target.txt")
+	if content != original {
+		t.Errorf("file should not be modified on failure, got: %q", content)
+	}
+}
+
+func TestEditEngine_ApplyUnifiedDiff_InvalidDiff(t *testing.T) {
+	wm, ws := setupTestWorkspace(t)
+	engine := NewEditEngine(wm, zap.NewNop())
+
+	if err := wm.WriteFile(ws, "target.txt", "content\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := engine.ApplyEdit(context.Background(), ws, EditOperation{
+		Path:        "target.txt",
+		UnifiedDiff: "this is not a valid diff",
+	})
+
+	if result.Success {
+		t.Fatal("expected failure for invalid diff")
+	}
+}

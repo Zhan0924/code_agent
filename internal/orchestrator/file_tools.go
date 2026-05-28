@@ -4,6 +4,7 @@
 package orchestrator
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -278,6 +279,21 @@ func fileToolDefinitions() []models.ToolDefinition {
 					"new_text": {"type": "string", "description": "The replacement text"}
 				},
 				"required": ["path", "old_text", "new_text"]
+			}`),
+			Source:    "builtin",
+			RiskLevel: 1, // Moderate risk: modifies existing files with rollback
+		},
+		{
+			Name:        "apply_diff",
+			Description: "Apply a unified diff patch to a file. The diff must be in standard unified diff format (output of 'diff -u'). After applying, the file is automatically lint/compile-checked — if the check fails, the edit is rolled back. Use this for large multi-line edits or when you have a diff from another source.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"workspace_id": {"type": "string", "description": "The workspace ID (or 'default')"},
+					"path": {"type": "string", "description": "Relative file path to patch"},
+					"diff": {"type": "string", "description": "Unified diff content (standard diff -u format with @@ hunks)"}
+				},
+				"required": ["path", "diff"]
 			}`),
 			Source:    "builtin",
 			RiskLevel: 1, // Moderate risk: modifies existing files with rollback
@@ -566,7 +582,6 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 
 	// Capture stdout and stderr separately
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	// Scrub the environment: LLM-chosen commands must not see host secrets
@@ -574,9 +589,34 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 	// then layer the minimum extras the toolchain needs.
 	cmd.Env = minimalCommandEnv()
 
-	start := time.Now()
-	err := cmd.Run()
-	duration := time.Since(start)
+	progressCb := GetProgressCallback(ctx)
+
+	var err error
+	var duration time.Duration
+	if progressCb != nil {
+		// Stream stdout line-by-line through the progress callback
+		stdoutPipe, pipeErr := cmd.StdoutPipe()
+		if pipeErr != nil {
+			return &models.ToolResult{Content: "Failed to create stdout pipe: " + pipeErr.Error(), IsError: true}, nil
+		}
+		start := time.Now()
+		if startErr := cmd.Start(); startErr != nil {
+			return &models.ToolResult{Content: "Failed to start command: " + startErr.Error(), IsError: true}, nil
+		}
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			line := scanner.Text() + "\n"
+			stdout.WriteString(line)
+			progressCb(line)
+		}
+		err = cmd.Wait()
+		duration = time.Since(start)
+	} else {
+		cmd.Stdout = &stdout
+		start := time.Now()
+		err = cmd.Run()
+		duration = time.Since(start)
+	}
 
 	exitCode := 0
 	if err != nil {
@@ -740,6 +780,43 @@ func (o *Orchestrator) toolEditFile(ctx context.Context, args json.RawMessage) (
 	})
 
 	o.logger.Info("tool:edit_file",
+		zap.String("path", req.Path),
+		zap.Bool("success", result.Success),
+		zap.Bool("rolled_back", result.RolledBack),
+		zap.Int("lint_errors", len(result.LintErrors)))
+
+	return &models.ToolResult{
+		Content: result.Message,
+		IsError: !result.Success,
+	}, nil
+}
+
+// toolApplyDiff applies a unified diff patch to a file using the EditEngine.
+func (o *Orchestrator) toolApplyDiff(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
+	var req struct {
+		WorkspaceID string `json:"workspace_id"`
+		Path        string `json:"path"`
+		Diff        string `json:"diff"`
+	}
+	if err := json.Unmarshal(args, &req); err != nil {
+		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+
+	ws := o.resolveWorkspace(req.WorkspaceID)
+	if ws == nil {
+		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
+	}
+
+	if o.editEngine == nil {
+		return &models.ToolResult{Content: "Edit engine not available", IsError: true}, nil
+	}
+
+	result := o.editEngine.ApplyEdit(ctx, ws, EditOperation{
+		Path:        req.Path,
+		UnifiedDiff: req.Diff,
+	})
+
+	o.logger.Info("tool:apply_diff",
 		zap.String("path", req.Path),
 		zap.Bool("success", result.Success),
 		zap.Bool("rolled_back", result.RolledBack),

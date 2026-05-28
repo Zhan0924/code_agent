@@ -74,13 +74,14 @@ func (o *Orchestrator) RegisterFileTools(reg *tools.Registry) error {
 	// File tools
 	fileDefs := fileToolDefinitions()
 	fileHandlers := map[string]func(context.Context, json.RawMessage) (*models.ToolResult, error){
-		"read_file":        o.toolReadFile,
-		"write_file":       o.toolWriteFile,
-		"patch_file":       o.toolPatchFile,
-		"edit_file":        o.toolEditFile,
-		"list_files":       o.toolListFiles,
-		"create_directory": o.toolCreateDirectory,
-		"run_tests":        o.toolRunTests,
+		"read_file":         o.toolReadFile,
+		"write_file":        o.toolWriteFile,
+		"patch_file":        o.toolPatchFile,
+		"edit_file":         o.toolEditFile,
+		"apply_diff":        o.toolApplyDiff,
+		"list_files":        o.toolListFiles,
+		"create_directory":  o.toolCreateDirectory,
+		"run_tests":         o.toolRunTests,
 		"run_workspace_cmd": o.toolRunWorkspaceCmd,
 	}
 

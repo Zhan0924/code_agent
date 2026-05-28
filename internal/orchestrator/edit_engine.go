@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/agent/code_agent/internal/workspace"
+	"github.com/sourcegraph/go-diff/diff"
 	"go.uber.org/zap"
 )
 
@@ -98,9 +99,10 @@ func (e *EditEngine) lockPaths(ws *workspace.Workspace, ops []EditOperation) fun
 
 // EditOperation represents a single file edit operation.
 type EditOperation struct {
-	Path    string `json:"path"`     // Relative file path within workspace
-	OldText string `json:"old_text"` // Must match exactly once in the file
-	NewText string `json:"new_text"` // Replacement text
+	Path        string `json:"path"`                   // Relative file path within workspace
+	OldText     string `json:"old_text,omitempty"`     // Must match exactly once in the file
+	NewText     string `json:"new_text,omitempty"`     // Replacement text
+	UnifiedDiff string `json:"unified_diff,omitempty"` // Alternative: apply a unified diff directly
 }
 
 // EditResult contains the outcome of an edit operation.
@@ -116,6 +118,10 @@ type EditResult struct {
 
 // ApplyEdit performs a single precision edit with uniqueness validation, backup, and lint.
 func (e *EditEngine) ApplyEdit(ctx context.Context, ws *workspace.Workspace, op EditOperation) *EditResult {
+	if op.UnifiedDiff != "" {
+		return e.applyUnifiedDiff(ctx, ws, op)
+	}
+
 	result := &EditResult{FilePath: op.Path}
 
 	// Serialise concurrent edits to the same file. Without this, two callers
@@ -201,6 +207,171 @@ func (e *EditEngine) ApplyEdit(ctx context.Context, ws *workspace.Workspace, op 
 	result.Message = fmt.Sprintf("✅ Successfully edited '%s' (replaced %d chars → %d chars, lint passed)\n\nDiff:\n%s",
 		op.Path, len(op.OldText), len(op.NewText), result.DiffPreview)
 	return result
+}
+
+// applyUnifiedDiff applies a unified diff to the target file.
+func (e *EditEngine) applyUnifiedDiff(ctx context.Context, ws *workspace.Workspace, op EditOperation) *EditResult {
+	result := &EditResult{FilePath: op.Path}
+
+	absPath := filepath.Join(ws.RootDir, op.Path)
+	defer e.lockPath(absPath)()
+
+	existing, err := e.workspaceMgr.ReadFile(ws, op.Path)
+	if err != nil {
+		result.Message = fmt.Sprintf("Failed to read '%s': %v", op.Path, err)
+		return result
+	}
+
+	fileDiffs, err := diff.ParseMultiFileDiff([]byte(op.UnifiedDiff))
+	if err != nil {
+		result.Message = fmt.Sprintf("Failed to parse unified diff: %v", err)
+		return result
+	}
+
+	if len(fileDiffs) == 0 {
+		result.Message = "Parsed diff contains no file diffs"
+		return result
+	}
+
+	patched, err := applyHunks(existing, fileDiffs[0].Hunks)
+	if err != nil {
+		result.Message = fmt.Sprintf("Failed to apply diff to '%s': %v", op.Path, err)
+		return result
+	}
+
+	backupPath := op.Path + ".bak"
+	if bErr := e.workspaceMgr.WriteFile(ws, backupPath, existing); bErr != nil {
+		e.logger.Warn("failed to create backup", zap.String("path", backupPath), zap.Error(bErr))
+	}
+	result.BackupPath = backupPath
+
+	if err := e.workspaceMgr.WriteFile(ws, op.Path, patched); err != nil {
+		result.Message = fmt.Sprintf("Failed to write patched '%s': %v", op.Path, err)
+		return result
+	}
+
+	result.DiffPreview = generateUnifiedDiff(op.Path, existing, patched)
+
+	lintErrors := e.lintChecker.Check(ctx, absPath, ws.RootDir)
+	result.LintErrors = lintErrors
+
+	if len(lintErrors) > 0 {
+		e.logger.Warn("lint failed after diff apply, rolling back",
+			zap.String("path", op.Path),
+			zap.Strings("errors", lintErrors))
+
+		if err := e.workspaceMgr.WriteFile(ws, op.Path, existing); err != nil {
+			e.logger.Error("rollback failed!", zap.String("path", op.Path), zap.Error(err))
+			result.Message = fmt.Sprintf("⚠️ CRITICAL: Diff caused lint errors AND rollback failed for '%s'.\n"+
+				"Lint errors: %s\nRollback error: %v\nBackup is at: %s",
+				op.Path, strings.Join(lintErrors, "\n"), err, backupPath)
+			return result
+		}
+
+		result.RolledBack = true
+		result.Message = fmt.Sprintf("❌ Diff rolled back for '%s' — post-edit lint/compile check failed:\n%s\n\n"+
+			"The file has been restored to its original state. Please fix the issues and try again.\n"+
+			"Diff of the attempted (failed) edit:\n%s",
+			op.Path, strings.Join(lintErrors, "\n"), result.DiffPreview)
+		return result
+	}
+
+	_ = e.workspaceMgr.DeleteFile(ws, backupPath)
+
+	result.Success = true
+	result.Message = fmt.Sprintf("✅ Successfully applied diff to '%s' (lint passed)\n\nDiff:\n%s",
+		op.Path, result.DiffPreview)
+	return result
+}
+
+// applyHunks applies parsed diff hunks to the original content line by line.
+func applyHunks(original string, hunks []*diff.Hunk) (string, error) {
+	lines := strings.SplitAfter(original, "\n")
+	// SplitAfter may leave a trailing empty string if the file ends with \n.
+	// We keep it; line indexing below is 1-based as in diff hunks.
+
+	var result []string
+	srcIdx := 0 // 0-based index into lines
+
+	for _, hunk := range hunks {
+		hunkStart := int(hunk.OrigStartLine) - 1 // convert to 0-based
+
+		if hunkStart < srcIdx {
+			return "", fmt.Errorf("overlapping hunks: hunk starts at line %d but already at %d", hunk.OrigStartLine, srcIdx+1)
+		}
+		if hunkStart > len(lines) {
+			return "", fmt.Errorf("hunk starts at line %d but file only has %d lines", hunk.OrigStartLine, len(lines))
+		}
+
+		// Copy lines before this hunk
+		result = append(result, lines[srcIdx:hunkStart]...)
+
+		body := strings.SplitAfter(string(hunk.Body), "\n")
+		consumed := 0
+		for _, bLine := range body {
+			if bLine == "" {
+				continue
+			}
+			if len(bLine) == 0 {
+				continue
+			}
+			marker := bLine[0]
+			content := bLine[1:]
+
+			switch marker {
+			case ' ':
+				// Context line — verify it matches
+				lineIdx := hunkStart + consumed
+				if lineIdx >= len(lines) {
+					return "", fmt.Errorf("context line at %d beyond file end", lineIdx+1)
+				}
+				if normalizeLineEnding(lines[lineIdx]) != normalizeLineEnding(content) {
+					return "", fmt.Errorf("context mismatch at line %d: expected %q, got %q",
+						lineIdx+1, normalizeLineEnding(content), normalizeLineEnding(lines[lineIdx]))
+				}
+				result = append(result, lines[lineIdx])
+				consumed++
+			case '-':
+				// Deleted line — verify it matches then skip
+				lineIdx := hunkStart + consumed
+				if lineIdx >= len(lines) {
+					return "", fmt.Errorf("delete line at %d beyond file end", lineIdx+1)
+				}
+				if normalizeLineEnding(lines[lineIdx]) != normalizeLineEnding(content) {
+					return "", fmt.Errorf("delete mismatch at line %d: expected %q, got %q",
+						lineIdx+1, normalizeLineEnding(content), normalizeLineEnding(lines[lineIdx]))
+				}
+				consumed++
+			case '+':
+				// Added line
+				result = append(result, content)
+			case '\\':
+				// "\ No newline at end of file" — ignore
+			default:
+				// Treat lines without a marker as context (some diffs omit the space prefix)
+				lineIdx := hunkStart + consumed
+				if lineIdx < len(lines) {
+					result = append(result, lines[lineIdx])
+					consumed++
+				}
+			}
+		}
+
+		srcIdx = hunkStart + consumed
+	}
+
+	// Copy remaining lines after last hunk
+	if srcIdx < len(lines) {
+		result = append(result, lines[srcIdx:]...)
+	}
+
+	joined := strings.Join(result, "")
+	// SplitAfter preserves newlines in each element, so joining directly is correct.
+	return joined, nil
+}
+
+func normalizeLineEnding(s string) string {
+	return strings.TrimRight(s, "\r\n")
 }
 
 // ApplyMultiEdit performs multiple edits atomically — if any lint check fails,
