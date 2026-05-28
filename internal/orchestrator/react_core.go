@@ -251,14 +251,24 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		} else {
 			// Sequential execution for write tools or single calls
 			for _, tc := range resp.ToolCalls {
-				result, execErr := o.executeTool(ctx, tc)
+				// Inject progress callback so long-running tools can stream output
+				toolCtx := WithProgressCallback(ctx, func(chunk string) {
+					sink.Emit(models.ReactStreamEvent{
+						Type:       "tool_progress",
+						Step:       globalStep,
+						ToolCallID: tc.ID,
+						ToolName:   tc.Name,
+						Content:    chunk,
+					})
+				})
+				result, execErr := o.executeTool(toolCtx, tc)
 				content := result.Content
 				if execErr != nil {
 					content = fmt.Sprintf("Error: %v", execErr)
 				}
 
 				// Track edited files for auto-test
-				if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file") && execErr == nil && !result.IsError {
+				if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file" || tc.Name == "apply_diff") && execErr == nil && !result.IsError {
 					var pathReq struct {
 						Path string `json:"path"`
 					}
