@@ -61,6 +61,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -482,16 +483,18 @@ type Gateway struct {
 	servers       map[string]*ServerConnection
 	serverConfigs map[string]*config.MCPServerConfig // (F8) stored for reconnection
 	toolIndex     map[string]string                  // toolName -> serverName for O(1) lookup
+	httpClient    *http.Client
 	mu            sync.RWMutex
 	logger        *zap.Logger
 }
 
 // NewGateway creates a new MCP gateway and connects to configured servers.
-func NewGateway(cfg *config.MCPConfig, logger *zap.Logger) (*Gateway, error) {
+func NewGateway(cfg *config.MCPConfig, httpClient *http.Client, logger *zap.Logger) (*Gateway, error) {
 	gw := &Gateway{
 		servers:       make(map[string]*ServerConnection),
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     make(map[string]string),
+		httpClient:    httpClient,
 		logger:        logger.With(zap.String("component", "mcp")),
 	}
 

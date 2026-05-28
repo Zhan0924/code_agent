@@ -82,7 +82,7 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 	sessionMgr := session.NewManager(rdb, sessCfg, logger)
 
 	// ── 5. MCP gateway (no servers configured) ──
-	mcpGw, err := mcp.NewGateway(&config.MCPConfig{}, logger)
+	mcpGw, err := mcp.NewGateway(&config.MCPConfig{}, nil, logger)
 	if err != nil {
 		t.Fatalf("mcp.NewGateway: %v", err)
 	}

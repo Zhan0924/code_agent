@@ -305,7 +305,7 @@ func main() {
 	}
 
 	// ─── Initialize MCP Gateway ──────────────────────────────────────────
-	mcpGateway, err := mcp.NewGateway(&cfg.MCP, logger)
+	mcpGateway, err := mcp.NewGateway(&cfg.MCP, egressHTTPClient, logger)
 	if err != nil {
 		logger.Warn("MCP gateway initialization failed", zap.Error(err))
 	} else {

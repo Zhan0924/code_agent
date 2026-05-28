@@ -108,7 +108,7 @@ func newP0Harness(t *testing.T, warmPoolEnabled bool) *p0Harness {
 	})
 
 	// ── 4. MCP gateway（空）──
-	gw, _ := mcp.NewGateway(&config.MCPConfig{}, logger)
+	gw, _ := mcp.NewGateway(&config.MCPConfig{}, nil, logger)
 
 	// ── 5. P0 探针 ──
 	specCache := orchestrator.NewSpeculativeToolCache(60*time.Second, logger)
