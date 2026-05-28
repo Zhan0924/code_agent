@@ -26,7 +26,7 @@ func (s *Server) handleRegisterDynamicTool(c *gin.Context) {
 		"execute_code", "search_code", "read_file", "write_file",
 		"patch_file", "list_files", "create_directory", "run_tests",
 		"run_workspace_cmd", "git_status", "git_diff", "git_commit",
-		"git_log", "git_branch", "edit_file",
+		"git_log", "git_branch", "edit_file", "apply_diff",
 	}
 	for _, name := range builtins {
 		if config.Name == name {

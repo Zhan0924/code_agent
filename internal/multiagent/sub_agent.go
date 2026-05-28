@@ -129,7 +129,7 @@ func buildUserMessage(req DelegationRequest) string {
 func (a *SubAgent) allowedTools() []string {
 	switch a.Type {
 	case AgentCode:
-		return []string{"read_file", "write_file", "edit_file", "patch_file",
+		return []string{"read_file", "write_file", "edit_file", "patch_file", "apply_diff",
 			"list_files", "create_directory", "git_status", "git_diff",
 			"git_commit", "git_branch", "git_log", "run_workspace_cmd"}
 	case AgentTest:

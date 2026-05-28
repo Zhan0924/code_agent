@@ -250,7 +250,7 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 
 func isFileWriteAction(action string) bool {
 	switch action {
-	case "write_file", "edit_file", "patch_file":
+	case "write_file", "edit_file", "patch_file", "apply_diff":
 		return true
 	}
 	return false

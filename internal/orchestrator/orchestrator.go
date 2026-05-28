@@ -1545,7 +1545,7 @@ func (o *Orchestrator) cacheScope() string {
 // enabling rollback on interrupt.
 func (o *Orchestrator) captureForTransaction(tc models.ToolCall) {
 	switch tc.Name {
-	case "write_file", "edit_file", "patch_file":
+	case "write_file", "edit_file", "patch_file", "apply_diff":
 	default:
 		return
 	}
