@@ -27,7 +27,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ============================================================
 FROM docker.m.daocloud.io/library/alpine:3.20 AS runtime
 
-RUN apk add --no-cache ca-certificates tzdata curl git && \
+RUN apk add --no-cache ca-certificates tzdata curl git bash && \
     addgroup -S agent && adduser -S agent -G agent
 
 COPY --from=builder /build/bin/code-agent /usr/local/bin/code-agent
