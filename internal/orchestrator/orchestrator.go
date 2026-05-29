@@ -89,6 +89,15 @@ type Orchestrator struct {
 	// [P1-D] Project rules loader for workspace-specific LLM guidance
 	ruleLoader *RuleLoader
 
+	// [P1] Persistent PTY session manager for stateful shell execution (nil = disabled)
+	ptyManager PTYManager
+
+	// [P1] LSP client for type-aware code intelligence (nil = disabled)
+	lspClient LSPClient
+
+	// [P1] Tree-sitter parser for multi-language AST analysis (nil = disabled)
+	tsParser TreeSitterParser
+
 	// [P2-D] Tool learning: feedback collector + advisor + adaptive policy + distiller
 	toolCollector *toollearn.Collector
 	toolAdvisor   *toollearn.Advisor

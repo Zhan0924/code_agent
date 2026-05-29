@@ -61,12 +61,14 @@ import (
 	"github.com/agent/code_agent/internal/generator"
 	"github.com/agent/code_agent/internal/indexer"
 	"github.com/agent/code_agent/internal/llm"
+	"github.com/agent/code_agent/internal/lsp"
 	"github.com/agent/code_agent/internal/mcp"
 	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/multiagent"
 	"github.com/agent/code_agent/internal/orchestrator"
 	"github.com/agent/code_agent/internal/planner"
+	"github.com/agent/code_agent/internal/pty"
 	"github.com/agent/code_agent/internal/rag"
 	"github.com/agent/code_agent/internal/repomap"
 	"github.com/agent/code_agent/internal/sandbox"
@@ -77,6 +79,7 @@ import (
 	temporalpkg "github.com/agent/code_agent/internal/temporal"
 	"github.com/agent/code_agent/internal/tools"
 	"github.com/agent/code_agent/internal/tracing"
+	"github.com/agent/code_agent/internal/treesitter"
 	"github.com/agent/code_agent/internal/workspace"
 	"github.com/redis/go-redis/v9"
 	temporalclient "go.temporal.io/sdk/client"
@@ -447,6 +450,7 @@ func main() {
 	})
 
 	// ─── Wire Indexer into API Server ────────────────────────────────────
+	var repomapGen *repomap.Generator
 	if ragEngine != nil {
 		var idxOpts []indexer.IndexerOption
 		if pgStore != nil {
@@ -465,7 +469,8 @@ func main() {
 				}
 			}
 
-			gen := repomap.NewGenerator(logger)
+			repomapGen = repomap.NewGenerator(logger)
+			gen := repomapGen
 			watcher := repomap.NewWatcher(watchPath, gen, logger)
 
 			var (
@@ -576,6 +581,73 @@ func main() {
 			apiServer.SetGenerator(gen)
 			logger.Info("project generator wired into API server")
 		}
+	}
+
+	// ─── [P1] Tree-sitter AST Parser (optional) ─────────────────────────
+	if cfg.TreeSitter.Enabled {
+		tsParser := treesitter.NewCGOParser(logger)
+		orch.SetTreeSitterParser(tsParser)
+		if ragEngine != nil {
+			ragEngine.SetTreeSitterParser(&tsParserAdapter{parser: tsParser})
+		}
+		if repomapGen != nil {
+			repomapGen.SetTreeSitterParser(&tsRepomapAdapter{parser: tsParser})
+		}
+		logger.Info("tree-sitter parser initialized", zap.Strings("languages", tsParser.SupportedLanguages()))
+	}
+
+	// ─── [P1] PTY Session Manager (optional) ────────────────────────────
+	if cfg.PTY.Enabled {
+		ptyCfg := pty.ManagerConfig{
+			Backend:     cfg.PTY.Backend,
+			MaxSessions: cfg.PTY.MaxSessionsPerWorkspace,
+			OutputLimit: cfg.PTY.OutputLimit,
+			Shell:       cfg.PTY.Shell,
+		}
+		if ptyCfg.Backend == "" {
+			ptyCfg.Backend = "local"
+		}
+		if ptyCfg.MaxSessions == 0 {
+			ptyCfg.MaxSessions = 3
+		}
+		if ptyCfg.Shell == "" {
+			ptyCfg.Shell = "/bin/bash"
+		}
+		if cfg.PTY.Backend == "docker" && sandboxMgr != nil {
+			ptyCfg.Image = cfg.PTY.Image
+			ptyCfg.MemoryLimit = cfg.PTY.MemoryLimit
+			ptyCfg.CPUQuota = cfg.PTY.CPUQuota
+		}
+		ptyCfg.WorkspaceBase = "/tmp/agent-workspaces"
+		ptyMgr, err := pty.NewManager(ptyCfg, logger)
+		if err != nil {
+			logger.Warn("PTY manager init failed, shell_exec disabled", zap.Error(err))
+		} else {
+			orch.SetPTYManager(ptyMgr)
+			defer ptyMgr.Close()
+			logger.Info("PTY session manager initialized",
+				zap.String("backend", ptyCfg.Backend),
+				zap.Int("max_sessions", ptyCfg.MaxSessions))
+		}
+	}
+
+	// ─── [P1] LSP Client (optional) ─────────────────────────────────────
+	if cfg.LSP.Enabled {
+		lspCfg := lsp.Config{
+			Servers: make(map[string]lsp.ServerConfig),
+			Timeout: cfg.LSP.MaxConcurrentRequests,
+		}
+		for name, srv := range cfg.LSP.Servers {
+			lspCfg.Servers[name] = lsp.ServerConfig{
+				Command:   srv.Command,
+				Args:      srv.Args,
+				Languages: srv.Languages,
+			}
+		}
+		lspClient := lsp.NewClient(lspCfg, logger)
+		orch.SetLSPClient(lspClient)
+		defer lspClient.ShutdownAll()
+		logger.Info("LSP client initialized", zap.Int("servers", len(cfg.LSP.Servers)))
 	}
 
 	httpServer := &http.Server{

@@ -72,6 +72,7 @@ func NewPlanner(llm LLMCaller, logger *zap.Logger) *Planner {
 		"read_file", "write_file", "edit_file", "execute_code",
 		"search_code", "run_tests", "think", "patch_file", "apply_diff",
 		"list_files", "create_directory", "run_workspace_cmd",
+		"shell_exec", "goto_definition", "find_references", "hover_info", "rename_symbol",
 	}
 	return &Planner{
 		llm:       llm,
@@ -85,7 +86,7 @@ const plannerSystemPrompt = `You are a planning agent. Given a user's coding tas
 Rules:
 1. Break the task into discrete steps. Each step has an "id" (like "step_1"), "action" (tool name), "description", optional "parameters", and "depends_on" (list of prerequisite step IDs).
 2. Steps with no dependencies can run in parallel.
-3. Use actions: read_file, write_file, edit_file, patch_file, apply_diff, execute_code, search_code, run_tests, run_workspace_cmd, list_files, create_directory, think.
+3. Use actions: read_file, write_file, edit_file, patch_file, apply_diff, execute_code, search_code, run_tests, run_workspace_cmd, list_files, create_directory, think, shell_exec, goto_definition, find_references, hover_info, rename_symbol.
 4. The plan should be minimal but complete — don't add unnecessary steps.
 5. Output ONLY valid JSON matching this schema:
 {

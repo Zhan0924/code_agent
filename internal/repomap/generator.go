@@ -21,11 +21,26 @@ import (
 
 // Generator builds a compact repo-map from a directory tree.
 type Generator struct {
-	logger *zap.Logger
+	logger   *zap.Logger
+	tsParser TreeSitterParser // optional tree-sitter parser for enhanced symbol extraction
 
 	mu       sync.RWMutex
 	cache    map[string]*CachedMap // rootDir → cached map
 	cacheTTL time.Duration
+}
+
+// TreeSitterParser is the interface for tree-sitter based symbol extraction.
+type TreeSitterParser interface {
+	ExtractSymbols(language, content string) ([]TreeSitterSymbol, error)
+	SupportedLanguages() []string
+}
+
+// TreeSitterSymbol represents a symbol extracted by tree-sitter.
+type TreeSitterSymbol struct {
+	Name       string
+	Kind       string
+	StartLine  int
+	Visibility string
 }
 
 // CachedMap holds a cached repo map with expiry.
@@ -57,6 +72,11 @@ func NewGenerator(logger *zap.Logger) *Generator {
 		cache:    make(map[string]*CachedMap),
 		cacheTTL: 5 * time.Minute,
 	}
+}
+
+// SetTreeSitterParser sets the tree-sitter parser for enhanced symbol extraction.
+func (g *Generator) SetTreeSitterParser(p TreeSitterParser) {
+	g.tsParser = p
 }
 
 // Generate produces a compact text repo-map for the given directory.
@@ -179,8 +199,8 @@ func (g *Generator) scanDir(rootDir string) ([]FileEntry, error) {
 			Lang: lang,
 		}
 
-		// Extract symbols
-		symbols, lines, err := extractSymbols(path, lang)
+		// Extract symbols (try tree-sitter first if available)
+		symbols, lines, err := g.extractSymbolsWithParser(path, lang)
 		if err != nil {
 			g.logger.Debug("failed to extract symbols", zap.String("file", rel), zap.Error(err))
 		} else {
@@ -227,6 +247,34 @@ var (
 	javaClassRe  = regexp.MustCompile(`^(?:public|protected)\s+(?:abstract\s+)?(?:class|interface|enum)\s+(\w+)`)
 	javaMethodRe = regexp.MustCompile(`^\s+(?:public|protected)\s+.*?\s+(\w+)\s*\(`)
 )
+
+// extractSymbolsWithParser tries tree-sitter first, then falls back to regex extraction.
+func (g *Generator) extractSymbolsWithParser(filePath, lang string) ([]Symbol, int, error) {
+	if g.tsParser != nil {
+		content, err := os.ReadFile(filePath)
+		if err == nil {
+			tsSymbols, err := g.tsParser.ExtractSymbols(lang, string(content))
+			if err == nil && len(tsSymbols) > 0 {
+				symbols := make([]Symbol, 0, len(tsSymbols))
+				for _, ts := range tsSymbols {
+					// Only include public symbols (matching repomap's purpose)
+					if ts.Visibility == "public" || ts.Visibility == "" {
+						symbols = append(symbols, Symbol{
+							Kind: ts.Kind,
+							Name: ts.Name,
+							Line: ts.StartLine,
+						})
+					}
+				}
+				// Count lines
+				lines := len(strings.Split(string(content), "\n"))
+				return symbols, lines, nil
+			}
+		}
+	}
+	// Fall back to regex extraction
+	return extractSymbols(filePath, lang)
+}
 
 func extractSymbols(filePath, lang string) ([]Symbol, int, error) {
 	f, err := os.Open(filePath)

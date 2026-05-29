@@ -131,11 +131,13 @@ func (a *SubAgent) allowedTools() []string {
 	case AgentCode:
 		return []string{"read_file", "write_file", "edit_file", "patch_file", "apply_diff",
 			"list_files", "create_directory", "git_status", "git_diff",
-			"git_commit", "git_branch", "git_log", "run_workspace_cmd"}
+			"git_commit", "git_branch", "git_log", "run_workspace_cmd",
+			"shell_exec", "goto_definition", "find_references", "hover_info", "rename_symbol"}
 	case AgentTest:
-		return []string{"run_tests", "execute_code", "read_file", "run_workspace_cmd"}
+		return []string{"run_tests", "execute_code", "read_file", "run_workspace_cmd", "shell_exec"}
 	case AgentReview:
-		return []string{"read_file", "search_code", "list_files", "git_diff", "git_log"}
+		return []string{"read_file", "search_code", "list_files", "git_diff", "git_log",
+			"goto_definition", "find_references", "hover_info"}
 	default:
 		return []string{"read_file", "search_code"}
 	}

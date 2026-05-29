@@ -7,7 +7,7 @@ bin/
 *.dylib
 code-agent
 code-agent-*
-agent
+/agent
 
 # Test binary, built with `go test -c`
 *.test

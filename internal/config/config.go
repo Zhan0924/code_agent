@@ -55,20 +55,23 @@ import (
 
 // Config is the root configuration structure for the entire agent system.
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	LLM      LLMConfig      `mapstructure:"llm"`
-	Redis    RedisConfig    `mapstructure:"redis"`
-	Postgres PostgresConfig `mapstructure:"postgres"`
-	Qdrant   QdrantConfig   `mapstructure:"qdrant"`
-	Temporal TemporalConfig `mapstructure:"temporal"`
-	Sandbox  SandboxConfig  `mapstructure:"sandbox"`
-	MCP      MCPConfig      `mapstructure:"mcp"`
-	RAG      RAGConfig      `mapstructure:"rag"`
-	Session  SessionConfig  `mapstructure:"session"`
-	Security SecurityConfig `mapstructure:"security"`
-	Logging  LoggingConfig  `mapstructure:"logging"`
-	Auth     AuthConfig     `mapstructure:"auth"`
-	Tracing  TracingConfig  `mapstructure:"tracing"`
+	Server     ServerConfig     `mapstructure:"server"`
+	LLM        LLMConfig        `mapstructure:"llm"`
+	Redis      RedisConfig      `mapstructure:"redis"`
+	Postgres   PostgresConfig   `mapstructure:"postgres"`
+	Qdrant     QdrantConfig     `mapstructure:"qdrant"`
+	Temporal   TemporalConfig   `mapstructure:"temporal"`
+	Sandbox    SandboxConfig    `mapstructure:"sandbox"`
+	MCP        MCPConfig        `mapstructure:"mcp"`
+	RAG        RAGConfig        `mapstructure:"rag"`
+	Session    SessionConfig    `mapstructure:"session"`
+	Security   SecurityConfig   `mapstructure:"security"`
+	Logging    LoggingConfig    `mapstructure:"logging"`
+	Auth       AuthConfig       `mapstructure:"auth"`
+	Tracing    TracingConfig    `mapstructure:"tracing"`
+	PTY        PTYConfig        `mapstructure:"pty"`
+	TreeSitter TreeSitterConfig `mapstructure:"tree_sitter"`
+	LSP        LSPConfig        `mapstructure:"lsp"`
 }
 
 // ServerConfig holds HTTP/WS server settings.
@@ -265,6 +268,43 @@ type TracingConfig struct {
 	ServiceName string  `mapstructure:"service_name"`
 	SampleRate  float64 `mapstructure:"sample_rate"`
 	Insecure    bool    `mapstructure:"insecure"`
+}
+
+// PTYConfig holds persistent PTY session settings.
+type PTYConfig struct {
+	Enabled                bool   `mapstructure:"enabled"`
+	Backend                string `mapstructure:"backend"` // "docker" or "local"
+	Image                  string `mapstructure:"image"`
+	MaxSessionsPerWorkspace int   `mapstructure:"max_sessions_per_workspace"`
+	IdleTimeout            string `mapstructure:"idle_timeout"`
+	CommandTimeout         string `mapstructure:"command_timeout"`
+	MemoryLimit            int64  `mapstructure:"memory_limit"`
+	CPUQuota               int64  `mapstructure:"cpu_quota"`
+	OutputLimit            int    `mapstructure:"output_limit"`
+	Shell                  string `mapstructure:"shell"`
+}
+
+// TreeSitterConfig holds tree-sitter AST parser settings.
+type TreeSitterConfig struct {
+	Enabled     bool     `mapstructure:"enabled"`
+	Languages   []string `mapstructure:"languages"`
+	MaxFileSize int      `mapstructure:"max_file_size"`
+}
+
+// LSPServerConfig defines a single LSP server.
+type LSPServerConfig struct {
+	Command   string   `mapstructure:"command"`
+	Args      []string `mapstructure:"args"`
+	Languages []string `mapstructure:"languages"`
+}
+
+// LSPConfig holds LSP client settings.
+type LSPConfig struct {
+	Enabled               bool                       `mapstructure:"enabled"`
+	Servers               map[string]LSPServerConfig `mapstructure:"servers"`
+	InitializationTimeout string                     `mapstructure:"initialization_timeout"`
+	RequestTimeout        string                     `mapstructure:"request_timeout"`
+	MaxConcurrentRequests int                        `mapstructure:"max_concurrent_requests"`
 }
 
 // Load reads and parses the configuration from the given path.

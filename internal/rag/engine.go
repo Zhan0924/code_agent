@@ -39,8 +39,26 @@ type Engine struct {
 	reranker      Reranker
 	queryRewriter QueryRewriter
 	depGraph      *DepGraph
+	tsParser      TreeSitterParser // optional tree-sitter parser for enhanced AST chunking
 	cfg           *config.RAGConfig
 	logger        *zap.Logger
+}
+
+// TreeSitterParser is the interface for tree-sitter based AST parsing.
+type TreeSitterParser interface {
+	ChunkByAST(language, content string) ([]TreeSitterChunk, error)
+	SupportedLanguages() []string
+}
+
+// TreeSitterChunk is the chunk format returned by tree-sitter parser.
+type TreeSitterChunk struct {
+	SymbolName   string
+	SymbolType   string
+	Content      string
+	StartLine    int
+	EndLine      int
+	Dependencies []string
+	Signature    string
 }
 
 // NewEngine creates a new RAG engine with the given components.
@@ -59,6 +77,33 @@ func NewEngine(embedder Embedder, store VectorStore, reranker Reranker, cfg *con
 // This is a setter to avoid circular dependencies (rewriter may need LLM client).
 func (e *Engine) SetQueryRewriter(rewriter QueryRewriter) {
 	e.queryRewriter = rewriter
+}
+
+// SetTreeSitterParser sets the tree-sitter parser for enhanced AST-based chunking.
+func (e *Engine) SetTreeSitterParser(p TreeSitterParser) {
+	e.tsParser = p
+}
+
+// parseWithTreeSitterOrFallback tries tree-sitter first, then falls back to heuristic parsing.
+func (e *Engine) parseWithTreeSitterOrFallback(language, content string) []astChunk {
+	if e.tsParser != nil {
+		chunks, err := e.tsParser.ChunkByAST(language, content)
+		if err == nil && len(chunks) > 0 {
+			result := make([]astChunk, 0, len(chunks))
+			for _, c := range chunks {
+				result = append(result, astChunk{
+					symbolName:   c.SymbolName,
+					symbolType:   c.SymbolType,
+					content:      c.Content,
+					startLine:    c.StartLine,
+					endLine:      c.EndLine,
+					dependencies: c.Dependencies,
+				})
+			}
+			return result
+		}
+	}
+	return parseWithAST(language, content)
 }
 
 // IndexCode parses and indexes code files into the vector store.
@@ -206,8 +251,8 @@ func (e *Engine) Retrieve(ctx context.Context, query string, filters map[string]
 func (e *Engine) parseCodeChunks(filePath, language, content string, metadata map[string]string) []models.CodeChunk {
 	var chunks []models.CodeChunk
 
-	// Try AST-based parsing first
-	astChunks := parseWithAST(language, content)
+	// Try tree-sitter first (if available), then fall back to heuristic parsing
+	astChunks := e.parseWithTreeSitterOrFallback(language, content)
 	if len(astChunks) > 0 {
 		for _, ac := range astChunks {
 			chunk := models.CodeChunk{

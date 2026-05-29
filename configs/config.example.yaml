@@ -142,3 +142,44 @@ tracing:
   service_name: "code-agent"
   sample_rate: 0.1
   insecure: true
+
+# ─── Tree-sitter AST Parser (P1) ────────────────────────────
+tree_sitter:
+  enabled: false  # Requires CGO + tree-sitter build tag
+  languages: ["go", "python", "typescript", "javascript", "rust", "java", "c", "cpp"]
+  max_file_size: 1048576  # 1MB, skip files larger than this
+
+# ─── Persistent PTY Sessions (P1) ───────────────────────────
+pty:
+  enabled: false
+  backend: "local"            # "local" or "docker"
+  image: "code-agent-sandbox:latest"  # Docker backend only
+  max_sessions_per_workspace: 3
+  idle_timeout: 5m
+  command_timeout: 120s
+  memory_limit: 536870912    # 512MB (Docker backend only)
+  cpu_quota: 100000          # 1 core (Docker backend only)
+  output_limit: 1048576      # 1MB max output per command
+  shell: "/bin/bash"
+
+# ─── LSP Integration (P1) ───────────────────────────────────
+lsp:
+  enabled: false
+  max_concurrent_requests: 8
+  servers:
+    go:
+      command: "gopls"
+      args: ["serve"]
+      languages: ["go"]
+    python:
+      command: "pylsp"
+      args: []
+      languages: ["python"]
+    typescript:
+      command: "typescript-language-server"
+      args: ["--stdio"]
+      languages: ["typescript", "javascript"]
+    rust:
+      command: "rust-analyzer"
+      args: []
+      languages: ["rust"]
