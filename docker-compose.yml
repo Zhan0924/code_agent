@@ -3,7 +3,7 @@
 services:
   # ─── Code Agent Service ───────────────────────────────────
   agent:
-    image: code-agent:p1-verify
+    build: .
     container_name: code-agent
     ports:
       - "8080:8080"   # HTTP API
