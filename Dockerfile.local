@@ -11,7 +11,9 @@ FROM alpine:local
 # ca-certificates are already in alpine base image.
 
 COPY bin/code-agent-linux /usr/local/bin/code-agent
-COPY configs /etc/code-agent/configs
+# Copy only the example config — real config.yaml is provided at runtime via
+# bind mount (see docker-compose.yml). This prevents secrets being baked in.
+COPY configs/config.example.yaml /etc/code-agent/configs/config.example.yaml
 
 EXPOSE 8080 8081
 

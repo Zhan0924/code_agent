@@ -27,6 +27,15 @@ type Supervisor struct {
 	toolExecutor agentloop.ToolExecutor
 	toolProvider agentloop.ToolProvider
 	eventSink    agentloop.EventSink
+
+	// fileWriteClassifier decides whether a plan-step action mutates files;
+	// the supervisor uses the answer to skip parallel scheduling of writes
+	// on overlapping paths. Defaults to a small hardcoded set covering the
+	// known builtin file-write tools (write_file / edit_file / patch_file /
+	// apply_diff / rename_symbol). Inject via WithFileWriteClassifier when
+	// the host carries a richer registry (the orchestrator wires a
+	// ToolDefinition.IsFileWrite metadata-backed lookup).
+	fileWriteClassifier func(action string) bool
 }
 
 // SupervisorOption configures optional Supervisor features.
@@ -53,16 +62,29 @@ func WithEventSink(sink agentloop.EventSink) SupervisorOption {
 	return func(s *Supervisor) { s.eventSink = sink }
 }
 
+// WithFileWriteClassifier injects a registry-aware "is this action a file
+// write?" predicate. Without this, the supervisor falls back to a small
+// hardcoded set. The orchestrator wires a ToolDefinition.IsFileWrite-backed
+// implementation so adding a new write tool requires only declaring the bit.
+func WithFileWriteClassifier(fn func(action string) bool) SupervisorOption {
+	return func(s *Supervisor) {
+		if fn != nil {
+			s.fileWriteClassifier = fn
+		}
+	}
+}
+
 // NewSupervisor creates a multi-agent supervisor.
 func NewSupervisor(dispatcher ToolDispatcher, config SupervisorConfig, logger *zap.Logger, opts ...SupervisorOption) *Supervisor {
 	s := &Supervisor{
-		pool:             NewAgentPool(config.MaxParallel, logger),
-		bus:              NewMessageBus(logger),
-		dispatcher:       dispatcher,
-		conflictResolver: NewConflictResolver(StrategyPriority, logger),
-		roleSelector:     NewRoleSelector(logger),
-		config:           config,
-		logger:           logger.With(zap.String("component", "multiagent.supervisor")),
+		pool:                NewAgentPool(config.MaxParallel, logger),
+		bus:                 NewMessageBus(logger),
+		dispatcher:          dispatcher,
+		conflictResolver:    NewConflictResolver(StrategyPriority, logger),
+		roleSelector:        NewRoleSelector(logger),
+		config:              config,
+		logger:              logger.With(zap.String("component", "multiagent.supervisor")),
+		fileWriteClassifier: defaultFileWriteClassifier,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -183,7 +205,7 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 
 	var conflictBlocked bool
 	var conflictMsg string
-	if isFileWriteAction(step.Action) {
+	if s.fileWriteClassifier(step.Action) {
 		filePath := extractFilePathFromParams(step.Parameters)
 		if filePath != "" {
 			edit := FileEdit{
@@ -248,12 +270,21 @@ func (s *Supervisor) executeStep(ctx context.Context, step planner.Step) AgentRe
 	return result
 }
 
-func isFileWriteAction(action string) bool {
+// defaultFileWriteClassifier is the fallback used when no registry-backed
+// classifier is injected via WithFileWriteClassifier. The orchestrator
+// overrides this with a ToolDefinition.IsFileWrite-driven version.
+func defaultFileWriteClassifier(action string) bool {
 	switch action {
 	case "write_file", "edit_file", "patch_file", "apply_diff", "rename_symbol":
 		return true
 	}
 	return false
+}
+
+// isFileWriteAction is kept as a thin wrapper for back-compat with internal
+// callers; production calls go through s.fileWriteClassifier.
+func isFileWriteAction(action string) bool {
+	return defaultFileWriteClassifier(action)
 }
 
 func extractFilePathFromParams(params json.RawMessage) string {

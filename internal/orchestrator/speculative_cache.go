@@ -65,9 +65,53 @@ var idempotentTools = map[string]struct{}{
 
 // IsIdempotentTool 返回某工具名是否属于幂等只读工具。
 // 外部也可以调用此函数做白名单判断（例如日志埋点）。
+//
+// 这是包级 fallback：仅查询硬编码白名单。生产路径上 SpeculativeToolCache
+// 通过 SetMetadataLookup 注入注册表查询，使新工具自动获得正确分类。
 func IsIdempotentTool(name string) bool {
 	_, ok := idempotentTools[name]
 	return ok
+}
+
+// SetMetadataLookup 注入注册表查询函数。lookup 返回 (idempotent, write, ok)：
+//   - ok=false：工具不在注册表（fallback 到 idempotentTools map）
+//   - ok=true：以 idempotent / write 为准
+//
+// 安全可在运行时多次调用。传 nil 则恢复为 fallback-only。
+func (c *SpeculativeToolCache) SetMetadataLookup(lookup func(name string) (idempotent, write, ok bool)) {
+	c.metaLookupMu.Lock()
+	c.metaLookup = lookup
+	c.metaLookupMu.Unlock()
+}
+
+// isIdempotent 综合查询：优先注册表，回退到硬编码白名单。
+func (c *SpeculativeToolCache) isIdempotent(tool string) bool {
+	c.metaLookupMu.RLock()
+	lookup := c.metaLookup
+	c.metaLookupMu.RUnlock()
+	if lookup != nil {
+		if idempotent, _, ok := lookup(tool); ok {
+			return idempotent
+		}
+	}
+	return IsIdempotentTool(tool)
+}
+
+// shouldInvalidate 判断写工具是否清缓存。优先注册表的 InvalidatesCache 位，
+// 回退到 "非幂等即视为写"（保守）。
+func (c *SpeculativeToolCache) shouldInvalidate(tool string) bool {
+	c.metaLookupMu.RLock()
+	lookup := c.metaLookup
+	c.metaLookupMu.RUnlock()
+	if lookup != nil {
+		if idempotent, write, ok := lookup(tool); ok {
+			if write {
+				return true
+			}
+			return !idempotent
+		}
+	}
+	return !IsIdempotentTool(tool)
 }
 
 // cachedToolEntry 是缓存中单条目；expiry 用绝对时间戳做 TTL 判断。
@@ -98,6 +142,14 @@ type SpeculativeToolCache struct {
 	misses  atomic.Uint64
 	bypass  atomic.Uint64 // 非幂等工具命中次数，用于观测 cache 覆盖率
 	logger  *zap.Logger
+
+	// metaLookup, when non-nil, lets the cache consult the live tool registry
+	// for ToolDefinition.IsIdempotentRead / InvalidatesCache metadata so the
+	// idempotent set stays in sync with the single source of truth in
+	// file_tools / git_tools / lsp_tools. When nil (tests, standalone use)
+	// the cache falls back to the package-level `idempotentTools` whitelist.
+	metaLookupMu sync.RWMutex
+	metaLookup   func(name string) (idempotent, write bool, ok bool)
 }
 
 // NewSpeculativeToolCache 构造一个 TTL 缓存。传 0 会使用默认 30s。
@@ -129,7 +181,7 @@ func MakeKey(tool string, args []byte) string {
 // scope: 参见 SpeculativeToolCache 的类型注释——**传 workspace ID**，
 // 而不是 sessionID（除非系统是单 workspace per session 的）。
 func (c *SpeculativeToolCache) Get(scope, tool string, args []byte) (*models.ToolResult, bool) {
-	if !IsIdempotentTool(tool) {
+	if !c.isIdempotent(tool) {
 		c.bypass.Add(1)
 		return nil, false
 	}
@@ -159,7 +211,7 @@ func (c *SpeculativeToolCache) Get(scope, tool string, args []byte) (*models.Too
 // Put 写入成功返回 true 方便做日志/metric 计数。
 // scope 语义见 Get。
 func (c *SpeculativeToolCache) Put(scope, tool string, args []byte, result *models.ToolResult) bool {
-	if !IsIdempotentTool(tool) || result == nil || result.IsError {
+	if !c.isIdempotent(tool) || result == nil || result.IsError {
 		// 失败结果不缓存，避免错误结果在 TTL 内反复影响 LLM 判断
 		return false
 	}

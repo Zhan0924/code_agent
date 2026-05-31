@@ -50,19 +50,23 @@ func (o *Orchestrator) RegisterLSPTools(reg *tools.Registry) error {
 	}
 
 	for _, lt := range lspTools {
-		tool := &builtinTool{
-			def: models.ToolDefinition{
-				Name:        lt.name,
-				Description: lt.desc,
-				Parameters:  lt.params,
-				Source:      "builtin",
-				RiskLevel:   0,
-			},
-			handler: lt.handler,
+		def := models.ToolDefinition{
+			Name:        lt.name,
+			Description: lt.desc,
+			Parameters:  lt.params,
+			Source:      "builtin",
+			RiskLevel:   0,
 		}
-		if lt.name == "rename_symbol" {
-			tool.def.RiskLevel = 2 // high risk: cross-file modification
+		switch lt.name {
+		case "goto_definition", "find_references", "hover_info":
+			def.IsIdempotentRead = true
+		case "rename_symbol":
+			def.RiskLevel = 2 // high risk: cross-file modification
+			def.IsFileWrite = true
+			def.TriggersAutoTest = true
+			def.InvalidatesCache = true
 		}
+		tool := &builtinTool{def: def, handler: lt.handler}
 		if err := reg.Register(tool); err != nil {
 			return err
 		}

@@ -98,6 +98,7 @@ func (o *Orchestrator) NewSupervisorWithReAct(config multiagent.SupervisorConfig
 		multiagent.WithToolExecutor(&orchToolExecutor{orch: o}),
 		multiagent.WithToolProvider(&orchToolProvider{orch: o}),
 		multiagent.WithEventSink(agentloop.NoopSink{}),
+		multiagent.WithFileWriteClassifier(o.isFileWriteTool),
 	)
 }
 

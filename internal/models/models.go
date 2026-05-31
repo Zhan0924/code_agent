@@ -185,12 +185,37 @@ type ToolCall struct {
 }
 
 // ToolDefinition describes a tool available to the LLM via function calling.
+//
+// Behavior metadata fields (IsFileWrite, IsIdempotentRead, TriggersAutoTest,
+// InvalidatesCache) centralize what used to be hardcoded tool-name lists
+// scattered across 9 sites (react_core, supervisor, captureForTransaction,
+// speculative_cache, dynamic_tool_handlers, mcp_skill_handlers, ...).
+// The source of truth for builtin tools is `fileToolDefinitions()` /
+// `gitToolDefinitions()` — set the bits there once.
 type ToolDefinition struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"` // JSON Schema
 	Source      string          `json:"source"`     // "builtin", "mcp:<server_name>"
 	RiskLevel   int             `json:"risk_level"` // 0=safe, 1=moderate, 2=high (requires approval)
+
+	// IsFileWrite marks a tool that mutates files in the workspace —
+	// used by transaction capture, auto-test triggering, and conflict
+	// detection in the multi-agent supervisor.
+	IsFileWrite bool `json:"is_file_write,omitempty"`
+
+	// IsIdempotentRead marks a side-effect-free read tool whose result
+	// can be cached by the speculative-tool cache.
+	IsIdempotentRead bool `json:"is_idempotent_read,omitempty"`
+
+	// TriggersAutoTest marks a tool whose successful execution should
+	// trigger the auto-test runner (typically equals IsFileWrite, but
+	// kept separate so the policy can diverge).
+	TriggersAutoTest bool `json:"triggers_auto_test,omitempty"`
+
+	// InvalidatesCache marks a tool that should clear the speculative
+	// read cache after a successful run (write-after-read invalidation).
+	InvalidatesCache bool `json:"invalidates_cache,omitempty"`
 }
 
 // ToolResult represents the output of a tool execution.

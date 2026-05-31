@@ -5,8 +5,10 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/agent/code_agent/internal/config"
@@ -72,39 +74,83 @@ func (hc *healthChecker) Stop() {
 	})
 }
 
-// checkAll iterates over all connected MCP servers and verifies they are alive.
+// checkAll iterates over all connected MCP servers and verifies they are
+// alive. We can't rely on ConnPool.Alive() alone because it only counts
+// non-nil slot pointers — a slot still holding a *ServerConnection whose
+// child process has already exited would look "alive" until something
+// explicitly clears it (and the pool's auto-replace loop isn't yet in
+// place). So we walk slots, probe each with Signal(0) (see isProcessAlive
+// for the rationale — ProcessState alone is unreliable here), and trigger
+// a pool rebuild only if zero slots have a running process.
 func (hc *healthChecker) checkAll() {
 	hc.gateway.mu.RLock()
 	type serverInfo struct {
 		name string
-		conn *ServerConnection
+		pool *ConnPool
 	}
 	var servers []serverInfo
-	for name, conn := range hc.gateway.servers {
-		servers = append(servers, serverInfo{name: name, conn: conn})
+	for name, pool := range hc.gateway.servers {
+		servers = append(servers, serverInfo{name: name, pool: pool})
 	}
 	hc.gateway.mu.RUnlock()
 
 	for _, s := range servers {
-		if !hc.isAlive(s.conn) {
-			hc.logger.Warn("MCP server unresponsive, attempting reconnect",
+		if hc.processAlive(s.pool) == 0 {
+			hc.logger.Warn("MCP server pool has no alive child processes, attempting reconnect",
 				zap.String("server", s.name),
+				zap.Int("size", s.pool.Size()),
 			)
 			go hc.reconnect(s.name)
 		}
 	}
 }
 
-// isAlive checks if an MCP server process is still running.
-func (hc *healthChecker) isAlive(conn *ServerConnection) bool {
-	if conn.cmd == nil || conn.cmd.Process == nil {
+// isProcessAlive returns true only when the child process is genuinely
+// running. Two layers, both required:
+//
+//  1. `conn.exited` — set by the per-connection reaper goroutine that calls
+//     cmd.Wait(). Reaping removes the zombie entry from the process table,
+//     so any post-exit detection MUST go through this flag. Signal(0) alone
+//     is not sufficient: a zombie's PID still answers signals as "exists"
+//     until reaped, so Signal(0) would return nil and we'd wrongly keep
+//     dispatching to a dead slot.
+//
+//  2. `Process.Signal(syscall.Signal(0))` — handles the brief race between
+//     the child exiting and Wait returning. ESRCH means the PID is gone
+//     (reaped from elsewhere). Any other error (EPERM in odd kernel states)
+//     is treated as "assume alive" so we don't tear down a working pool on
+//     a transient syscall fault.
+func isProcessAlive(conn *ServerConnection) bool {
+	if conn == nil || conn.cmd == nil || conn.cmd.Process == nil {
 		return false
 	}
-	// ProcessState is non-nil only after the process has exited
-	if conn.cmd.ProcessState != nil {
+	if conn.exited.Load() {
 		return false
 	}
-	return true
+	err := conn.cmd.Process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, syscall.ESRCH)
+}
+
+func (hc *healthChecker) processAlive(p *ConnPool) int {
+	cnt := 0
+	for i := range p.conns {
+		conn := p.conns[i].Load()
+		if conn == nil {
+			continue
+		}
+		if !isProcessAlive(conn) {
+			// Process gone — drop the dead slot so future Pick() skips it.
+			if p.conns[i].CompareAndSwap(conn, nil) {
+				_ = conn.close()
+			}
+			continue
+		}
+		cnt++
+	}
+	return cnt
 }
 
 // reconnect attempts to restart a crashed MCP server with exponential backoff.
@@ -157,13 +203,13 @@ func (hc *healthChecker) reconnect(serverName string) {
 	)
 }
 
-// reconnectServer kills the old connection and creates a new one.
-// It must be called with the server name that matches a serverCfg in the original config.
+// reconnectServer tears down the old pool and starts a fresh one.
+// It must be called with a server name that matches a serverCfg in the original config.
 func (gw *Gateway) reconnectServer(ctx context.Context, serverName string) error {
 	gw.mu.Lock()
-	oldConn, ok := gw.servers[serverName]
+	oldPool, ok := gw.servers[serverName]
 	if ok {
-		_ = oldConn.close()
+		_ = oldPool.Close()
 		delete(gw.servers, serverName)
 	}
 	gw.mu.Unlock()
@@ -180,18 +226,13 @@ func (gw *Gateway) reconnectServer(ctx context.Context, serverName string) error
 		return fmt.Errorf("no stored config for MCP server: %s", serverName)
 	}
 
-	conn, err := newServerConnection(serverCfg, gw.logger)
-	if err != nil {
-		return fmt.Errorf("failed to start MCP server %s: %w", serverName, err)
-	}
-
-	if err := gw.initializeServer(ctx, conn); err != nil {
-		conn.close()
-		return fmt.Errorf("failed to initialize MCP server %s: %w", serverName, err)
+	pool := NewConnPool(serverCfg, gw.logger)
+	if err := pool.Start(ctx, gw.initializeServer); err != nil {
+		return fmt.Errorf("failed to start MCP server pool %s: %w", serverName, err)
 	}
 
 	gw.mu.Lock()
-	gw.servers[serverName] = conn
+	gw.servers[serverName] = pool
 	gw.mu.Unlock()
 
 	return nil

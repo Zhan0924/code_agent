@@ -29,6 +29,18 @@ llm:
     max_failures: 5
     timeout: 30s
     half_open_max_requests: 2
+  # Optional intent-based model tier router. When any of heavy/medium/light
+  # model is non-empty, the orchestrator picks a tier per request based on
+  # intent + a lightweight complexity heuristic (see internal/llm/router.go).
+  # Leave all empty (default) to disable: every call goes through the
+  # primary/fallback model unchanged.
+  router:
+    heavy_model: ""           # e.g. "claude-opus-4-7" — complex reasoning, multi-file edits, deploy/diagnose
+    medium_model: ""          # e.g. "claude-sonnet-4-6" — single-file edits, code Q&A
+    light_model: ""           # e.g. "claude-haiku-4-5" — intent parsing, summaries, simple chat
+    heavy_max_tokens: 16384
+    medium_max_tokens: 8192
+    light_max_tokens: 4096
 
 redis:
   addr: "localhost:6379"

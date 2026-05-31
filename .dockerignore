@@ -19,6 +19,11 @@ coverage.out
 docker-compose.yml
 Dockerfile
 
+# Secrets-bearing configs — runtime mounts these via volume.
+# config.example.yaml is the only allowed config in the image.
+configs/config.yaml
+configs/config.allinone.yaml
+
 # Docs
 README.md
 *.md

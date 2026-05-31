@@ -179,7 +179,8 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path"]
 			}`),
-			Source: "builtin",
+			Source:           "builtin",
+			IsIdempotentRead: true,
 		},
 		{
 			Name:        "write_file",
@@ -193,8 +194,11 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "content"]
 			}`),
-			Source:    "builtin",
-			RiskLevel: 2, // High risk: modifies files
+			Source:           "builtin",
+			RiskLevel:        2, // High risk: modifies files
+			IsFileWrite:      true,
+			TriggersAutoTest: true,
+			InvalidatesCache: true,
 		},
 		{
 			Name:        "patch_file",
@@ -209,8 +213,11 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "old_text", "new_text"]
 			}`),
-			Source:    "builtin",
-			RiskLevel: 1, // Moderate risk: modifies existing files
+			Source:           "builtin",
+			RiskLevel:        1, // Moderate risk: modifies existing files
+			IsFileWrite:      true,
+			TriggersAutoTest: true,
+			InvalidatesCache: true,
 		},
 		{
 			Name:        "list_files",
@@ -224,7 +231,8 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": []
 			}`),
-			Source: "builtin",
+			Source:           "builtin",
+			IsIdempotentRead: true,
 		},
 		{
 			Name:        "create_directory",
@@ -280,8 +288,11 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "old_text", "new_text"]
 			}`),
-			Source:    "builtin",
-			RiskLevel: 1, // Moderate risk: modifies existing files with rollback
+			Source:           "builtin",
+			RiskLevel:        1, // Moderate risk: modifies existing files with rollback
+			IsFileWrite:      true,
+			TriggersAutoTest: true,
+			InvalidatesCache: true,
 		},
 		{
 			Name:        "apply_diff",
@@ -295,8 +306,11 @@ func fileToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["path", "diff"]
 			}`),
-			Source:    "builtin",
-			RiskLevel: 1, // Moderate risk: modifies existing files with rollback
+			Source:           "builtin",
+			RiskLevel:        1, // Moderate risk: modifies existing files with rollback
+			IsFileWrite:      true,
+			TriggersAutoTest: true,
+			InvalidatesCache: true,
 		},
 	}
 }

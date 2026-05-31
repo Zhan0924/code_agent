@@ -136,9 +136,10 @@ func TestGateway_CallTool_Timeout(t *testing.T) {
 
 	conn := newInMemoryConnection("timeout-server", mock.outW, mock.stdinR, mock.stdinW, mock.outR, logger)
 
-	// Manually wire up a gateway with this connection
+	// Manually wire up a gateway with this connection (wrapped in a
+	// 1-slot ConnPool — production gateways always go through pools).
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"timeout-server": conn},
+		servers:       map[string]*ConnPool{"timeout-server": newSingletonPool(&config.MCPServerConfig{Name: "timeout-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"slow-tool": "timeout-server"},
 		logger:        logger,
@@ -168,7 +169,7 @@ func TestGateway_Close(t *testing.T) {
 	conn := newInMemoryConnection("close-server", mock.outW, mock.stdinR, mock.stdinW, mock.outR, logger)
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"close-server": conn},
+		servers:       map[string]*ConnPool{"close-server": newSingletonPool(&config.MCPServerConfig{Name: "close-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"tool-a": "close-server"},
 		logger:        logger,
@@ -211,9 +212,9 @@ func TestGateway_GetToolDefinitions(t *testing.T) {
 	}
 
 	gw := &Gateway{
-		servers: map[string]*ServerConnection{
-			"server-a": conn1,
-			"server-b": conn2,
+		servers: map[string]*ConnPool{
+			"server-a": newSingletonPool(&config.MCPServerConfig{Name: "server-a"}, conn1, logger),
+			"server-b": newSingletonPool(&config.MCPServerConfig{Name: "server-b"}, conn2, logger),
 		},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex: map[string]string{
@@ -245,7 +246,7 @@ func TestGateway_GetToolDefinitions(t *testing.T) {
 
 func TestGateway_FindServerForTool_WithServers(t *testing.T) {
 	gw := &Gateway{
-		servers:       make(map[string]*ServerConnection),
+		servers:       make(map[string]*ConnPool),
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex: map[string]string{
 			"git_status": "git-server",
@@ -279,7 +280,7 @@ func TestGateway_CallTool_InvalidArgs(t *testing.T) {
 	conn := newInMemoryConnection("args-server", mock.outW, mock.stdinR, mock.stdinW, mock.outR, logger)
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"args-server": conn},
+		servers:       map[string]*ConnPool{"args-server": newSingletonPool(&config.MCPServerConfig{Name: "args-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"tool": "args-server"},
 		logger:        logger,
@@ -508,7 +509,7 @@ func TestGateway_CallTool_SuccessRoundTrip(t *testing.T) {
 	conn.tools = []MCPTool{{Name: "echo", Description: "echo tool"}}
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"roundtrip-server": conn},
+		servers:       map[string]*ConnPool{"roundtrip-server": newSingletonPool(&config.MCPServerConfig{Name: "roundtrip-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"echo": "roundtrip-server"},
 		logger:        logger,
@@ -540,7 +541,7 @@ func TestGateway_CallTool_ErrorResponse(t *testing.T) {
 	conn.tools = []MCPTool{{Name: "fail_tool"}}
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"error-server": conn},
+		servers:       map[string]*ConnPool{"error-server": newSingletonPool(&config.MCPServerConfig{Name: "error-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"fail_tool": "error-server"},
 		logger:        logger,
@@ -576,7 +577,7 @@ func TestGateway_CallTool_MultipleContentTypes(t *testing.T) {
 	conn.tools = []MCPTool{{Name: "multi_tool"}}
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"multi-content-server": conn},
+		servers:       map[string]*ConnPool{"multi-content-server": newSingletonPool(&config.MCPServerConfig{Name: "multi-content-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"multi_tool": "multi-content-server"},
 		logger:        logger,
@@ -610,7 +611,7 @@ func TestGateway_CallTool_ConcurrentDistribution(t *testing.T) {
 	conn.tools = []MCPTool{{Name: "echo"}}
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"concurrent-gw-server": conn},
+		servers:       map[string]*ConnPool{"concurrent-gw-server": newSingletonPool(&config.MCPServerConfig{Name: "concurrent-gw-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"echo": "concurrent-gw-server"},
 		logger:        logger,
@@ -653,7 +654,7 @@ func TestGateway_CallTool_ComplexArguments(t *testing.T) {
 	conn.tools = []MCPTool{{Name: "complex_tool"}}
 
 	gw := &Gateway{
-		servers:       map[string]*ServerConnection{"complex-args-server": conn},
+		servers:       map[string]*ConnPool{"complex-args-server": newSingletonPool(&config.MCPServerConfig{Name: "complex-args-server"}, conn, logger)},
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     map[string]string{"complex_tool": "complex-args-server"},
 		logger:        logger,

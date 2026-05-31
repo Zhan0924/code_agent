@@ -31,7 +31,9 @@ RUN apk add --no-cache ca-certificates tzdata curl git bash && \
     addgroup -S agent && adduser -S agent -G agent
 
 COPY --from=builder /build/bin/code-agent /usr/local/bin/code-agent
-COPY --from=builder /build/configs /etc/code-agent/configs
+# Copy only the example config — real config.yaml is provided at runtime via
+# bind mount (see docker-compose.yml). This prevents secrets being baked in.
+COPY --from=builder /build/configs/config.example.yaml /etc/code-agent/configs/config.example.yaml
 
 USER agent
 WORKDIR /home/agent

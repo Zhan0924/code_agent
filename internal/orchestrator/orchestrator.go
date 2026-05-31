@@ -61,6 +61,7 @@ func getMaxSteps(intent models.TaskIntent) int {
 // Orchestrator is the central brain of the Agent system.
 type Orchestrator struct {
 	llmClient      *llm.Client
+	llmRouter      *llm.Router // Optional intent-based model tier router; nil = disabled.
 	sessionMgr     *session.Manager
 	ragEngine      *rag.Engine
 	sandboxMgr     *sandbox.Manager
@@ -238,6 +239,18 @@ Always use tools when they would produce better answers. After receiving tool re
 		logger.Error("failed to register builtin tools", zap.Error(err))
 	}
 
+	// Wire the speculative tool cache's metadata lookup to the registry so
+	// idempotent / write classification stays in sync with ToolDefinition
+	// metadata (set in file_tools / git_tools / lsp_tools). Falls back to the
+	// hardcoded whitelist for tools that aren't (yet) in the registry.
+	orch.toolCache.SetMetadataLookup(func(name string) (bool, bool, bool) {
+		def, ok := orch.toolMetadata(name)
+		if !ok {
+			return false, false, false
+		}
+		return def.IsIdempotentRead, def.IsFileWrite || def.InvalidatesCache, true
+	})
+
 	// [P2-D] Initialize tool learning subsystem
 	collector := toollearn.NewCollector(nil, logger)
 	extractor := toollearn.NewExtractor(collector, logger)
@@ -249,6 +262,16 @@ Always use tools when they would produce better answers. After receiving tool re
 		orch.store = pgStore[0]
 	}
 	return orch
+}
+
+// SetToolLearnStore wires a persistent store into the tool-learning collector
+// so feedback survives process restarts. Safe to call at any time after
+// construction; nil is a no-op.
+func (o *Orchestrator) SetToolLearnStore(s toollearn.Store) {
+	if o.toolCollector == nil || s == nil {
+		return
+	}
+	o.toolCollector.SetStore(s)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -742,9 +765,9 @@ func (o *Orchestrator) ProcessMessageStream(ctx context.Context, sessionID, user
 	}
 	messages := append([]models.Message{systemMsg}, contextMsgs...)
 
-	ch, err := o.llmClient.ChatCompletionStream(ctx, &llm.ChatRequest{
-		Messages: messages,
-	})
+	streamReq := &llm.ChatRequest{Messages: messages}
+	o.applyModelRoute(streamReq, "conversation", userMessage, len(messages))
+	ch, err := o.llmClient.ChatCompletionStream(ctx, streamReq)
 	if err != nil {
 		return nil, err
 	}
@@ -998,9 +1021,14 @@ Respond with ONLY the category name.`,
 	messages := append([]models.Message{systemPrompt}, contextMsgs...)
 	messages = append(messages, models.Message{Role: models.RoleUser, Content: userMessage})
 
-	resp, err := o.llmClient.ChatCompletion(ctx, &llm.ChatRequest{
+	intentReq := &llm.ChatRequest{
 		Messages: messages, MaxTokens: 20, Temperature: 0.0,
-	})
+	}
+	// Intent parsing is the canonical "internal utility" route — the router
+	// classifies this as Light tier, so we use a cheap+fast model when
+	// available.
+	o.applyModelRoute(intentReq, "_intent_parse", userMessage, len(messages))
+	resp, err := o.llmClient.ChatCompletion(ctx, intentReq)
 	if err != nil {
 		return models.IntentConversation, nil
 	}
@@ -1383,7 +1411,7 @@ func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*mo
 		o.toolCache.Put(scope, tc.Name, tc.Args, result)
 	}
 	// [P0-3] Cache invalidation: write tools invalidate the scope
-	if o.toolCache != nil && ShouldInvalidateAfter(tc.Name) {
+	if o.toolCache != nil && o.toolCache.shouldInvalidate(tc.Name) {
 		o.toolCache.Invalidate(scope)
 	}
 
@@ -1551,11 +1579,11 @@ func (o *Orchestrator) cacheScope() string {
 }
 
 // captureForTransaction records file state before write tools execute,
-// enabling rollback on interrupt.
+// enabling rollback on interrupt. Uses centralized IsFileWrite metadata bit
+// (set in fileToolDefinitions / lsp_tools) so new write tools opt in by
+// declaring the bit, not by editing this switch.
 func (o *Orchestrator) captureForTransaction(tc models.ToolCall) {
-	switch tc.Name {
-	case "write_file", "edit_file", "patch_file", "apply_diff":
-	default:
+	if !o.isFileWriteTool(tc.Name) {
 		return
 	}
 

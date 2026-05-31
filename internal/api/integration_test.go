@@ -364,7 +364,13 @@ func TestIntegration_ChatInputValidation(t *testing.T) {
 func TestIntegration_ToolsAndSkillLifecycle(t *testing.T) {
 	h := newIntegrationHarness(t)
 
-	// ── Initial state: list tools returns builtins ──
+	// ── Initial state: list tools returns the registry-derived set ──
+	// With nil orchestrator (the harness omits it deliberately — see
+	// newIntegrationHarness) the registry has nothing to enumerate, so the
+	// /tools endpoint legitimately returns []. Previously this test passed a
+	// hardcoded 20-tool list straight from handler code, which masked exactly
+	// the kind of "endpoint claims tools that aren't actually registered"
+	// drift this PR moves the codebase away from.
 	code, body, _ := h.do("GET", "/api/v1/tools", nil)
 	if code != 200 {
 		t.Fatalf("GET /tools status = %d; body=%s", code, body)
@@ -373,14 +379,9 @@ func TestIntegration_ToolsAndSkillLifecycle(t *testing.T) {
 	if err := json.Unmarshal(body, &tools); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	builtinCount := 0
-	for _, tool := range tools {
-		if tool["source"] == "builtin" {
-			builtinCount++
-		}
-	}
-	if builtinCount < 5 {
-		t.Errorf("expected ≥5 builtin tools, got %d; tools=%v", builtinCount, tools)
+	// Endpoint must return a well-formed JSON array (not null), even when empty.
+	if tools == nil {
+		t.Errorf("/tools returned null body, expected JSON array (possibly empty)")
 	}
 
 	// ── List skills — should be empty ──

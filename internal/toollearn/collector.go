@@ -44,13 +44,24 @@ func (c *Collector) Record(toolName string, args []byte, success bool, duration 
 	if len(c.buffer) < c.maxBuf {
 		c.buffer = append(c.buffer, fb)
 	}
+	store := c.store
 	c.mu.Unlock()
 
-	if c.store != nil {
-		if err := c.store.RecordFeedback(&fb); err != nil {
+	if store != nil {
+		if err := store.RecordFeedback(&fb); err != nil {
 			c.logger.Debug("failed to persist feedback", zap.Error(err))
 		}
 	}
+}
+
+// SetStore wires a persistent backing store into the collector at runtime.
+// In-memory buffer entries already collected are NOT replayed — they remain
+// the recency window for in-process queries. Subsequent Record calls fan out
+// to both buffer and store.
+func (c *Collector) SetStore(s Store) {
+	c.mu.Lock()
+	c.store = s
+	c.mu.Unlock()
 }
 
 // RecentFeedback returns the last N feedback entries for a tool.

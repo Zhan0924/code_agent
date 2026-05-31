@@ -167,6 +167,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			Tools:          opts.tools,
 			ResponseFormat: opts.responseFormat,
 		}
+		o.applyModelRoute(llmReq, string(opts.task.Intent), opts.task.UserInput, len(messages))
 		for attempt := range 3 {
 			resp, llmErr = o.llmClient.ChatCompletion(ctx, llmReq)
 			if llmErr == nil {
@@ -267,8 +268,11 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 					content = fmt.Sprintf("Error: %v", execErr)
 				}
 
-				// Track edited files for auto-test
-				if (tc.Name == "edit_file" || tc.Name == "write_file" || tc.Name == "patch_file" || tc.Name == "apply_diff") && execErr == nil && !result.IsError {
+				// Track edited files for auto-test. Uses the centralized
+				// TriggersAutoTest metadata bit instead of a hardcoded name list,
+				// so adding a new file-write tool (rename_symbol, future ones)
+				// requires no edits here.
+				if execErr == nil && !result.IsError && o.triggersAutoTest(tc.Name) {
 					var pathReq struct {
 						Path string `json:"path"`
 					}

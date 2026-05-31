@@ -77,6 +77,7 @@ import (
 	"github.com/agent/code_agent/internal/skill"
 	"github.com/agent/code_agent/internal/store"
 	temporalpkg "github.com/agent/code_agent/internal/temporal"
+	"github.com/agent/code_agent/internal/toollearn"
 	"github.com/agent/code_agent/internal/tools"
 	"github.com/agent/code_agent/internal/tracing"
 	"github.com/agent/code_agent/internal/treesitter"
@@ -168,6 +169,26 @@ func main() {
 	logger.Info("LLM client initialized",
 		zap.String("primary", cfg.LLM.Primary.Provider+"/"+cfg.LLM.Primary.Model),
 	)
+
+	// Optional intent-based model-tier router. Disabled unless at least one
+	// of heavy/medium/light model is set in config — we don't want to silently
+	// remap users' explicit primary/fallback model choice.
+	var llmRouter *llm.Router
+	if cfg.LLM.Router.Enabled() {
+		llmRouter = llm.NewRouter(llm.RouterConfig{
+			HeavyModel:      cfg.LLM.Router.HeavyModel,
+			MediumModel:     cfg.LLM.Router.MediumModel,
+			LightModel:      cfg.LLM.Router.LightModel,
+			HeavyMaxTokens:  cfg.LLM.Router.HeavyMaxTokens,
+			MediumMaxTokens: cfg.LLM.Router.MediumMaxTokens,
+			LightMaxTokens:  cfg.LLM.Router.LightMaxTokens,
+		}, logger)
+		logger.Info("LLM model router enabled",
+			zap.String("heavy", cfg.LLM.Router.HeavyModel),
+			zap.String("medium", cfg.LLM.Router.MediumModel),
+			zap.String("light", cfg.LLM.Router.LightModel),
+		)
+	}
 
 	// ─── Wire LLM Summarizer into Session Manager ───────────────────────
 	sessionMgr.Summarizer = session.NewLLMSummarizer(
@@ -408,15 +429,25 @@ func main() {
 	if cfg.Session.CompactionMode != "" {
 		orch.SetCompactionMode(cfg.Session.CompactionMode)
 	}
+	if llmRouter != nil {
+		orch.SetRouter(llmRouter)
+		logger.Info("LLM router wired into orchestrator")
+	}
 	// Wire Planner for complex task DAG execution
 	plannerAdapter := orchestrator.NewLLMCallerAdapter(llmClient)
 	p := planner.NewPlanner(plannerAdapter, logger)
 	orch.AttachPlanner(p)
 	logger.Info("orchestrator initialized (planner attached)")
 
-	// Wire multi-agent Supervisor for parallel plan execution
+	// Wire multi-agent Supervisor for parallel plan execution. Inject the
+	// registry-backed file-write classifier so conflict detection uses the
+	// same metadata source as the rest of the system (avoiding the latent
+	// rename_symbol drift the hardcoded list previously had).
 	supCfg := multiagent.DefaultSupervisorConfig()
-	supervisor := multiagent.NewSupervisor(orch.NewToolDispatcherAdapter(), supCfg, logger)
+	supervisor := multiagent.NewSupervisor(
+		orch.NewToolDispatcherAdapter(), supCfg, logger,
+		multiagent.WithFileWriteClassifier(orch.IsFileWriteTool),
+	)
 	orch.AttachSupervisor(supervisor)
 	logger.Info("multi-agent supervisor attached")
 
@@ -425,6 +456,19 @@ func main() {
 	if memAdapter != nil {
 		orch.SetMemoryStore(memAdapter)
 		logger.Info("long-term memory store wired into orchestrator")
+	}
+
+	// ─── Wire ToolLearn PG Store (optional) ─────────────────────────────
+	// Persists tool-execution feedback so adaptive policy / distiller survive
+	// restarts. Falls back to in-memory if Postgres is unavailable.
+	if pgStore != nil {
+		tlStore := toollearn.NewPGStore(pgStore.DB())
+		if err := tlStore.Migrate(); err != nil {
+			logger.Warn("toollearn pg migration failed, feedback stays in-memory", zap.Error(err))
+		} else {
+			orch.SetToolLearnStore(tlStore)
+			logger.Info("toollearn PG store wired into orchestrator (tool_feedback table)")
+		}
 	}
 
 	// ─── Wire Memory Extractor (optional) ────────────────────────────────

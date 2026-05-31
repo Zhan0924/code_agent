@@ -180,20 +180,38 @@ func (s *Server) handleListTools(c *gin.Context) {
 		Source      string `json:"source"`
 	}
 
-	var tools []toolInfo
+	// Pre-allocate to guarantee JSON marshals to `[]` rather than `null` when
+	// the registry is empty (e.g. partial-init smoke tests with no orchestrator).
+	tools := make([]toolInfo, 0, 16)
 
-	// Builtin tools
-	builtins := []string{"execute_code", "search_code", "read_file", "write_file",
-		"patch_file", "list_files", "create_directory", "run_tests", "run_workspace_cmd",
-		"git_status", "git_diff", "git_commit", "git_log", "git_branch", "apply_diff",
-		"shell_exec", "goto_definition", "find_references", "hover_info", "rename_symbol"}
-	for _, name := range builtins {
-		tools = append(tools, toolInfo{Name: name, Source: "builtin"})
+	// Tools sourced from the orchestrator's registry — includes builtin,
+	// dynamic, and (via GetAvailableTools) skill/MCP entries. Single
+	// enumeration replaces the previously hardcoded `builtins` slice that
+	// drifted whenever a new builtin landed.
+	seen := make(map[string]struct{})
+	if s.orchestrator != nil {
+		for _, t := range s.orchestrator.GetAvailableTools() {
+			if _, dup := seen[t.Name]; dup {
+				continue
+			}
+			seen[t.Name] = struct{}{}
+			tools = append(tools, toolInfo{
+				Name:        t.Name,
+				Description: t.Description,
+				Source:      t.Source,
+			})
+		}
 	}
 
-	// MCP tools
-	if s.mcpGateway != nil {
+	// MCP tools — already included via orchestrator.GetAvailableTools() when
+	// a gateway is wired in, but keep this branch for the case when the
+	// orchestrator pointer is nil (e.g. partial-init smoke tests).
+	if s.orchestrator == nil && s.mcpGateway != nil {
 		for _, t := range s.mcpGateway.GetAvailableTools() {
+			if _, dup := seen[t.Name]; dup {
+				continue
+			}
+			seen[t.Name] = struct{}{}
 			tools = append(tools, toolInfo{
 				Name:        t.Name,
 				Description: t.Description,
@@ -208,24 +226,15 @@ func (s *Server) handleListTools(c *gin.Context) {
 		snap := s.skillRegistry.Snapshot()
 		c.Header("X-Tools-Etag", snap.ETag)
 		for _, t := range snap.Tools {
+			if _, dup := seen[t.Name]; dup {
+				continue
+			}
+			seen[t.Name] = struct{}{}
 			tools = append(tools, toolInfo{
 				Name:        t.Name,
 				Description: t.Description,
 				Source:      t.Source,
 			})
-		}
-	}
-
-	// Dynamic tools from orchestrator registry
-	if s.orchestrator != nil {
-		for _, t := range s.orchestrator.GetAvailableTools() {
-			if t.Source == "dynamic" {
-				tools = append(tools, toolInfo{
-					Name:        t.Name,
-					Description: t.Description,
-					Source:      t.Source,
-				})
-			}
 		}
 	}
 

@@ -21,19 +21,13 @@ func (s *Server) handleRegisterDynamicTool(c *gin.Context) {
 
 	config.CreatedAt = time.Now()
 
-	// Check for conflicts with builtin tools
-	builtins := []string{
-		"execute_code", "search_code", "read_file", "write_file",
-		"patch_file", "list_files", "create_directory", "run_tests",
-		"run_workspace_cmd", "git_status", "git_diff", "git_commit",
-		"git_log", "git_branch", "edit_file", "apply_diff",
-		"shell_exec", "goto_definition", "find_references", "hover_info", "rename_symbol",
-	}
-	for _, name := range builtins {
-		if config.Name == name {
-			c.JSON(http.StatusConflict, gin.H{"error": "tool name conflicts with builtin: " + name})
-			return
-		}
+	// Check for conflicts with builtin tools using the live registry rather
+	// than a hardcoded list that historically drifted (see
+	// tool_metadata.go::BuiltinToolNames). Any new builtin gets reflected here
+	// automatically.
+	if s.orchestrator.IsBuiltinTool(config.Name) {
+		c.JSON(http.StatusConflict, gin.H{"error": "tool name conflicts with builtin: " + config.Name})
+		return
 	}
 
 	// Create dynamic tool

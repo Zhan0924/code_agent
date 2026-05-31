@@ -108,6 +108,29 @@ type LLMConfig struct {
 	Primary        LLMProviderConfig    `mapstructure:"primary"`
 	Fallback       LLMProviderConfig    `mapstructure:"fallback"`
 	CircuitBreaker CircuitBreakerConfig `mapstructure:"circuit_breaker"`
+	Router         RouterConfig         `mapstructure:"router"`
+}
+
+// RouterConfig configures intent-based model tier routing. When all model
+// fields are empty the router is treated as disabled (orchestrator skips
+// ApplyRoute entirely — full back-compat). Set heavy/medium/light to enable
+// adaptive selection: see internal/llm/router.go for the rule table.
+//
+// Mirrors llm.RouterConfig to avoid a config → llm import cycle (llm already
+// imports config); main.go converts between the two at wire-up.
+type RouterConfig struct {
+	HeavyModel  string `mapstructure:"heavy_model"`
+	MediumModel string `mapstructure:"medium_model"`
+	LightModel  string `mapstructure:"light_model"`
+
+	HeavyMaxTokens  int `mapstructure:"heavy_max_tokens"`
+	MediumMaxTokens int `mapstructure:"medium_max_tokens"`
+	LightMaxTokens  int `mapstructure:"light_max_tokens"`
+}
+
+// Enabled reports whether at least one model tier is configured.
+func (r RouterConfig) Enabled() bool {
+	return r.HeavyModel != "" || r.MediumModel != "" || r.LightModel != ""
 }
 
 // RedisConfig holds Redis connection settings.

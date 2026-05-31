@@ -63,7 +63,6 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -183,6 +182,12 @@ type ServerConnection struct {
 	logger   *zap.Logger
 	readerWg sync.WaitGroup // 跟踪 readResponses goroutine 生命周期
 
+	// exited 由后台 reaper goroutine 在 cmd.Wait() 返回时设为 true。
+	// 健康检查（reconnect.go::isProcessAlive）通过它检出僵尸（exited
+	// 但还没被父进程 wait 回收的子进程）—— 这种情况下 kill(pid, 0) 仍
+	// 返回 0，单独的 Signal(0) 探针会误报"还活着"。
+	exited atomic.Bool
+
 	// testHook 让 mock server 在进程外用 io.Pipe 注入响应流而无需真正 fork 进程。
 	// 生产路径下永远为 nil；仅单元测试使用。
 	testHook bool
@@ -234,6 +239,33 @@ func newServerConnection(cfg *config.MCPServerConfig, logger *zap.Logger) (*Serv
 	// Start response reader goroutine
 	conn.readerWg.Add(1)
 	go conn.readResponses()
+
+	// Reaper goroutine: waits for the child to exit, reaps the zombie, and
+	// flips `exited` so the health checker can detect dead processes
+	// reliably (Signal(0) alone treats zombies as alive — see reconnect.go::
+	// isProcessAlive).
+	//
+	// Per os/exec's documented contract, cmd.Wait() must NOT be called until
+	// all reads from StdoutPipe have completed — Wait closes the pipe from
+	// under any pending Read. So we block on `readerWg.Wait()` first;
+	// readResponses returns when the stdout pipe EOFs, which happens either
+	// when (a) the child exits naturally (kernel closes the write end) or
+	// (b) close() closes our read end explicitly.
+	//
+	// What cmd.Wait() does next depends on which path we came from:
+	//   - path (a): child is already gone → Wait returns quickly with the
+	//               exit status, reaping the zombie.
+	//   - path (b): child may still be running because close() closed stdout
+	//               before calling Process.Kill(). Wait blocks here until
+	//               close()'s Kill (later in close()) takes effect. That
+	//               blocking is fine — the reaper goroutine has no other
+	//               work — and once Kill lands, Wait returns and we set
+	//               exited.
+	go func() {
+		conn.readerWg.Wait()
+		_ = cmd.Wait()
+		conn.exited.Store(true)
+	}()
 
 	return conn, nil
 }
@@ -484,8 +516,15 @@ func (sc *ServerConnection) close() error {
 
 // Gateway manages connections to multiple MCP servers and provides
 // a unified tool registry for the LLM.
+//
+// Each configured server is backed by a ConnPool (one process per slot, sized
+// via MCPServerConfig.PoolSize). When PoolSize <= 1 the pool degenerates to
+// a single connection — same behavior as before this refactor, no config
+// migration required. Setting PoolSize > 1 unlocks parallel tools/call
+// distribution across forked subprocesses, useful for chatty servers like
+// filesystem-mcp under bursty ReAct loads.
 type Gateway struct {
-	servers       map[string]*ServerConnection
+	servers       map[string]*ConnPool
 	serverConfigs map[string]*config.MCPServerConfig // (F8) stored for reconnection
 	toolIndex     map[string]string                  // toolName -> serverName for O(1) lookup
 	httpClient    *http.Client
@@ -496,7 +535,7 @@ type Gateway struct {
 // NewGateway creates a new MCP gateway and connects to configured servers.
 func NewGateway(cfg *config.MCPConfig, httpClient *http.Client, logger *zap.Logger) (*Gateway, error) {
 	gw := &Gateway{
-		servers:       make(map[string]*ServerConnection),
+		servers:       make(map[string]*ConnPool),
 		serverConfigs: make(map[string]*config.MCPServerConfig),
 		toolIndex:     make(map[string]string),
 		httpClient:    httpClient,
@@ -513,37 +552,43 @@ func NewGateway(cfg *config.MCPConfig, httpClient *http.Client, logger *zap.Logg
 			continue
 		}
 
-		conn, err := newServerConnection(serverCfg, logger)
-		if err != nil {
-			gw.logger.Error("failed to connect to MCP server",
+		pool := NewConnPool(serverCfg, gw.logger)
+		if err := pool.Start(context.Background(), gw.initializeServer); err != nil {
+			gw.logger.Error("failed to start MCP server pool",
 				zap.String("server", serverCfg.Name),
 				zap.Error(err),
 			)
 			continue
 		}
 
-		// Initialize and discover tools
-		if err := gw.initializeServer(context.Background(), conn); err != nil {
-			gw.logger.Error("failed to initialize MCP server",
-				zap.String("server", serverCfg.Name),
-				zap.Error(err),
-			)
-			conn.close()
-			continue
-		}
-
-		gw.servers[serverCfg.Name] = conn
+		gw.servers[serverCfg.Name] = pool
 		gw.serverConfigs[serverCfg.Name] = serverCfg
-		for _, t := range conn.tools {
+		for _, t := range pool.Tools() {
 			gw.toolIndex[t.Name] = serverCfg.Name
 		}
-		gw.logger.Info("MCP server connected",
+		gw.logger.Info("MCP server pool started",
 			zap.String("server", serverCfg.Name),
-			zap.Int("tools", len(conn.tools)),
+			zap.Int("pool_size", pool.Size()),
+			zap.Int("alive", pool.Alive()),
+			zap.Int("tools", len(pool.Tools())),
 		)
 	}
 
 	return gw, nil
+}
+
+// newSingletonPool wraps an already-constructed ServerConnection in a 1-slot
+// ConnPool. Test-only convenience used by tests that hand-construct the
+// gateway with mock connections. The handshake step is bypassed (conn.tools
+// is taken as-is from the caller).
+func newSingletonPool(cfg *config.MCPServerConfig, conn *ServerConnection, logger *zap.Logger) *ConnPool {
+	if cfg == nil {
+		cfg = &config.MCPServerConfig{Name: "test", PoolSize: 1}
+	}
+	p := NewConnPool(cfg, logger)
+	p.conns[0].Store(conn)
+	p.tools = conn.tools
+	return p
 }
 
 // initializeServer performs the MCP initialization handshake and tool discovery.
@@ -588,8 +633,8 @@ func (gw *Gateway) GetAvailableTools() []models.ToolDefinition {
 	defer gw.mu.RUnlock()
 
 	var tools []models.ToolDefinition
-	for serverName, conn := range gw.servers {
-		for _, t := range conn.tools {
+	for serverName, pool := range gw.servers {
+		for _, t := range pool.Tools() {
 			tools = append(tools, models.ToolDefinition{
 				Name:        t.Name,
 				Description: t.Description,
@@ -601,52 +646,27 @@ func (gw *Gateway) GetAvailableTools() []models.ToolDefinition {
 	return tools
 }
 
-// CallTool invokes a tool on the appropriate MCP server.
+// CallTool invokes a tool on the appropriate MCP server. Internally delegates
+// to ConnPool.CallTool which picks the least-loaded subprocess via
+// least-pending + atomic CAS — see pool.go for the load balancing strategy.
 func (gw *Gateway) CallTool(ctx context.Context, serverName, toolName string, args json.RawMessage) (*models.ToolResult, error) {
 	gw.mu.RLock()
-	conn, ok := gw.servers[serverName]
+	pool, ok := gw.servers[serverName]
 	gw.mu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("MCP server not found: %s", serverName)
 	}
 
-	var argsMap interface{}
+	// Pre-validate JSON args here so the caller gets a structured error before
+	// the pool dispatch (matches the historical Gateway.CallTool contract).
 	if len(args) > 0 {
-		if err := json.Unmarshal(args, &argsMap); err != nil {
+		var probe interface{}
+		if err := json.Unmarshal(args, &probe); err != nil {
 			return nil, fmt.Errorf("failed to parse tool arguments: %w", err)
 		}
 	}
-
-	resp, err := conn.sendRequest(ctx, "tools/call", map[string]interface{}{
-		"name":      toolName,
-		"arguments": argsMap,
-	})
-	if err != nil {
-		return &models.ToolResult{
-			Content: fmt.Sprintf("Tool call failed: %v", err),
-			IsError: true,
-		}, nil
-	}
-
-	var toolResult MCPToolResult
-	if err := json.Unmarshal(resp.Result, &toolResult); err != nil {
-		return nil, fmt.Errorf("failed to parse tool result: %w", err)
-	}
-
-	// [OPT-22] Concatenate text content using strings.Builder to avoid O(n²) alloc.
-	var sb strings.Builder
-	for _, c := range toolResult.Content {
-		if c.Type == "text" {
-			sb.WriteString(c.Text)
-		}
-	}
-	content := sb.String()
-
-	return &models.ToolResult{
-		Content: content,
-		IsError: toolResult.IsError,
-	}, nil
+	return pool.CallTool(ctx, toolName, args)
 }
 
 // FindServerForTool locates which MCP server provides the given tool.
@@ -687,34 +707,31 @@ func (gw *Gateway) AddServer(cfg *config.MCPServerConfig) (*ServerStatus, error)
 		return nil, fmt.Errorf("MCP server '%s' already exists", cfg.Name)
 	}
 
-	conn, err := newServerConnection(cfg, gw.logger)
-	if err != nil {
+	pool := NewConnPool(cfg, gw.logger)
+	if err := pool.Start(context.Background(), gw.initializeServer); err != nil {
 		return nil, fmt.Errorf("failed to start MCP server %s: %w", cfg.Name, err)
 	}
 
-	if err := gw.initializeServer(context.Background(), conn); err != nil {
-		conn.close()
-		return nil, fmt.Errorf("failed to initialize MCP server %s: %w", cfg.Name, err)
-	}
-
-	gw.servers[cfg.Name] = conn
+	gw.servers[cfg.Name] = pool
 	gw.serverConfigs[cfg.Name] = cfg
-	for _, t := range conn.tools {
+	for _, t := range pool.Tools() {
 		gw.toolIndex[t.Name] = cfg.Name
 	}
 
-	toolNames := make([]string, len(conn.tools))
-	for i, t := range conn.tools {
+	toolNames := make([]string, len(pool.Tools()))
+	for i, t := range pool.Tools() {
 		toolNames[i] = t.Name
 	}
 
-	gw.logger.Info("MCP server added at runtime",
-		zap.String("server", cfg.Name), zap.Int("tools", len(conn.tools)))
+	gw.logger.Info("MCP server pool added at runtime",
+		zap.String("server", cfg.Name),
+		zap.Int("pool_size", pool.Size()),
+		zap.Int("tools", len(pool.Tools())))
 
 	return &ServerStatus{
 		Name:       cfg.Name,
 		Status:     "connected",
-		ToolsCount: len(conn.tools),
+		ToolsCount: len(pool.Tools()),
 		Tools:      toolNames,
 	}, nil
 }
@@ -724,24 +741,24 @@ func (gw *Gateway) RemoveServer(name string) error {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 
-	conn, ok := gw.servers[name]
+	pool, ok := gw.servers[name]
 	if !ok {
 		return fmt.Errorf("MCP server '%s' not found", name)
 	}
 
-	if err := conn.close(); err != nil {
-		gw.logger.Warn("error closing MCP server", zap.String("server", name), zap.Error(err))
+	if err := pool.Close(); err != nil {
+		gw.logger.Warn("error closing MCP server pool", zap.String("server", name), zap.Error(err))
 	}
 
 	// Remove tool index entries for this server
-	for _, t := range conn.tools {
+	for _, t := range pool.Tools() {
 		delete(gw.toolIndex, t.Name)
 	}
 
 	delete(gw.servers, name)
 	delete(gw.serverConfigs, name)
 
-	gw.logger.Info("MCP server removed", zap.String("server", name))
+	gw.logger.Info("MCP server pool removed", zap.String("server", name))
 	return nil
 }
 
@@ -751,15 +768,16 @@ func (gw *Gateway) ListServers() []ServerStatus {
 	defer gw.mu.RUnlock()
 
 	var result []ServerStatus
-	for name, conn := range gw.servers {
-		toolNames := make([]string, len(conn.tools))
-		for i, t := range conn.tools {
+	for name, pool := range gw.servers {
+		tools := pool.Tools()
+		toolNames := make([]string, len(tools))
+		for i, t := range tools {
 			toolNames[i] = t.Name
 		}
 		result = append(result, ServerStatus{
 			Name:       name,
 			Status:     "connected",
-			ToolsCount: len(conn.tools),
+			ToolsCount: len(tools),
 			Tools:      toolNames,
 		})
 	}
@@ -771,11 +789,11 @@ func (gw *Gateway) Close() error {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 
-	for name, conn := range gw.servers {
-		if err := conn.close(); err != nil {
-			gw.logger.Warn("failed to close MCP server", zap.String("server", name), zap.Error(err))
+	for name, pool := range gw.servers {
+		if err := pool.Close(); err != nil {
+			gw.logger.Warn("failed to close MCP server pool", zap.String("server", name), zap.Error(err))
 		}
 	}
-	gw.servers = make(map[string]*ServerConnection)
+	gw.servers = make(map[string]*ConnPool)
 	return nil
 }

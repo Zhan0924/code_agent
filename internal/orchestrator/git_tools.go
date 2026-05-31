@@ -33,7 +33,8 @@ func gitToolDefinitions() []models.ToolDefinition {
 				},
 				"required": []
 			}`),
-			Source: "builtin",
+			Source:           "builtin",
+			IsIdempotentRead: true,
 		},
 		{
 			Name:        "git_diff",
@@ -47,7 +48,8 @@ func gitToolDefinitions() []models.ToolDefinition {
 				},
 				"required": []
 			}`),
-			Source: "builtin",
+			Source:           "builtin",
+			IsIdempotentRead: true,
 		},
 		{
 			Name:        "git_commit",
@@ -61,8 +63,9 @@ func gitToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["message"]
 			}`),
-			Source:    "builtin",
-			RiskLevel: 2, // High risk: mutates git history
+			Source:           "builtin",
+			RiskLevel:        2, // High risk: mutates git history
+			InvalidatesCache: true,
 		},
 		{
 			Name:        "git_log",
@@ -75,7 +78,8 @@ func gitToolDefinitions() []models.ToolDefinition {
 				},
 				"required": []
 			}`),
-			Source: "builtin",
+			Source:           "builtin",
+			IsIdempotentRead: true,
 		},
 		{
 			Name:        "git_branch",
@@ -89,7 +93,8 @@ func gitToolDefinitions() []models.ToolDefinition {
 				},
 				"required": ["name"]
 			}`),
-			Source: "builtin",
+			Source:           "builtin",
+			InvalidatesCache: true,
 		},
 	}
 }
