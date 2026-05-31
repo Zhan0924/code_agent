@@ -2,20 +2,31 @@
 
 已知的文档不足和需要未来调查的领域。
 
-## 死代码 — 已实现未接线
+> **2026-06-01 边界澄清**：本文同时记录**跨包缺口**与**死代码 / 接线缺失**两类条目。`docs/architecture/NN_*.md` 各篇的"已知缺陷一览"自 2026-06-01 起按包独立维护并带 file:line。**两份清单暂时并存**，当包级缺陷一览覆盖某项后，应回头清理这里对应条目，避免双源不同步。下方表格的"包级文档"列指明最新权威来源。
 
-这些组件已完整编译但运行时从不调用，需要决定是启用还是删除：
+## 死代码 — 已实现未接线（与包级文档双源）
 
-| 组件 | 位置 | 状态 |
-|------|------|------|
-| `llm.Router` | `internal/llm/router.go` | Heavy/Medium/Light 模型路由，无 main.go 或 Orchestrator 引用 |
-| `SpeculativeToolCache` | `internal/orchestrator/speculative_cache.go` | Orchestrator 无此字段，无调用点 |
-| Git 工具 | `internal/orchestrator/git_tools.go` | `gitToolDefinitions()` 未纳入 `getAvailableTools()`，LLM 无法调用 |
-| `LLMSummarizer` | `internal/session/summarizer.go` | Summarizer 接口定义，`Manager.buildSummary()` 使用内联截断 |
-| `ConnPool` ↔ `Gateway` | `internal/mcp/pool.go` | ConnPool 实现完整但 Gateway 仍使用单连接/服务器 |
-| MCP SSE 传输 | `internal/mcp/client.go` | `doc.go` 提及 SSE 支持，`NewGateway` 跳过非 stdio 服务器 |
-| Redis `RedisRateLimiter` | `internal/auth/redis_ratelimit.go` | 完整实现但中间件使用进程内 token bucket |
-| `chatApi.stream()` | `code_agent_ui/src/api/client.ts` | 前端定义了 `/chat/stream` 调用但 ChatPage 直接 fetch `/chat/react-stream` |
+> **2026-06-01 复核**：以 `cmd/agent/main.go` / `internal/api/router.go` / `internal/orchestrator/*` 为准。6 项历史死代码条目已接线，仅余 3 项未接 + 2 项孤儿。
+
+**仍未接线 / 孤儿**：
+
+| 组件 | 位置 | 状态 | 包级文档 |
+|------|------|------|----------|
+| MCP SSE 传输 | `internal/mcp/client.go` | `doc.go` 提及 SSE 支持，`NewGateway` 仍仅处理 stdio 传输 | `docs/architecture/06_mcp.md` |
+| `chatApi.stream()` | `code_agent_ui/src/api/client.ts:66-68` | 前端定义 `/chat/stream` 调用但 ChatPage:102 直接 fetch `/chat/react-stream` | （前端，无包级文档） |
+| `internal/audit` / `internal/errors` | 整包孤儿 | 零生产 importer（构建可过但无调用点） | `docs/architecture/19_observability.md` |
+| `internal/pool` | 单一 importer | 仅 `session/manager.go` 使用 | `docs/architecture/19_observability.md` |
+
+**已接线（保留供历史回溯，下次审计删除）**：
+
+| 组件 | 接线点 |
+|---|---|
+| `llm.Router` | `cmd/agent/main.go:433` `orch.SetRouter(llmRouter)` |
+| `SpeculativeToolCache` | `internal/orchestrator/orchestrator.go:89,231` 已是 `Orchestrator` 字段 |
+| Git 工具 | `internal/orchestrator/builtin_tools.go:100` `gitDefs := gitToolDefinitions()` |
+| `LLMSummarizer` | `cmd/agent/main.go:194` `sessionMgr.Summarizer = session.NewLLMSummarizer(...)` |
+| `ConnPool` ↔ `Gateway` | `internal/mcp/...`（按 working-agreement.md:80 描述已切换为 `map[string]*ConnPool`） |
+| `RedisRateLimiter` | `internal/api/router.go:190` `auth.NewRedisRateLimiter(...)` |
 
 ## 功能缺口 — 前端
 
@@ -56,18 +67,28 @@ Session 层使用低精度版本，可能导致上下文窗口管理偏差。
 
 ## 未调查领域
 
-- `configs/config.allinone.yaml` 具体内容
-- `deploy/entrypoint.sh`（allinone 进程管理脚本）
-- `Dockerfile.p0test` / `Dockerfile.test` 细节
-- Warm Pool 与 Manager.Execute 的集成点
-- Store 从 Orchestrator 的实际调用路径
-- `_principles.go` 设计文档中描述的理想架构 vs 当前实现的差异全貌
-- Repomap 正则提取的精度限制（多行 receiver、Python decorator 等）
-- Distiller 策略持久化（`pg_store.go` 已存在但 main.go 未接线确认）
-- MultiAgent Supervisor 在 Orchestrator 中的集成路径（`main.go` 接线状态未确认）
-- Metacognition 对 ReAct 循环决策的实际影响范围
+> 2026-06-01 更新：以下领域大多已在 `docs/architecture/` 重写过程中被覆盖；保留仅供回溯。
+
+- ~~`configs/config.allinone.yaml` 具体内容~~ → 见 `docs/architecture/20_deploy.md` §5.2
+- ~~`deploy/entrypoint.sh`（allinone 进程管理脚本）~~ → 见 `docs/architecture/20_deploy.md` §5.3
+- ~~`Dockerfile.p0test` / `Dockerfile.test` 细节~~ → 见 `docs/architecture/20_deploy.md` §5.6
+- ~~Distiller 策略持久化~~ → 见 `docs/architecture/23_toollearn.md`（main.go pgStore 已接线 `Migrate` + `orch.SetToolLearnStore`）
+- ~~MultiAgent Supervisor 集成路径~~ → 见 `docs/architecture/22_multiagent.md`
+- ~~Metacognition 对 ReAct 影响范围~~ → 见 `docs/architecture/21_agentloop.md`
+
+**仍待调查**：
+- Warm Pool 与 Manager.Execute 的实际命中率与冷启动延迟（缺生产 metrics 样本）
+- Repomap 正则提取的精度限制（多行 receiver、Python decorator、TS 装饰器）
+- `_principles.go` 理想架构 vs 当前实现的剩余差异（已部分对账，但完整差异表未生成）
 
 ## 文档结构待办
 
 - `llmdoc/guides/` — 当前为空，未来按需创建工作流指南（如：如何添加新工具、如何接线死代码、如何添加新 MCP 服务器）
 - `llmdoc/reference/` — 当前为空，未来按需创建稳定参考（如：配置字段全表、API 端点全表、工具定义 schema）
+
+## 与 `docs/architecture/` 的协同
+
+`docs/architecture/NN_*.md` 中 00–28（29 篇）含"已知缺陷一览"，按文档分别维护 P0/P1/P2 条目，带 file:line。修改单个包前应**优先看包级缺陷一览**；本文件用于：
+1. **跨包缺口**（如 macOS CI matrix、双估算器 token 不一致）—— 不归任何单包
+2. **前端缺口** —— `docs/architecture/` 仅覆盖后端
+3. **过渡期双源**：上方"死代码"表中条目同时存在于本文件与包级文档；两者一致前以**代码 + 包级文档**为准

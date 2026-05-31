@@ -59,8 +59,10 @@ npm run build       # tsc -b && vite build
 
 ## 配置
 
-- 主配置文件：`configs/config.yaml`（Viper 加载）
+- 主配置文件：`configs/config.yaml`（Viper 加载，**已被 `.gitignore` + `.dockerignore` 排除**）
+- 配置模板：`configs/config.example.yaml`（仓库内的唯一可见配置，仅含占位符）
 - 环境变量覆盖前缀：`CODE_AGENT_`，分隔符 `_`
 - 优先级（高到低）：环境变量 > YAML 文件 > Viper 默认值 > Go 零值
 - `${VAR}` 模式在 16+ 个字符串字段上展开（含 MCP 服务器配置）
 - 验证：`config.Validate()` 在启动时执行，失败 fatal
+- 详见 `docs/architecture/01_config.md`
