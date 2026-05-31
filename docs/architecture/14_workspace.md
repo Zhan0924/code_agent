@@ -1,521 +1,540 @@
 # 14 · Workspace 管理 `internal/workspace`
 
-> 代码：
-> - `internal/workspace/manager.go` (343) — `Manager + Workspace`：目录隔离、路径穿越防护、持久化 manifest、tar.gz 归档
-> - `internal/api/workspace_handlers.go` (354) — REST 端点：list / tree / read / write / delete / mkdir / download
+> 代码（**以代码为准**）：
+>
+> - `manager.go` (369 行) — Workspace 生命周期 + 路径沙箱 + 持久化 manifest + 重启恢复
+> - `manager_test.go` (274 行) — 单元测试，覆盖 idempotent create / safePath 攻击向量 / 重启恢复
+>
+> 上层调用：
+>
+> - `cmd/agent/main.go:613` — `workspace.NewManager("/tmp/agent-workspaces", logger)` 唯一构造点
+> - `internal/orchestrator/file_tools.go:935` — `ResolveSessionWorkspace` 把 sessionID 映射到 Workspace（**租户隔离修复在这里，不在 workspace 包里**）
+> - `internal/orchestrator/edit_engine.go` — 原子多文件编辑（`.bak` 备份 + lint + rollback）通过 workspaceMgr 操作文件
+> - `internal/pty/local.go` — PTY 会话默认在 `/tmp/agent-workspaces` 下分配工作目录
+> - `internal/api/workspace_handler.go` — 文件浏览器/编辑器 REST 接口
 
 ---
 
 ## 1. 模块定位
 
-**"给每个 session 划一个沙盒目录，让 Agent 在里面随便 rm -rf 都不会伤到宿主机。"**
+**"会话的私有盘：每个 session 一个隔离目录，外加防穿越的安全文件 I/O。"**
 
-Agent 会做的事情：
+Code agent 的所有"生成项目 / 修改文件 / 跑测试"动作必须落到磁盘上某个目录。
+不能写全局共享盘——会话间相互污染、并发任务覆盖、租户跨越是真实威胁。
 
-- `write_to_file: cmd/main.go` — 创建新文件；
-- `execute_command: go build` — 在项目根目录编译；
-- `git init / git commit` — 启动版本控制；
-- `replace_in_file: config.yaml` — 原地修改。
+本包做 4 件事：
 
-**这些操作必须落在某个确定的目录**。本包负责：
+1. **目录隔离**：每个 sessionID → 单独 dir，根目录在 `/tmp/agent-workspaces/<id>`；
+2. **路径沙箱**：`safePath` 三层过滤（Clean + Abs reject + EvalSymlinks + HasPrefix），防止 `../../etc/passwd` 和 symlink 穿越；
+3. **manifest 持久化**：每个 workspace 写一个 `.workspace.json`，进程重启从磁盘扫描恢复内存索引；
+4. **tar.gz 流式归档**：把 workspace 打包给用户下载，project name 作为 tar 顶层目录。
 
-1. **目录隔离**：每个 workspace 一个独立子目录，session 之间互不干扰；
-2. **路径穿越防护**：所有 `WriteFile("../../etc/passwd")` 这类请求必须被拒绝；
-3. **持久化 manifest**：进程重启后能恢复之前的 workspace 列表；
-4. **可下载归档**：用户做完项目能一键 `tar.gz` 拉走；
-5. **REST 管理 API**：前端 WorkspacePage 的文件树、编辑器、下载按钮都走这里。
+**不做的事**（重要）：
 
-注意：**本包不管容器沙箱** —— 沙箱执行是 `05_sandbox`；workspace 只是**宿主机侧的工作目录**，真正跑命令时会把这个目录挂载进沙箱容器（`sandbox.volume.go` 负责）。
+- ❌ **不做租户隔离决策**：workspace 包只提供"按 ID 索引到一个目录"的能力，**判断 sessionID 是否合法、能否回退到 default workspace 的逻辑在 `orchestrator/file_tools.go`**。这是历史教训：早期实现失败时回退到 `ListWorkspaces()[0]`，会跨租户泄露文件
+- ❌ **不做容量限制 / 配额**：单个 workspace 写到磁盘满为止——靠上层（tools 限制单次 write 大小）和宿主机监控兜底
+- ❌ **不做并发文件锁**：同一 workspace 两次并发 WriteFile 同一个文件靠 OS write 原子性兜底，没有 advisory lock
 
 ---
 
-## 1.5 核心设计问题
+## 1.5 设计哲学：4 个被代码证实的抉择
 
-### 为什么 workspace 是一级概念而不是 session 的附属？
+### Q1 — 为什么是 `/tmp/agent-workspaces` 而不是 PV？
 
-Chat session 短时（几分钟到几小时）；但用户可能：
-- 同一 workspace 跨多个 session（新开 tab 继续）
-- 一个 session 不要 workspace（纯对话）
-- 多个 session 共享 workspace（协作审阅）
+`main.go:613` 硬编码 `/tmp/agent-workspaces` 作为 baseDir。
 
-解耦 session / workspace 让上述场景都成立。workspace 的生命周期独立于
-session，由显式的 Create/Cleanup 管理。
+| 选项 | 速度 | 持久性 | 容量 | 跨 pod | 成本 |
+|---|---|---|---|---|---|
+| `/tmp` (tmpfs in K8s) | 极快 | 重启丢 | RAM 受限 | 不可 | 0 |
+| 容器内 OverlayFS | 快 | 容器死丢 | host disk | 不可 | 0 |
+| PVC | 中 | 强 | 可大 | 可共享 | 中 |
+| S3 / 对象存储 | 慢 | 强 | 无限 | 可 | 高 |
 
-### 路径穿越防御为什么放在 workspace 层？
+**选择 `/tmp` 的理由**：
+- 代理工作流大多是**短生命周期**（一次对话内完成生成 + 跑测试 + 打包），用户取走 tar.gz 后无需保留
+- Agent 容器重启时丢失 workspace = 丢失会话的 in-flight 状态——但 session.Manager 在 Redis 持久化的是**对话历史**而不是工作目录，可接受
+- `manifest 恢复` 机制只能在**同一容器内重启**时生效（目录还在磁盘上），换 pod 后 `/tmp` 是新的，会丢
 
-每个 I/O 调用都可能被攻击者传 `../../../etc/passwd` 逃出 workspace。
-如果每个 handler / tool 都自己写路径校验，**第 N 个一定漏**。
+⚠️ **生产部署如果要跨 pod 保留 workspace，必须把 `/tmp/agent-workspaces` 挂成 PVC**——
+代码本身不区分 tmpfs 和 PVC，因为它只看路径不看挂载类型。
 
-**解决**：`safePath(wsRoot, rel) → abs` 作为所有 I/O 的**唯一入口**。
-实现逻辑：
-1. `filepath.Join(wsRoot, rel)`
-2. `filepath.Clean` 规范化
-3. 检查 result 以 `wsRoot + os.Separator` 开头
+### Q2 — 为什么 RootDir 存的是 EvalSymlinks 之后的真实路径？
 
-**TOCTOU 注意**：symlink 穿越需要 `EvalSymlinks` 校验——目前代码用字符串
-前缀检查，对符号链接逃逸**不完全防护**（见 P1 待办）。
+`CreateForSession` L67-70：
+```go
+realDir, err := filepath.EvalSymlinks(dir)
+if err != nil {
+    return nil, fmt.Errorf("resolve workspace dir: %w", err)
+}
+ws := &Workspace{RootDir: realDir, ...}
+```
 
-### 为什么 Tmpfs vs Bind Mount 的选择权给用户
+为什么不直接存 `filepath.Join(baseDir, id)` 这个理论路径？
 
-- **Tmpfs**（默认）：速度快、完全隔离、容器停止即灰飞烟灭 → 适合"一次性"任务
-- **Bind mount**：持久化到宿主机、可跨容器复用 → 适合"要缓存 node_modules"
+因为 `safePath` 的安全检查（L299）用 `strings.HasPrefix(realPath, ws.RootDir+sep)` 判断越界：
+- 如果 `ws.RootDir` 是含 symlink 的逻辑路径（如 `/tmp/agent-workspaces/ws-1`）
+- 而 `realPath` 是 EvalSymlinks 解析过的真实路径（如 `/private/tmp/agent-workspaces/ws-1/file.go`，macOS 下 `/tmp → /private/tmp`）
+- HasPrefix 就**永远不匹配**，所有正常文件都被判为越界 → 拒绝写入
 
-bind mount 本身是沙箱逃逸面（挂错一个目录等于 root 权限泄露），所以
-`volume.go` 强制：
-- 默认只读
-- 黑名单（docker.sock / /etc / /proc / /sys）
-- 写权限必须显式要求
+**所以必须双边都用 real path 比较**——`RootDir` 存 EvalSymlinks 结果，`safePath` 也用 EvalSymlinks，HasPrefix 才有意义。
+
+这个细节在 `restore`（L137-139）里被显式处理：
+```go
+ws.RootDir = filepath.Join(m.baseDir, e.Name())   // manifest 里存的可能是旧路径
+if realDir, err := filepath.EvalSymlinks(ws.RootDir); err == nil {
+    ws.RootDir = realDir                          // 恢复时再做一次 EvalSymlinks
+}
+```
+代码注释明确标 "P0-1 fix" —— 历史上 manifest 反序列化后没做这一步，导致重启后 safePath 全部拒写。
+
+### Q3 — `sync.Map` 而非 `map + RWMutex`？
+
+`Manager.workspaces` 是 `sync.Map`（L33）。
+
+`sync.Map` 在 **"读多写少 + key 集合稳定"** 场景显著快于 `RWMutex + map`。
+Workspace 的读写模式正好命中：
+- 创建只在 session 第一次写文件时发生（低频）
+- 每次 `WriteFile/ReadFile` 都要 `Get(ws.ID)` 拿到 \*Workspace（高频）
+- key 集合（session ID）一旦创建就稳定，几乎不修改
+
+**代价**：`GetBySession`（L85）需要 `Range` 全表扫，O(n) 复杂度。
+在 n < 几百时无感，但**如果业务变成"按 sessionID 查询"是主路径**，应该额外维护 `sessionID → *Workspace` 的二级索引。
+当前注释：业务上 `ws.ID == sessionID`（见 `ResolveSessionWorkspace` 调用 `Get(sessionID)` 而不是 `GetBySession`），所以 `GetBySession` 其实是历史遗留，**绝大多数路径不会走这里**。
+
+### Q4 — `safePath` 为什么有 "parent dir EvalSymlinks fallback"？
+
+L286-296：
+```go
+realPath, err := filepath.EvalSymlinks(absPath)
+if err != nil {
+    // EvalSymlinks fails if file doesn't exist (e.g., WriteFile creating new file)
+    parentDir := filepath.Dir(absPath)
+    realParent, err2 := filepath.EvalSymlinks(parentDir)
+    if err2 != nil {
+        return "", fmt.Errorf("parent directory invalid: %w", err2)
+    }
+    realPath = filepath.Join(realParent, filepath.Base(absPath))
+}
+```
+
+为什么要这一段？因为 `WriteFile` 在新建文件时调用 `safePath`，但**新文件还不存在，EvalSymlinks 必然失败**（"no such file or directory"）。
+直接 return error 会让所有 WriteFile 新建文件全部失败。
+
+解法：解析**父目录**的真实路径，再拼上 base name。
+攻击面分析：
+- 攻击者写 `path = "evil.go"`，父目录 = workspace root，EvalSymlinks(root) = 真实 root → 安全
+- 攻击者写 `path = "../etc/passwd"`，父目录已被 Clean + Join 规范化到 `/private/tmp/agent-workspaces/ws-1/etc`，EvalSymlinks 失败因为这个父目录不存在，**会被外层 HasPrefix 检查兜底**
+- 攻击者写 `path = "evil/../../passwd"`，Clean 之后是 `passwd`，安全
+- 唯一不能防住的攻击：父目录是合法的 symlink，但只要 EvalSymlinks(parent) + HasPrefix 双重检查，依然会被拒（symlink target 不在 root 下）
+
+**完整测试见 `manager_test.go` 的 `TestSafePath_*` 系列用例**——覆盖了上述所有 case。
 
 ---
 
 ## 2. 依赖架构
 
 ```
-┌────────────────────────────────────────────────────────┐
-│  前端 WorkspacePage.tsx                                 │
-│  (Monaco 编辑器 + 文件树 + 下载按钮)                      │
-└───────────────┬────────────────────────────────────────┘
-                │ HTTP
-                ▼
-┌────────────────────────────────────────────────────────┐
-│  /api/v1/workspaces/* (workspace_handlers.go)          │
-│    list/tree/read/write/delete/mkdir/download          │
-└───────────────┬────────────────────────────────────────┘
-                │
-                ▼
-┌────────────────────────────────────────────────────────┐
-│            workspace.Manager                           │
-│  CRUD + safePath + Archive + restore                   │
-└────────────┬───────────────────────────────────────────┘
-             │
-   ┌─────────┼────────┬──────────────┐
-   ▼         ▼        ▼              ▼
-┌────────┐ ┌─────┐ ┌────────┐   ┌──────────┐
-│ os.*   │ │tar  │ │sync.Map│   │ manifest │
-│ WriteF │ │ .gz │ │索引 id │   │  .json   │
-└────────┘ └─────┘ └────────┘   └──────────┘
-
-   ┌────────── 上游消费者 ──────────┐
-   │                              │
-   ▼                              ▼
-orchestrator                  sandbox.Manager
-  file_tools.go                (volume mount)
-  auto_test_runner.go
-  edit_engine.go
-  git_tools.go
+┌─ orchestrator.ProcessMessage ─────────────────────┐
+│  o.ResolveSessionWorkspace(sessionID)              │  ← 租户隔离决策点
+│  o.workspaceMgr.WriteFile(ws, path, content)       │
+│  o.workspaceMgr.ReadFile(ws, path)                 │
+│  o.workspaceMgr.Archive(ws, w)                     │
+└──────────────────┬────────────────────────────────┘
+                   │
+                   ▼
+        ┌──────────────────────────┐
+        │ workspace.Manager         │
+        │   - baseDir: /tmp/...     │
+        │   - workspaces: sync.Map  │
+        └──────────┬───────────────┘
+                   │
+        ┌──────────┴────────┬─────────────┐
+        ▼                   ▼             ▼
+   ┌─────────┐       ┌─────────────┐  ┌──────────┐
+   │ os.* I/O│       │ filepath.   │  │ archive/ │
+   │         │       │ EvalSymlinks│  │   tar+gz │
+   └─────────┘       └─────────────┘  └──────────┘
 ```
+
+**注入点**（`cmd/agent/main.go:613`）：
+```go
+wsMgr, err := workspace.NewManager("/tmp/agent-workspaces", logger)
+if err != nil {
+    logger.Warn("workspace manager init failed, file tools and generator disabled", zap.Error(err))
+} else {
+    orch.SetWorkspaceManager(wsMgr)
+    apiServer.SetWorkspaceManager(wsMgr)
+    // generator 也吃 wsMgr
+}
+```
+
+**workspace 是可选依赖**：init 失败时 `wsMgr == nil`，但 main.go 不 fatal——
+file_tools / generator / PTY 检测到 nil 时返回 "workspace not available" 错误，不影响其他能力（chat / RAG / MCP）。
 
 ---
 
 ## 2.5 数据流总览
 
 ```text
-┌───────────────────────────────────────────────────────────────┐
-│ orchestrator / API handler                                    │
-│   CreateForSession(sessionID) 或 resolveWorkspace(reqID)      │
-└─────────────────────────────┬─────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────────┐
-│ workspace.Manager.CreateForSession(sessionID)                 │
-│   sync.Map 查重 → 已存在则幂等返回                             │
-│   os.MkdirAll(/tmp/agent-workspaces/<id>/)                   │
-│   saveManifest(.manifest.json)                                │
-└─────────────────────────────┬─────────────────────────────────┘
-                              │ (*Workspace)
-                              ▼
-┌───────────────────────────────────────────────────────────────┐
-│               所有 I/O 操作入口                                │
-│  WriteFile / ReadFile / DeleteFile / MkdirAll / ListFiles     │
-└─────────────────────────────┬─────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────────┐
-│              ★ safePath(base, rel) ★                          │
-│  ① filepath.Clean(rel)                                        │
-│  ② filepath.IsAbs → reject                                   │
-│  ③ HasPrefix(joined, base + separator) → reject if false     │
-│  任何路径穿越尝试在此被拦截                                    │
-└─────────────────────────────┬─────────────────────────────────┘
-                              │ (安全绝对路径)
-                              ▼
-         ┌────────────────────┼────────────────────┐
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────────┐
-│  os 文件操作  │    │ 【sandbox】  │    │  Archive()       │
-│  Read/Write  │    │ volume mount │    │  tar.gz 打包     │
-│  Delete/List │    │ → /workspace │    │  → HTTP 响应流   │
-└──────────────┘    └──────────────┘    └──────────────────┘
+═══════════ 创建路径: ResolveSessionWorkspace ════════════════════════════
 
-服务重启恢复流程:
-┌────────────┐     ┌──────────────────┐     ┌──────────────┐
-│  启动扫描   │──▶  │ 读 .manifest.json│──▶  │ 注册到       │
-│  baseDir/* │     │ 恢复 Workspace   │     │ sync.Map     │
-└────────────┘     └──────────────────┘     └──────────────┘
+orchestrator.ResolveSessionWorkspace(sessionID)        [file_tools.go:943]
+       │
+       │ if sessionID == "" → log warn + return nil       (拒绝跨租户)
+       │ if ws := workspaceMgr.Get(sessionID); ws != nil → return
+       │
+       ▼
+workspaceMgr.Create(sessionID, label)                  [manager.go:53]
+       │
+       ▼
+workspaceMgr.CreateForSession(id, "", projectName)     [manager.go:58]
+       │
+       │ if existing := Get(id); existing != nil → return existing  (idempotent)
+       │ os.MkdirAll(baseDir/id, 0o755)
+       │ realDir := EvalSymlinks(dir)                   ← 关键：存真实路径
+       │ ws := &Workspace{ID, SessionID, RootDir: realDir, ...}
+       │ workspaces.Store(id, ws)                       ← sync.Map
+       │ saveManifest(ws) → write .workspace.json
+       │
+       ▼ return ws
+
+═══════════ 写入路径: WriteFile ═══════════════════════════════════════════
+
+orchestrator.handleFileWrite                           [file_tools.go:392]
+       │
+       ▼
+workspaceMgr.WriteFile(ws, relPath, content)           [manager.go:158]
+       │
+       ▼
+safePath(ws, relPath)                                  [manager.go:274]
+       │
+       │ 1. cleaned := filepath.Clean(relPath)
+       │ 2. if IsAbs(cleaned) → reject
+       │ 3. absPath := Join(ws.RootDir, cleaned)
+       │ 4. realPath := EvalSymlinks(absPath)
+       │       ├ if err (file doesn't exist):
+       │       │    parentDir := Dir(absPath)
+       │       │    realParent := EvalSymlinks(parentDir)
+       │       │    realPath := Join(realParent, Base(absPath))
+       │ 5. if !HasPrefix(realPath, ws.RootDir+sep) && realPath != ws.RootDir
+       │       → reject "path traversal detected"
+       │
+       │ return realPath ✅
+       │
+       ├ os.MkdirAll(Dir(absPath), 0o755)              ← 父目录预创建
+       └ os.WriteFile(absPath, []byte(content), 0o644)
+
+═══════════ 恢复路径: NewManager → restore ═════════════════════════════════
+
+NewManager(baseDir, logger)                            [manager.go:39]
+       │
+       │ os.MkdirAll(baseDir, 0o755)
+       │
+       ▼
+m.restore()                                            [manager.go:113]
+       │
+       │ for each entry in baseDir:
+       │   if !IsDir → skip
+       │   data := os.ReadFile(entry/.workspace.json)
+       │       └ if err → skip (not a managed workspace)
+       │   json.Unmarshal(data, &ws)
+       │   ws.RootDir = Join(baseDir, entry.Name())     ← 矫正路径
+       │   if realDir, _ := EvalSymlinks(ws.RootDir); ok:
+       │       ws.RootDir = realDir                     ← P0-1 fix: 真实路径
+       │   workspaces.Store(ws.ID, &ws)
+       │
+       └ logger.Info("workspaces restored from disk", count=N)
 ```
 
 ---
 
-## 3. 核心数据模型
+## 3. 数据模型
+
+### 3.1 `Workspace`（manager.go:22-28）
 
 ```go
-// manager.go:22
 type Workspace struct {
-    ID        string    // 唯一 ID，通常等于 session ID
-    SessionID string    // 绑定的 session ID（可空，支持"游离 workspace"）
-    RootDir   string    // 宿主机上的绝对路径，如 /var/lib/agent/ws/abc123
-    Project   string    // 人类可读的项目名，如 "my-fastapi-app"
-    CreatedAt time.Time
+    ID        string    `json:"id"`
+    SessionID string    `json:"session_id,omitempty"`  // 绑定 chat session
+    RootDir   string    `json:"root_dir"`              // EvalSymlinks 后的真实路径
+    Project   string    `json:"project_name"`          // tar.gz 顶层目录名
+    CreatedAt time.Time `json:"created_at"`
 }
+```
 
-// manager.go:31
+**ID 约定**：业务上 `ws.ID == sessionID`（见 `ResolveSessionWorkspace` 调 `workspaceMgr.Get(sessionID)`）。
+`SessionID` 字段历史遗留，与 `ID` 重复——`GetBySession` 用它做反查，但当前调用路径几乎不走这条。
+
+### 3.2 `Manager`（manager.go:31-35）
+
+```go
 type Manager struct {
-    baseDir    string          // 所有 workspace 的父目录
-    workspaces sync.Map        // id → *Workspace (并发安全)
+    baseDir    string
+    workspaces sync.Map // id → *Workspace
     logger     *zap.Logger
 }
 ```
 
-为什么用 `sync.Map` 而不是 `map + Mutex`？
+⚠️ **没有 mutex**——所有并发安全靠 `sync.Map` 提供。
+单字段读（`baseDir`）天然 race-free（只在构造时赋值）。
 
-- **读多写少**场景最优解（sync.Map 对"几乎只读"case 近乎 lock-free）；
-- workspace 的创建/删除是低频事件，读（Get/List）是高频事件；
-- 标准 `map+RWMutex` 在 500 QPS 下仍然会在 RLock 上有竞争开销。
+### 3.3 manifest 文件：`.workspace.json`
+
+**实际文件名**：`/tmp/agent-workspaces/<id>/.workspace.json`（manager.go:100、124）。
+
+⚠️ 旧文档曾写作 `.manifest.json`——**与代码不符**，本次重写已修正。
+
+manifest 内容就是 `json.Marshal(ws)`，即上面 `Workspace` 结构体的字段。
+重启时 `restore` 扫描 baseDir 下每个子目录，能读到 `.workspace.json` 的就恢复，否则跳过。
+
+**没有 manifest 的目录会变成孤儿**：手动 `mkdir /tmp/agent-workspaces/orphan-1` 之后，重启 agent 不会认领它，**也不会清理**。这是有意保守——避免误删用户数据。
 
 ---
 
-## 4. ★ 安全核心：`safePath` (L266)
+## 4. ★ `safePath` —— 三层路径沙箱（manager.go:274-304）
+
+### 4.1 完整算法
 
 ```go
-safePath(ws, relPath) (absPath string, err error):
-  cleaned := filepath.Clean(relPath)              // "a/../b" → "b"
-  if filepath.IsAbs(cleaned): return ERROR        // 拒绝 "/etc/passwd"
+func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
+    // L1: 规范化
+    cleaned := filepath.Clean(relPath)
+    if filepath.IsAbs(cleaned) {
+        return "", fmt.Errorf("absolute paths not allowed: %s", relPath)
+    }
 
-  absPath := filepath.Join(ws.RootDir, cleaned)
-  # 关键检查：拼接后的路径是否仍在 rootDir 下？
-  if !strings.HasPrefix(absPath, ws.RootDir + sep):
-      if absPath != ws.RootDir:
-          return ERROR ("path traversal detected")
-  return absPath, nil
+    // L2: 拼接 + 解析 symlink
+    absPath := filepath.Join(ws.RootDir, cleaned)
+    realPath, err := filepath.EvalSymlinks(absPath)
+    if err != nil {
+        // 文件不存在（如新建文件）的兜底：解析父目录
+        parentDir := filepath.Dir(absPath)
+        realParent, err2 := filepath.EvalSymlinks(parentDir)
+        if err2 != nil {
+            return "", fmt.Errorf("parent directory invalid: %w", err2)
+        }
+        realPath = filepath.Join(realParent, filepath.Base(absPath))
+    }
+
+    // L3: 边界检查
+    if !strings.HasPrefix(realPath, ws.RootDir+string(filepath.Separator)) && realPath != ws.RootDir {
+        return "", fmt.Errorf("path traversal detected (symlink resolved to %s)", realPath)
+    }
+
+    return realPath, nil
+}
 ```
 
-### 4.1 为什么这样做？
+### 4.2 攻击向量覆盖
 
-攻击样本：
-
-| 恶意输入 | `filepath.Clean` 后 | `filepath.Join(rootDir, ...)` 后 | 落哪 |
+| 攻击 | 输入 | 防御层 | 结果 |
 |---|---|---|---|
-| `../secret.txt` | `../secret.txt` | `/var/lib/agent/ws/secret.txt` | **跳出 ws** |
-| `/etc/passwd` | `/etc/passwd` | Go 在 Unix 下会拼成 `/etc/passwd` | **跳出 ws** |
-| `a/../../b` | `../b` | `/var/lib/agent/b` | **跳出 ws** |
-| `./safe.go` | `safe.go` | `/var/lib/agent/ws/abc/safe.go` | ✅ 正常 |
+| 绝对路径 | `/etc/passwd` | L1 IsAbs | reject |
+| 父级穿越 | `../../etc/passwd` | L1 Clean → `etc/passwd`, L3 HasPrefix | reject |
+| 隐式当前目录 | `./../../etc/passwd` | L1 Clean 归一 → `../../etc/passwd` → L3 | reject |
+| 绝对 symlink | 提前 `ln -s /etc/passwd ws/evil`，然后 `path=evil` | L2 EvalSymlinks(evil) = `/etc/passwd`, L3 HasPrefix 失败 | reject |
+| 相对 symlink | `ln -s ../../etc/passwd ws/evil` | 同上 | reject |
+| dir 是 symlink | `ln -s /etc ws/etc`, path=`etc/passwd` | L2 EvalSymlinks 解出真实 `/etc/passwd`, L3 失败 | reject |
+| 新文件 | path=`new.go`（不存在） | L2 fallback: 解析父目录 = ws root, 拼回 → 真实路径 | accept |
+| 嵌套新文件 | path=`a/b/new.go`（a 已存在，b 是新目录） | L2 fallback: parentDir=`ws/a/b`, EvalSymlinks 失败 | **reject** — 必须先 MkdirAll 父目录 |
 
-前三种都会被 `HasPrefix(absPath, rootDir+"/")` 拦下。**第二种靠 `IsAbs` 早期判断** 直接报错。
+**最后一项是已知限制**：WriteFile L164 显式 `os.MkdirAll(Dir(absPath), 0o755)` 在 safePath 之后预创建，但 `safePath` 自己拿到的 `absPath` 是 `Join(ws.RootDir, cleaned)`（**未 EvalSymlinks**），所以 `Dir(absPath)` 是 `ws.RootDir/a/b` 这种逻辑路径——MkdirAll 之后再 WriteFile 时父目录已存在，EvalSymlinks 成功。
+但 `safePath` 单独被调时（如 ListDir 一个不存在的子目录），可能在父目录链不完整时报错——见 ListDir L322-329 的 fallback 处理。
 
-### 4.2 为什么要 `+ string(filepath.Separator)`？
+### 4.3 与旧文档的差异（**重要纠正**）
 
-不加分隔符会被 `/var/lib/agent/ws/abcdef` 这类"rootDir + 任意后缀"骗过：
+⚠️ **旧 doc 在改进建议里列 "P1: `safePath` 缺少 symlink 防护"——这是错误**：
+- 代码 L285 明确调用 `filepath.EvalSymlinks(absPath)`
+- 代码 L290 在父目录 EvalSymlinks fallback 路径也做了 symlink 解析
+- 代码 L299 用 `HasPrefix(realPath, ws.RootDir+sep)` 边界检查（`ws.RootDir` 本身就是 EvalSymlinks 之后的真实路径，见 §1.5 Q2）
 
-```
-rootDir = "/var/lib/agent/ws/abc"
-absPath = "/var/lib/agent/ws/abcdef-attack"   # 不在 abc/ 下
-HasPrefix(absPath, rootDir) → true            # ★ Bug!
-```
-
-加了分隔符：
-
-```
-HasPrefix(absPath, rootDir + "/") → false     # ✅ 正确拦截
-```
-
-这是 Go 代码审计里**经典漏洞**，务必注意。
-
-### 4.3 所有 I/O 方法都先调 `safePath`
-
-`WriteFile / ReadFile / DeleteFile / MkdirAll` 的第一行都是：
-
-```go
-absPath, err := m.safePath(ws, relPath)
-if err != nil { return err }
-```
-
-**单点拦截 + 强制**，避免各处重复实现防护。
+**实际状态**：symlink 防护已完整实现。如果有遗留怀疑，跑 `manager_test.go` 看 `TestSafePath_SymlinkAttack` 系列即可验证。
 
 ---
 
-## 5. 生命周期：Create / Restore / Cleanup
+## 5. 持久化与恢复
 
-### 5.1 `CreateForSession` (L58)
+### 5.1 `saveManifest`（manager.go:99-109）
 
-```text
-CreateForSession(id, sessionID, projectName):
-  if exists := m.Get(id): return exists         # 幂等
-
-  rootDir := baseDir + "/" + id
-  os.MkdirAll(rootDir, 0755)
-
-  ws := &Workspace{ID: id, SessionID: sessionID, RootDir: rootDir, Project: projectName, CreatedAt: now}
-  m.workspaces.Store(id, ws)
-  m.saveManifest(ws)                            # 写 .manifest.json
-  return ws
+每次 `CreateForSession` 后立即写：
+```go
+manifestPath := filepath.Join(ws.RootDir, ".workspace.json")
+data, _ := json.Marshal(ws)
+os.WriteFile(manifestPath, data, 0o644)
 ```
 
-**幂等**是关键：同一 session 多次调 `CreateForSession` 要返回同一个 workspace，不能创建第二个（会导致历史文件"丢失"）。
+写失败不 propagate——只记 error 日志。
+**原因**：manifest 是"恢复友好"特性，不是关键路径。manifest 丢了下次重启时这个 workspace 不会被恢复，但文件还在磁盘上——下次 `Create(sameID, ...)` 会重新走一遍，可能创建出和之前不同的 workspace 对象（但 RootDir 仍指向同一目录），文件不丢。
 
-### 5.1.1 ★ 租户隔离：`ResolveSessionWorkspace` 的 fallback 陷阱（P0 #15 修复）
+### 5.2 `restore`（manager.go:113-146）
 
-> ⚠️ **修复前的 bug**：`orchestrator.ResolveSessionWorkspace(sessionID)`
-> 当 `Get(sessionID)` 没命中、`Create` 又失败时，fallback 到
-> `resolveWorkspace("")` → `ListWorkspaces()[0]`——**返回另一个租户的
-> workspace**！
->
-> ```
-> session-A 创建 workspace A（存在）
-> session-B 调 ResolveSessionWorkspace("session-B")
->   → Get 失败（没创建过）
->   → Create 失败（例如磁盘满、路径冲突）
->   → fallback ListWorkspaces()[0] → 返回 workspace A
-> session-B 开始读写 session-A 的文件！  ← 跨租户数据泄露
-> ```
+**何时触发**：`NewManager` 构造时一次性扫描。
 
-**修复**：`orchestrator/file_tools.go:749-782` 去掉 fallback。创建失败返回
-`nil` + log error，由上层 handler 翻成 500 并拒绝服务。绝**不**用一个不
-属于请求者的 workspace 继续工作。
+```go
+entries := os.ReadDir(baseDir)
+for each entry:
+    if !IsDir: skip
+    data := ReadFile(entry/.workspace.json)
+    if err: continue                              ← 静默忽略孤儿目录
+    json.Unmarshal(data, &ws)
+    ws.RootDir = Join(baseDir, entry.Name())       ← 矫正：手动覆盖 manifest 里的旧值
+    if realDir := EvalSymlinks(ws.RootDir); ok:
+        ws.RootDir = realDir                       ← 关键：必须再 EvalSymlinks
+    workspaces.Store(ws.ID, &ws)
+```
+
+**注意 L135-139 的两步**：
+1. 先用 `Join(baseDir, entry.Name())` 覆盖 manifest 里存的 `RootDir`——防止挂载点变了之后 manifest 里写的是 `/old/path/ws-1`，新部署在 `/new/path` 时直接拿来用会越界
+2. 再 EvalSymlinks 一次——保证内存 `RootDir` 是真实路径（与 CreateForSession 行为一致），否则 safePath 全部失败
+
+**P0-1 fix 注释**（L136）指的就是历史 bug：早期实现只做了第一步，没做第二步，导致 macOS 上重启后 safePath HasPrefix 全部不匹配，所有写入失败。
+
+### 5.3 manifest 字段演化
+
+manifest 是 JSON，向后兼容：
+- 加新字段：旧 manifest 反序列化时新字段为零值——OK
+- 改字段类型：会反序列化失败 → `restore` L131 记 warn 并 skip ——这个 workspace 丢失内存索引，但目录文件还在
+
+**没有 schema version 字段**——是隐患但不致命。如果未来要重大改 Workspace 结构，要么加 `Version int` 字段，要么用 manifest 文件名后缀（`.workspace.v2.json`）做版本路由。
+
+---
+
+## 6. 其他 CRUD
+
+| 方法 | 行号 | 行为 |
+|---|---|---|
+| `Create(id, projectName)` | L53 | 转发到 `CreateForSession(id, "", projectName)` |
+| `CreateForSession(id, sessionID, projectName)` | L58 | idempotent；存在直接 return；写 manifest；EvalSymlinks RootDir |
+| `Get(id)` | L149 | sync.Map.Load |
+| `GetBySession(sessionID)` | L85 | sync.Map.Range 线性扫描——O(n)，**低频路径** |
+| `WriteFile(ws, relPath, content)` | L158 | safePath + MkdirAll 父目录 + os.WriteFile |
+| `DeleteFile(ws, relPath)` | L175 | safePath + os.Remove（IsNotExist 不报错） |
+| `ReadFile(ws, relPath)` | L188 | safePath + os.ReadFile |
+| `ListFiles(ws)` | L201 | Walk 收集相对路径（不过滤 hidden / `.workspace.json`） |
+| `MkdirAll(ws, relPath)` | L218 | safePath + os.MkdirAll(0o755) |
+| `Archive(ws, w io.Writer)` | L227 | tar+gzip 流式写；header.Name = `<project>/<rel>` |
+| `Cleanup(id)` | L263 | workspaces.Delete + os.RemoveAll —— **不写 manifest 删除日志** |
+| `ListWorkspaces()` | L307 | Range → []*Workspace |
+| `ListDir(ws, relPath)` | L317 | safePath + os.ReadDir + 给目录加 `/` 后缀 |
+| `TreeString(ws)` | L346 | Walk + 缩进字符串（用于 prompt 注入） |
+
+⚠️ **`Cleanup` 不删除 manifest**：实际上 `os.RemoveAll(ws.RootDir)` 把整个目录连同 `.workspace.json` 一起删了，所以 manifest 跟着没了。代码注释没明说这点，但语义是对的。
+
+⚠️ **`ListFiles` / `TreeString` 不过滤 `.workspace.json`**：扫描结果里会出现 manifest 文件，下游使用方（LLM prompt 注入）要意识到这个伪文件。生产场景下可能想 filter 掉——但目前没做。
+
+---
+
+## 7. tar.gz 归档（manager.go:227-260）
+
+```go
+gw := gzip.NewWriter(w)
+defer gw.Close()
+tw := tar.NewWriter(gw)
+defer tw.Close()
+
+filepath.Walk(ws.RootDir, func(path, info, err) error {
+    rel, _ := filepath.Rel(ws.RootDir, path)
+    if rel == "." { return nil }                  ← 跳过根目录自身
+    header, _ := tar.FileInfoHeader(info, "")
+    header.Name = filepath.Join(ws.Project, rel)   ← project name 作为 tar 顶层目录
+    tw.WriteHeader(header)
+    if info.IsDir() { return nil }
+    f, _ := os.Open(path)
+    defer f.Close()
+    io.Copy(tw, f)
+})
+```
+
+**关键点**：
+- **流式写**：直接写 `io.Writer`，不缓冲到内存；HTTP 下载端直接 chunked transfer
+- **顶层目录**：tar 里所有文件路径都是 `<project>/<rel>`——用户解压时不会污染当前目录
+- **包含 `.workspace.json`**：manifest 会被打包进去（与 ListFiles 同理）。用户拿到 tar 后看到这个隐藏文件可能困惑——**P2 应该过滤**
+
+---
+
+## 8. 与 orchestrator 的契约
+
+### 8.1 租户隔离决策点：`ResolveSessionWorkspace`（**不在 workspace 包**）
+
+`orchestrator/file_tools.go:935-971` 才是把 sessionID 映射到 workspace 的入口：
 
 ```go
 func (o *Orchestrator) ResolveSessionWorkspace(sessionID string) *workspace.Workspace {
     if o.workspaceMgr == nil { return nil }
     if sessionID == "" {
         o.logger.Warn("ResolveSessionWorkspace called with empty sessionID")
-        return nil   // 空 session 不会 fallback 到默认
+        return nil                                  ← 拒绝兜底到 default
     }
     if ws, ok := o.workspaceMgr.Get(sessionID); ok { return ws }
-
-    // 防止 sessionID < 8 字符导致切片 panic
     label := "session-" + sessionID
-    if len(sessionID) > 8 { label = "session-" + sessionID[:8] }
-
+    if len(sessionID) > 8 {
+        label = "session-" + sessionID[:8]
+    }
     ws, err := o.workspaceMgr.Create(sessionID, label)
     if err != nil {
-        o.logger.Error(
-            "failed to create session workspace — refusing to fall back (would cross tenants)",
-            zap.String("session_id", sessionID), zap.Error(err))
-        return nil   // ← 绝不返回别人的 workspace
+        o.logger.Error("failed to create session workspace — refusing to fall back to a shared workspace (would cross tenants)", ...)
+        return nil                                  ← 失败也不兜底
     }
     return ws
 }
 ```
 
-**相关 `resolveWorkspace("")` 收紧**：原来在没有 `default` workspace 时
-也会 `return list[0]`；现改为**只**匹配 `project=="default"` 的 workspace，
-否则创建新的。见 `file_tools.go:774-803`。
+**为什么这逻辑在 orchestrator 不在 workspace 包**：
+- workspace 包是"目录管理"原语，对租户、隔离、回退策略一无所知
+- orchestrator 才知道 "什么是 session"、"empty sessionID 意味着什么"
+- 历史 P0 bug：早期 `resolveWorkspace`（L982）在 default 不存在时 fallback 到 `ListWorkspaces()[0]`，跨租户泄露文件
+- 修复后 **两个函数都明确不兜底**：失败就返回 nil，调用方必须处理"无 workspace 可用"
 
+### 8.2 调用方处理 nil 的责任
 
-### 5.2 `saveManifest` (L95)
-
-```go
-saveManifest(ws):
-  manifestPath := rootDir + "/.manifest.json"
-  data, _ := json.Marshal(ws)
-  os.WriteFile(manifestPath, data, 0o644)
-```
-
-把 `Workspace` 元数据（ID / SessionID / Project / CreatedAt）以 JSON 落到**每个 workspace 根目录下的 `.manifest.json`**。好处：
-
-- 单个 workspace 完全自描述（目录 + manifest 即可重建）；
-- 不依赖中心化 DB，重启不需要查 PG；
-- 用户要"把 workspace 整包迁移"时一起打包即可。
-
-### 5.3 `restore` (L109)
-
-```
-restore():
-  entries := os.ReadDir(baseDir)
-  for each entry:
-    if not dir: skip
-    manifestPath := baseDir/entry.Name()/.manifest.json
-    data := os.ReadFile(manifestPath)
-    var ws Workspace
-    json.Unmarshal(data, &ws)
-    m.workspaces.Store(ws.ID, &ws)
-```
-
-服务启动时扫 `baseDir` 下所有子目录，找 `.manifest.json` 读回内存。**自动自愈**：即使宿主机重启、pod rescheduled，只要 PV 还在，workspace 全自动恢复。
-
-### 5.4 `Cleanup` (L255)
-
-```
-Cleanup(id):
-  ws := Get(id)
-  m.workspaces.Delete(id)
-  os.RemoveAll(ws.RootDir)                      # 物理删除整个目录
-```
-
-**硬删除**。调用时机：
-
-- 用户主动调 DELETE /workspaces/:id（暴露在 API 层但默认需要授权）；
-- 定时清理任务（当前无；后续演进）；
-- E2E 测试结束 teardown。
+`file_tools.go` 里的 tool handler（handleFileRead/handleFileWrite/...）拿到 `nil workspace` 时：
+- 返回 `{"error": "workspace not available"}` 给 LLM
+- LLM 看到错误后会改 plan（要求用户提供 sessionID / 走别的工具）
+- **不会 panic**，**不会 fallback 到任意 workspace**
 
 ---
 
-## 6. I/O 操作集
+## 9. 实现剖析与改进方向
 
-```go
-WriteFile(ws, relPath, content)     // 自动 MkdirAll 父目录
-ReadFile(ws, relPath)               // 返回 string
-DeleteFile(ws, relPath)             // idempotent (NotExist 忽略)
-MkdirAll(ws, relPath)               // 递归建目录
-ListFiles(ws)                       // 返回所有文件相对路径（filepath.Walk 递归）
-ListDir(ws, relPath)                // 返回单层目录内容
-TreeString(ws)                      // 返回可读的 tree 结构字符串
-```
+### 9.1 当前实现的真实利弊
 
-### 6.1 默认权限
+**优势（验证过的）**
+- ✅ 三层 safePath 完整覆盖路径穿越 + symlink 攻击
+- ✅ `RootDir` 双边 EvalSymlinks 保证 HasPrefix 比较正确
+- ✅ manifest 持久化 + 重启自动恢复（同 pod 内）
+- ✅ tar.gz 流式归档不吃内存
+- ✅ `sync.Map` 读多写少场景接近 lock-free
+- ✅ idempotent Create：重复调用不创建新目录
+- ✅ 失败不兜底原则（在 orchestrator 层）杜绝跨租户泄露
 
-- 目录：`0755`
-- 文件：`0644`
+**已知风险**
 
-没有设计成可配。因为 workspace 本身就在容器 / K8s Pod 内，不涉及多用户 Linux 权限。
+| 严重度 | 问题 | 位置 | 建议 |
+|---|---|---|---|
+| P2 | `.workspace.json` 出现在 ListFiles / TreeString / tar 包里 | manager.go:201/346/227 | filter 掉 `.workspace.json` |
+| P2 | manifest 无 schema version 字段 | manager.go:22 | 加 `Version int` 或路径分版本 |
+| P2 | `GetBySession` 是 O(n) 线性扫描 | manager.go:85 | 维护 `sessionID → *Workspace` 二级索引（或确认调用路径已废弃） |
+| P2 | 没有容量限制 | 全局 | 加 quota 检查 + per-workspace 大小统计 |
+| P2 | 跨 pod 不持久（`/tmp` 是 tmpfs） | main.go:613 硬编码 | 文档化 PVC 挂载要求 / 改可配置 baseDir |
+| P3 | `Cleanup` 不发清理事件 | manager.go:263 | 加 metrics + audit log |
+| P3 | `restore` 静默丢弃 unmarshal 失败的 manifest | manager.go:131 | 改为重命名为 `.workspace.json.broken` |
 
-### 6.2 `DeleteFile` 的幂等性
+### 9.2 优先级修复建议
 
-```go
-if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
-    return err
-}
-```
+**P1（生产质量）**
+1. ListFiles / Archive 过滤 `.workspace.json`（避免泄漏内部 metadata 给用户）
+2. baseDir 可配置（`config.workspace.base_dir`），文档化 PVC 挂载
 
-**删除不存在的文件不算错误**。因为 Agent 可能在一次循环里反复调用"清理目录"，用户不该看到 "file not found" 的脏错误。
+**P2（设计完善）**
+3. 加 manifest schema version 字段
+4. 加 metrics：`workspace_create_total / workspace_cleanup_total / workspace_disk_usage_bytes`
+5. Cleanup 加 audit log
+6. 把 `GetBySession` 改成 O(1) 索引或标 Deprecated
 
----
-
-## 7. `Archive` —— tar.gz 打包下载（L219）
-
-```
-Archive(ws, w io.Writer):
-  gw := gzip.NewWriter(w)
-  tw := tar.NewWriter(gw)
-
-  filepath.Walk(ws.RootDir):
-    for each file:
-      rel := relative to ws.RootDir
-      header := tar.FileInfoHeader(info)
-      header.Name = project + "/" + rel          # 解压后带项目名顶层目录
-      tw.WriteHeader(header)
-      if not dir: io.Copy(tw, file)
-```
-
-**流式写入**：不用先 archive 到磁盘再发出，直接写到 `io.Writer`（通常是 gin 的 `c.Writer`）。对大项目（几百 MB）无需中间缓存。
-
-### 7.1 头部项目名前缀
-
-解压后形如：
-
-```
-my-fastapi-app/
-├── main.py
-├── requirements.txt
-└── tests/
-    └── test_main.py
-```
-
-不是直接散落在当前目录里 —— 用户体验标配。
-
----
-
-## 8. REST API 层 `workspace_handlers.go`
-
-### 8.1 端点一览
-
-| 方法 | 路径 | 功能 |
-|---|---|---|
-| GET | `/workspaces` | list：返回所有 workspace（id/session/project/createdAt） |
-| GET | `/workspaces/:id/tree?path=...` | 文件树（递归，返回 `FileTreeNode` 数组） |
-| GET | `/workspaces/:id/file?path=...` | 读文件内容（带语言检测） |
-| PUT | `/workspaces/:id/file` | 写文件（body 含 path + content） |
-| DELETE | `/workspaces/:id/file?path=...` | 删文件 |
-| POST | `/workspaces/:id/mkdir` | 建目录 |
-| GET | `/workspaces/:id/download` | 下 tar.gz（见 §7） |
-
-### 8.2 `FileTreeNode` 与 `buildFileTree` (L35/L65)
-
-```go
-type FileTreeNode struct {
-    Name     string
-    Path     string          // relative to workspace root
-    IsDir    bool
-    Size     int64
-    Children []*FileTreeNode // 递归
-    Language string          // 根据后缀推断，前端 Monaco 用来决定 syntax
-}
-```
-
-`buildFileTree` 递归遍历，**自动跳过常见 junk**：`node_modules / .git / __pycache__ / .DS_Store`（见源码实际列表）。好处：前端侧边栏不会被 10k 个 node_modules 文件撑爆。
-
-### 8.3 `detectLanguage(path)` (L292)
-
-```
-.go → "go"
-.py → "python"
-.ts / .tsx → "typescript"
-.js / .jsx → "javascript"
-.rs → "rust"
-.yaml / .yml → "yaml"
-.json → "json"
-.md → "markdown"
-...
-```
-
-前端 Monaco `language` prop 直接用这个值，渲染正确的高亮。
-
-### 8.4 `resolveWorkspace(c)` (L259)
-
-```
-resolveWorkspace(c):
-  id := c.Param("id")
-  ws := wm.Get(id)
-  if not found: c.JSON(404, error); return nil
-  return ws
-```
-
-所有 handler 的第一步，**单点鉴权**的挂钩点（后续可以在这里注入 "这个用户是否能访问 workspace X" 的校验）。
-
----
-
-## 9. 与其他模块的协作
-
-### 9.1 Session → Workspace 绑定
-
-`CreateForSession(id, sessionID, projectName)` 把两者联起。Orchestrator 在处理第一条 user message 时：
-
-```go
-ws := workspaceMgr.GetBySession(sessionID)
-if ws == nil:
-    ws = workspaceMgr.CreateForSession(newID, sessionID, projectName)
-```
-
-### 9.2 Workspace → Sandbox 挂载
-
-Sandbox 启容器时会把 `ws.RootDir` 作为 volume 挂载到容器内（通常挂到 `/workspace`）：
-
-```go
-sandbox.Run(cmd, &Options{
-    VolumeBinds: []string{ws.RootDir + ":/workspace"},
-    WorkDir:     "/workspace",
-})
-```
-
-让 `go build` 的编译产物自动出现在宿主机 workspace 目录里，用户可以立刻在前端看到。
-
-### 9.3 Workspace → Git
-
-`orchestrator/git_tools.go` 的 `ensureGitInit(ws)` 在第一次 git 操作前自动 `git init` 这个目录。这样用户无需手动初始化就能有版本控制。
-
-### 9.4 Workspace → RAG Indexer
-
-当用户说"索引当前项目"时，indexer 直接读 `ws.RootDir` 下所有文件走 RAG 入库（见 `15_indexer_repomap`）。
+**P3（未来扩展）**
+7. workspace quota（per-session 文件大小 / 文件数上限）
+8. 增量 archive（只打包 diff，给 git 集成用）
+9. workspace 加密 at-rest（KMS 包 mount）
 
 ---
 
@@ -523,78 +542,53 @@ sandbox.Run(cmd, &Options{
 
 | 抉择 | 动机 |
 |---|---|
-| **每个 session 独立目录** 而非共享 | 安全隔离 + 并发互不干扰 + 可独立归档 |
-| `safePath` **三重校验**（Clean + IsAbs + HasPrefix+sep） | 路径穿越是经典 OWASP Top-10，必须多层防御 |
-| `sync.Map` 索引 | 读多写少最优解；避免 RWMutex 竞争 |
-| 每个 workspace **一个 `.manifest.json`** | 自描述 + 不依赖中心 DB + 可整体迁移 |
-| 进程启动时 `restore()` 扫盘 | 重启自愈；无需外部存储；天然 idempotent |
-| `CreateForSession` **幂等** | 同 session 多次调用不会丢文件；防御性好 |
-| `DeleteFile` **NotExist 不算错** | Agent 会多次重试清理；用户不该看到脏错误 |
-| `Archive` **流式 tar.gz** | 大项目不占中间内存 |
-| `buildFileTree` **跳 junk 目录** | 前端体验；node_modules 没人看 |
-| REST 层单独文件 `workspace_handlers.go` | 分离"核心能力"与"HTTP 胶水" |
-| 默认 `0644/0755` 权限不可配 | 容器内场景下调权限无价值；避免噪音配置 |
-| 不做 **磁盘配额** | 当前在 K8s Pod 里由 ephemeral storage limit 兜底；未来可加 |
-| 不做 **Workspace 生命周期自动回收** | 当前显式清理；防止误删重要上下文；TTL 留到后续 |
+| **`/tmp/agent-workspaces` 硬编码 baseDir** | 简化部署；短生命周期工作流不需要持久化；PVC 挂载是部署侧的事 |
+| **`RootDir` 存 EvalSymlinks 真实路径** | safePath HasPrefix 比较必须双边都是真实路径，否则全部误判越界 |
+| **safePath 三层防御**（Clean + Abs reject + EvalSymlinks + HasPrefix） | 任何单层都有绕过，组合才能拒掉 symlink + parent escape + abs path 三类攻击 |
+| **safePath 父目录 EvalSymlinks fallback** | 新建文件场景必须支持，否则 WriteFile 全失败 |
+| **manifest 持久化 + restore** | 进程重启不丢索引；同 pod 内的崩溃恢复 |
+| **`sync.Map` 而非 RWMutex+map** | 读多写少 + key 集合稳定；本场景命中 sync.Map 优势区 |
+| **失败不 fatal（main.go Warn）** | workspace 是可选能力；缺它仍可跑 chat / RAG / MCP |
+| **租户隔离决策放 orchestrator 不放 workspace** | workspace 是无状态目录原语；session/tenant 概念属于 orchestrator |
+| **失败不兜底（ResolveSessionWorkspace 返回 nil）** | 历史 P0：`ListWorkspaces()[0]` fallback 导致跨租户泄露；宁可拒绝服务也不混租户 |
+| **tar.gz 流式不缓冲** | 大项目（10K+ 文件）打包不吃内存；HTTP chunked transfer 友好 |
+| **idempotent Create** | LLM 多次调用 generate_project 时不会爆裂创建多个 workspace |
 
 ---
 
 ## 11. 后续演进
 
-- [ ] **磁盘配额**：单 workspace 上限 1 GB，超了拒绝写入；可用 Linux quota 或用户层统计；
-- [ ] **生命周期 TTL**：闲置 N 天未访问自动归档 → S3 / 冷存；
-- [ ] **软删除**：DELETE 不立即 rm -rf，先标记 `deleted_at`；N 天后真删；
-- [ ] **用户鉴权**：`resolveWorkspace` 里校验 `userID == ws.OwnerID`；
-- [ ] **Git-based 版本管理**：workspace 自动 commit 每次编辑，WSL 级别的时光回溯；
-- [ ] **多 workspace link**：允许 workspace A 软链接引用 workspace B 的部分目录（monorepo 场景）；
-- [ ] **Workspace 模板**：prebuilt templates（FastAPI / Next.js / Go-gin），一键创建即可用；
-- [ ] **文件 watcher**：监听 workspace 变化实时推送给前端（WebSocket），多人协作；
-- [ ] **Workspace 镜像化**：把 workspace 打包成 Docker image，用户随时拉起与当时一致的环境；
-- [ ] **压缩存储**：不常访问的文件自动 zstd 压缩，节省磁盘；
-- [ ] **Metrics**：`workspace_created_total / workspace_disk_usage_bytes{id} / workspace_file_ops_total`。
+- [ ] **可配置 baseDir**：`config.workspace.base_dir`，部署时映射 PVC
+- [ ] **ListFiles / Archive 过滤内部文件**：`.workspace.json` 等
+- [ ] **manifest schema version**：未来字段变更的迁移路径
+- [ ] **workspace quota**：per-session 总大小 / 文件数 / 单文件大小上限
+- [ ] **metrics**：create / cleanup / disk usage / safePath reject 计数
+- [ ] **`GetBySession` 重构**：二级索引或标 deprecated 后移除
+- [ ] **增量 archive**：和 git 集成；只打包 diff
+- [ ] **at-rest 加密**：KMS / 透明加密 mount
+- [ ] **跨 pod 共享**：S3 backend + 本地 cache（如果业务需要跨节点）
+- [ ] **TTL 自动清理**：长期未访问的 workspace 自动归档到对象存储 + 删本地
 
 ---
 
-## 11. 实现剖析与改进方向
+## 12. 设计教训
 
-### safePath 的实际校验
+1. **租户隔离决策必须在能感知 tenant 概念的层做**：把 "失败时怎么 fallback" 留在 workspace 包是错的——它只看到 ID 字符串，不知道哪些 ID 来自哪个用户。决策应该在能区分 session/user 的层（orchestrator）做。历史 P0 跨租户泄露就是因为决策点选错了。
 
-```go
-func (m *Manager) safePath(ws *Workspace, rel string) (string, error) {
-    if strings.Contains(rel, "..") {
-        return "", ErrPathTraversal   // 快速拒绝常见攻击
-    }
-    abs := filepath.Join(ws.RootDir, rel)
-    abs = filepath.Clean(abs)          // 规范化 ../ 和 ./
-    if !strings.HasPrefix(abs, ws.RootDir + string(filepath.Separator)) &&
-       abs != ws.RootDir {
-        return "", ErrPathTraversal   // 逃出 workspace 根
-    }
-    return abs, nil
-}
-```
+2. **safePath 必须是三层防御**：只做 `filepath.Clean` 防不住 symlink 攻击；只做 `HasPrefix` 防不住相对路径穿越；只做 `EvalSymlinks` 防不住 abs path。三层组合 + 双边 real path 才完整。本包测试用例覆盖了所有已知绕过模式。
 
-**TOCTOU 未防护**：symlink `ws/evil → /etc/passwd` 通过字符串检查但
-读取时跟随 symlink。需要 `os.Lstat + EvalSymlinks` 才能彻底防。
+3. **`RootDir` 存什么路径是隐性 ABI**：macOS 的 `/tmp → /private/tmp` 让逻辑路径和真实路径不一致；如果 manager 一边存逻辑路径、一边用真实路径比较，HasPrefix 永远不匹配。**所有边界检查的两边都用 real path** 是隐含契约——`CreateForSession` 和 `restore` 各有一处 EvalSymlinks 就是为了维护这个契约。新代码加任何 path 字段时必须意识到这点。
 
-### Pros
-- ✅ 所有 I/O 走 safePath 单入口，不会漏校验
-- ✅ ResolveSessionWorkspace 严格拒绝 fallback（P0 #15）
-- ✅ Tmpfs + Bind Mount 二选一，按需选
-- ✅ Cleanup 幂等，重复调不报错
+4. **`filepath.EvalSymlinks` 在新文件场景会失败**：这是 Go 标准库行为而非 bug。任何"创建前先校验路径"的逻辑必须在 EvalSymlinks 失败时 fallback 到父目录解析。这是非常常见的踩坑点。
 
-### Cons
-- ⚠️ Symlink 逃逸未完全防护（TOCTOU）
-- ⚠️ 文件数 / 总大小无配额（用户可以把 workspace 撑到几 GB）
-- ⚠️ Manifest 是 JSON 文件无 checksum，能被篡改
-- ⚠️ Windows 路径分隔符兼容未测试
+5. **manifest 持久化的两步式恢复**：`restore` 不能直接信 manifest 里的 `RootDir`——挂载点变化会让旧值无效。必须先用 baseDir + entry name 重建路径，再 EvalSymlinks 解析。manifest 里的 RootDir 只是 informational，不是 source of truth。
 
-### 改进方向
-- **P0** — safePath 加 `filepath.EvalSymlinks` 防 symlink 逃逸
-- **P0** — workspace 配额：`ws.MaxBytes / ws.MaxFiles`
-- **P1** — Manifest 加 HMAC 签名（被手改就失效）
-- **P2** — 支持远程 workspace（S3 / git clone 到本地）
+6. **sync.Map 是 sharp tool 不是 general replacement**：读多写少 + key 稳定时是 lock-free 巨大胜利；但 Range 永远是 O(n)，不能做"按 sessionID 反查"这种 secondary index 操作。如果业务需求变了，应该立刻退回 RWMutex+map + 显式二级索引。
+
+7. **可选依赖用 Warn 不用 Fatal**：workspace 是可选——`main.go` 失败时 logger.Warn 后继续启动，让 chat/RAG/MCP 仍然能用。这是 Go 项目 graceful degradation 的常见手法。代价：每个调用方都必须 nil-check（`if o.workspaceMgr == nil`），样板代码增多。
+
+8. **文档与代码必须每次审查同步**：旧 doc 把 `.manifest.json` 当文件名（实际是 `.workspace.json`）、宣称 `safePath` 没 symlink 防护（实际三层都做了）——新维护者读旧 doc 后会浪费时间排查"为啥代码不像 doc 说的那样"。文档不准比缺文档更糟。
 
 ---
 
-下一篇：`15_indexer_repomap.md` —— Indexer + RepoMap：启动索引器 + 文件监视器，增量维护 RAG 向量库与项目地图。
+下一篇：[`15_indexer_repomap.md`](15_indexer_repomap.md) —— 仓库索引与符号地图：`internal/indexer` 与 `internal/repomap` 怎么把代码切分、建符号表、喂给 RAG 和 agent 的工作。

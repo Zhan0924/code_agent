@@ -1,308 +1,294 @@
 # 12 · Session 管理 `internal/session`
 
-> 代码：
-> - `manager.go` (434) — Redis 后端会话生命周期：CRUD + 冷热分离 + Lua 原子追加 + 分片键 + 滑动窗口压缩
-> - `summarizer.go` (108) — 两种摘要器：`LLMSummarizer`（调 LLM）与 `SimpleSummarizer`（纯字符串截断）
-> - 测试：`summarizer_test.go` (127)
+> 代码（**以代码为准**，不要把 `_principles.go` 和 `doc.go` 里的设计构想当成实现）：
+>
+> - `manager.go` (633 行) — Redis 后端会话生命周期：CRUD + 热冷分层 + Lua 原子追加 + auto-pin + 压缩
+> - `summarizer.go` (108 行) — Summarizer 接口 + `LLMSummarizer` / `SimpleSummarizer`
+> - `_principles.go` (714 行) — **RFC 风格的设计构想**：里面描绘的 `sess:meta:{sid}` HASH + `sess:msg:{sid}:{shard}` LIST + Redis Cluster `{hash tag}` 全部 **未在 `manager.go` 中实现**。读这个文件时请意识到它是设计草图而非现状
+> - `doc.go` (46 行) — 同样**与代码不一致**：宣称的 List + Hash + String 三键分离 / PostgreSQL 表结构 / `SET NX PX` 分布式锁 在代码里都没有
+>
+> 测试：`summarizer_test.go` (127 行)。
 
 ---
 
 ## 1. 模块定位
 
-**"对话的记忆器：把长对话塞进 LLM 窗口而不爆 + 把历史安全搬到冷存。"**
+**"对话的记忆器：把长对话塞进 LLM 窗口而不爆 + 把超出预算的历史降维成摘要。"**
 
-LLM 有 context window 上限（4K/32K/128K），**长对话是 Agent 天生的敌人**：
+LLM 调用本质无状态——每一轮 ReAct 都要把完整 history 重新塞 prompt 里。
+长会话天生与 LLM 为敌：
 
-- **LLM 成本**：每次都把全历史塞进去 = O(n²) token 增长；
+- **Token 成本** O(n²)：第 n 轮要把前 n-1 轮全送回去；
 - **延迟**：128K 上下文的 TTFT 显著高于 8K；
-- **Redis 内存**：每次 append 重写整条 session JSON，单 key 破 MB 后 Redis 出现 **延迟尖刺**；
-- **Hot key**：高频用户的 session key 会集中打到同一 Redis slot，集群模式下单分片过载；
-- **持久化**：几个月前的历史对 LLM 无用但对用户可能有价值（审计/回看）。
+- **Redis 内存**：单 key JSON 破 1MB 后 `GET` 出现尖刺；
+- **并发**：同一会话两条消息并发写，read-modify-write 会丢消息；
+- **持久化**：过期 session 占着 Redis 不释放，月度成本失控。
 
-Session 包用五招组合拳解决：
+本包实际用了 3 招（**不是 _principles.go 描绘的 5 招**）：
 
-1. **冷热分离**（Hot/Cold Separation）：最近 10 条在 Redis，更老的走摘要 + 异步归档到冷存；
-2. **Redis 分片键**（shardCount=4）：同一 session 的数据分散到 4 个 key，打散 hot slot；
-3. **Lua 原子脚本**（`addMessageLuaScript`）：SET-GET-追加-SET 做成一条原子命令，杜绝并发写导致的"消息丢失"；
-4. **异步摘要**：超过 token 阈值时 **后台 goroutine** 调 LLM 出摘要，不阻塞主链路；
-5. **滑动窗口**（`compressContext`）：当摘要仍然过长时，二次压缩摘要本身。
+1. **Lua 原子追加**（`addMessageLuaScript`）：单线程 GET-decode-append-encode-SET 一气呵成，杜绝并发写丢失；
+2. **Token 预算驱动的热冷分离**：超 `SummaryThresholdTokens` 时把最旧若干条摘要化并归档到 `coldKey`；
+3. **Auto-Pin**：含"always/never/must/important:"等关键词的用户消息自动置位 `Pinned=true`（注意：**当前压缩逻辑并未真正读取 `Pinned`**，是埋点供未来的剪枝器使用）。
+
+**没有实现但 `_principles.go` 声称有的**：
+
+- ❌ 多 key 切分（`sess:meta` HASH + `sess:msg:{shard}` LIST）—— 实际只有 **一个 `sess:hot:<id>` key 装整个 JSON**
+- ❌ Redis Cluster hash tag `{sid}` —— 实际 key 没有花括号
+- ❌ `msgShardKey` 写入路径 —— 函数定义了但**无任何调用方写入**，只在 `Delete` 时被防御性删除
+- ❌ 分布式锁 / `SET NX PX` —— 完全没有
+- ❌ TTL 滑动续期 —— `Get` 不 touch TTL；只有 `SET` 时重设 TTL
 
 ---
 
-## 1.5 设计哲学：Session 存储的 4 个根本抉择
+## 1.5 设计哲学：4 个被代码证实的抉择
 
-### Q1 — 放哪里：内存 / Redis / Postgres？
+### Q1 — 为什么 Session 放 Redis？
 
-**选项对比**：
+| 选项 | 读延迟 | 写耐久 | 水平扩容 | TTL | 成本 |
+|---|---|---|---|---|---|
+| 进程内 map | ns | 0（重启丢） | 不可（绑 pod） | 手工实现 | 0 |
+| Redis | <1ms | AOF 可选 | 共享 | 原生 `EXPIRE` | 中 |
+| Postgres | 1-5ms | 强 | 共享 | 手工清理 | 高 |
 
-| 维度 | 进程内 map | Redis | Postgres |
-|---|---|---|---|
-| 读延迟 | ns | <1ms | 1-5ms |
-| 写耐久 | 零（重启丢） | 可选 AOF | 强 |
-| 水平扩容 | 不可能（绑 pod） | 共享 | 共享 |
-| TTL | 手工实现 | 原生 `EXPIRE` | 手工清理 |
-| 吞吐 | ∞ | 10 万 QPS | 1-5 万 |
-| 成本 | 0 | 中 | 高 |
+**结论**：Redis。`main.go:140-141` 显示 Redis 失败直接 fatal，session 包认 Redis 为强依赖。
+Postgres 只通过 `ColdStore` 回调注入（可选）。
 
-**决策**：**Redis 主**，Postgres 辅（审计 / 长期任务）。
+### Q2 — 为什么是单 JSON blob，不是 HASH + LIST？
 
-**核心推导**：Agent 无状态水平扩容，用户从前端来的请求可能打到任意 Pod——
-必须共享存储。Postgres 太慢（每步 ReAct 要 10+ 次 session 读写）。内存
-不扩容。Redis 是唯一平衡点。
+代码里 `hotKey()` 单 key 装整条 `models.Session`（含 Messages 数组）。
+这与多数教科书"用 LIST 存 messages"建议相反，但出于两个原因合理：
 
-### Q2 — 数据结构：Hash / List / JSON blob？
+1. **Lua 脚本的复杂度**：HASH + LIST 多键操作，原子追加需要更复杂的 Lua（处理 metadata 和 msgs 列表两边），单 JSON 只需要 `GET → decode → append → encode → SET`
+2. **`Get` 是热路径**：每次 ReAct 步骤都 `Get(sessionID)`，单 GET + 单 unmarshal 简单且 cacheline-friendly。如果是 HASH+LIST，要 HGETALL + LRANGE 两次 RTT
 
-**场景**：一个 session 有 metadata（id/user/created_at）+ 可变长 messages
-数组。
+**代价**：单 JSON 在 messages 数组很长时 marshal/unmarshal 成本随 N 线性增长。
+这就是为什么 `performHotColdSeparation` 在 token 超阈值时**必然要归档**——
+不归档不仅仅是 prompt 太长，单纯 JSON 操作就吃不消。
 
-**选项**：
-- (A) 单个 JSON blob 存 String：`SET sess:123 '{...}'`
-- (B) Hash 存 metadata + List 存 messages：`HGETALL sess:123` + `LRANGE msgs:123`
-- (C) 全部用 Hash，messages 编号成 field
+### Q3 — 阈值是 token，不是消息条数
 
-**决策**：(B)。
-- 每次 AddMessage 只需 `RPUSH msgs:123 <new>`，O(1) 不读全量
-- metadata 用 HGET 单字段，不影响 messages
-- List 有 `LTRIM` 原生支持滑动窗口淘汰
-
-**(A) 的陷阱**：每次 AddMessage 要读-合并-写，并发修改一定丢。
-
-### Q3 — Hot / Cold 分层的由来
-
-**现象**：实测一个 session 10 条消息时，**最近 3 条**被访问 90%（ReAct
-每步重读最近上下文）；**前 7 条**只在压缩时读一次。
-
-**设计**：分两个 key：
-```
-hot:sess:<id>   — 最近 N 条完整消息（low-latency 热路径）
-cold:sess:<id>  — 老消息的压缩摘要（偶尔读）
+`checkAndArchive`（L302）的触发条件是：
+```go
+totalTokens > m.cfg.SummaryThresholdTokens && len(session.Messages) > minHotMessages
 ```
 
-**优点**：
-- 热路径 `LRANGE hot:sess:123 0 -1` 数据量小，网络时间缩短
-- 冷路径只在 prompt 重建时读一次，不影响主循环延迟
-- 两个 key 可以走**不同的 Redis 节点 / slot**分担压力（见 Q4）
+**不是** "≥10 条 → 压缩"。
+为什么？因为有些用户的消息是 100 字的代码补丁，有些是 50KB 的 traceback。
+按条数压缩会让 50KB 的 traceback 在它单条就超 prompt 时仍然不压缩。
+按 token 压缩才能保证 prompt 永远在预算内。
 
-**量化**：实测热路径 P99 延迟从 5ms（全量 JSON blob）降到 <1ms。
+**`minHotMessages = 2`**（L82）是硬下限：保护性兜底，避免单条巨大消息触发"把唯一一条消息也归档"的退化场景。
 
-### Q4 — Key 分片防热点
+### Q4 — 摘要为什么异步？
 
-**问题**：Redis 单 slot 上限 ~20 万 QPS。一个极热 session（如 long-running
-代码生成任务）可能瞬间 1000+ QPS，单 slot 撑不住。
+`AddMessage` 末尾（L272）：
+```go
+go m.checkAndArchive(context.Background(), sessionID)
+```
 
-**决策**：`key = sess:{user_id_hash % shard_count}:actual_id`。
+注意 `context.Background()` —— **故意不用 request ctx**：用户的 HTTP 请求 ctx 在 AddMessage 返回后会被取消，
+若摘要 goroutine 跟着请求 ctx，就会随请求结束被打断。
+归档是后台事务，**它的生命周期独立于发起它的那次写入请求**。
 
-前缀把热 session 分到不同 slot。**注意**：这个优化**不是 "Redis cluster
-的 hash tag"**——cluster hash tag 是为了保证多 key 在同 slot（便于事务），
-我们恰恰相反，是为了分散。
-
-### 设计权衡：TTL 策略
-
-- **活跃 session**：24 小时（默认）
-- **AddMessage 触发 TTL 刷新**：任何活动延长 24h（滑动过期）
-- **冷存储摘要**：7 天（比活跃更长，防用户 24h 后又回来）
-- **无刷新 session**：24h 后自动 Redis 回收，不占空间
+副作用：如果连续两条消息触发归档，会产生 2 个并发归档 goroutine。
+当前实现**没有 per-session lock**，所以最坏情况两边都把 `Messages[:keepFrom]` 移走，
+靠 Lua 原子写入的最后写入胜出来收敛。**这是已知 P1 风险**，详见 §10。
 
 ---
 
 ## 2. 依赖架构
 
 ```
-┌─ orchestrator.ProcessMessage ─┐
-│  sessionMgr.GetOrCreate        │
-│  sessionMgr.AppendUser/Assist  │
-│  sessionMgr.GetContextWindow   │
-└────────────┬───────────────────┘
+┌─ orchestrator.ProcessMessage ──────────────────────┐
+│  sessionMgr.AddMessage(user msg)                    │
+│  sessionMgr.GetContextWindow(sessionID)             │
+│  sessionMgr.AddMessage(assistant msg)               │
+└────────────┬───────────────────────────────────────┘
              │
              ▼
-    ┌────────────────────┐
-    │   session.Manager  │
-    │   CRUD + Compress  │
-    └────────┬───────────┘
-             │
-     ┌───────┴────────┐
-     │                │
-     ▼                ▼
- ┌────────┐    ┌──────────┐
- │ Redis  │    │Summarizer│
- │ Cluster│    │  (LLM)   │
- └────────┘    └──────────┘
-     │
-     │ (async)
-     ▼
- ColdStore callback
-   → PostgreSQL / S3
+   ┌────────────────────────┐
+   │ session.Manager         │
+   │  - rdb: *redis.Client   │
+   │  - cfg: SessionConfig   │
+   │  - ColdStore: callback  │
+   │  - Summarizer: iface    │
+   └────────┬───────────────┘
+            │
+     ┌──────┴──────┐
+     │             │
+     ▼             ▼
+  ┌──────┐    ┌─────────────┐
+  │Redis │    │ Summarizer  │
+  │ hot+ │    │ (LLM/Simple│
+  │ cold │    │  字符串)    │
+  └──────┘    └─────────────┘
+            │
+            │ (async, optional)
+            ▼
+       ColdStore(callback)
+         → PostgreSQL / S3
 ```
+
+**注入点**（`cmd/agent/main.go`）：
+
+- L144：`session.NewManager(rdb, &cfg.Session, logger)`
+- L194-209：把 `llmClient.ChatCompletion`（Temperature=0.2）包装成 `LLMSummarizer` 注入 `sessionMgr.Summarizer`
+- `ColdStore` 字段**在 main.go 中没有任何赋值**——目前是悬空回调，归档只到 `coldKey` Redis，不会落 PG
 
 ---
 
 ## 2.5 数据流总览
 
 ```text
-═══════════════ 写入路径: AddMessage ═══════════════
+═══════════════ 写入路径: AddMessage ═══════════════════════════════════
 
-┌─────────────────────────┐
-│ orchestrator / handler  │
-│ sess.AddMessage(msg)    │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Lua 原子脚本 (Redis EVAL)                                    │
-│  KEYS[1] = session:hot:<id>                                  │
-│  ① GET → JSON decode → append msg → JSON encode → SET       │
-│  ② EXPIRE (sliding TTL)                                      │
-│  → 保证并发安全，无需分布式锁                                 │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼ (count > maxHotMessages?)
-              ┌──────────────┴──────────────┐
-              │ YES                         │ NO
-              ▼                             ▼
-┌──────────────────────────┐     ┌─────────────────┐
-│ async goroutine:         │     │ 返回 (完成)     │
-│ performHotColdSeparation │     └─────────────────┘
-└────────────┬─────────────┘
-             │
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│ ① 取最旧 N 条消息 → archiveToCold (PG / S3 callback)       │
-│ ② buildSummary: 拼接旧摘要 + 新归档消息                      │
-│    → 【LLM API (cheap model)】 生成新摘要                    │
-│    或 SimpleSummarizer: 截断拼接                             │
-│ ③ 更新 session.Summary                                      │
-│ ④ 仍超 token 预算? → compressContext:                       │
-│    保留最近 3 条 + 截断 summary                              │
-└─────────────────────────────────────────────────────────────┘
+orchestrator.processStep
+       │
+       ▼
+sessionMgr.AddMessage(ctx, sid, msg)                    [manager.go:239]
+       │
+       │ 1. estimateTokens(msg.Content)       ← llm.FastEstimate
+       │ 2. msg.ID = uuid; msg.Timestamp = now
+       │ 3. shouldAutoPin(msg)                ← 关键词嗅探
+       │ 4. json.Marshal(msg)
+       │
+       ▼
+addMessageLuaScript.Run(KEYS=[hotKey], ARGV=[json, ttl, now])  [L218]
+       │   Lua 单线程:
+       │     data = GET hotKey                ← 整条 Session JSON
+       │     session = cjson.decode(data)
+       │     table.insert(session.messages, msg)
+       │     SET hotKey cjson.encode(session) EX ttl
+       │     return #session.messages
+       │
+       │ if err → addMessageFallback (非原子兜底)         [L278]
+       │
+       ├─ go checkAndArchive(Background(), sid)            [L272 异步]
+       │      │
+       │      ▼
+       │   Get(sid) → totalTokens > SummaryThresholdTokens ?
+       │      │  YES
+       │      ▼
+       │   performHotColdSeparation                        [L310]
+       │      ├ 从尾向头扫描，找 keepFrom（保留尾部最近若干条 ≤ targetTokens=0.75*threshold）
+       │      ├ go archiveToCold(coldMsgs, summary)        [L438 异步]
+       │      │     → SET coldKey JSON, TTL=cfg.TTL*2
+       │      │     → if ColdStore != nil: ColdStore(ctx, sid, coldData)
+       │      ├ session.Summary = buildSummary(prev, coldMsgs)
+       │      │     ├ if Summarizer: 调 LLM → 失败回退到字符串拼接
+       │      │     └ else: 拼接 "[role]: content" 截断
+       │      ├ session.Messages = session.Messages[keepFrom:]
+       │      └ totalTokens 仍超? → compressContext (二级压缩)   [L503]
+       │            按 MaxHistoryTokens/2 预算从尾装回头
+       │
+       ▼ return nil
 
+═══════════════ 读取路径: GetContextWindow ═══════════════════════════════
 
-═══════════════ 读取路径: GetContextWindow ═══════════════
-
-┌─────────────────────────┐
-│ orchestrator.           │
-│ buildMessages()         │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│ session.Manager.GetContextWindow(sessionID)                   │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 【Redis】 GET session:hot:<id>                               │
-│  → JSON decode → Session{Messages, Summary, TokenCount}     │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 组装上下文窗口:                                              │
-│  [0] system message (含 Summary 摘要)                       │
-│  [1..N] hot messages (最近对话)                              │
-│  → 返回 []Message 给 PromptBuilder                          │
-└─────────────────────────────────────────────────────────────┘
+orchestrator.buildMessages
+       │
+       ▼
+sessionMgr.GetContextWindow(ctx, sid)                   [manager.go:385]
+       │
+       ▼
+Get(sid)                                                [manager.go:180]
+       ├ rdb.Get(hotKey)                ← 主体 Session JSON
+       ├ rdb.Get(coldKey)               ← Cold 摘要（可选）
+       └ 合并：session.Summary = cold.Summary + "\n" + session.Summary
+       │
+       ▼
+组装上下文窗口（manager.go:391-401）:
+   if session.Summary != "":
+     [0] system "[Previous conversation summary]: <summary>"
+   [1..N] session.Messages...
+   → 返回 []Message 给 PromptBuilder
 ```
 
 ---
 
-## 3. Redis 键名规划
+## 3. Redis 键名规划（**以代码为准**）
 
 ```go
-// manager.go:74-98
-hotKey(sessionID)     → "sess:hot:{sessionID}"               // 当前热数据（≤10 条）
-coldKey(sessionID)    → "sess:cold:{sessionID}"              // 冷数据摘要元信息
-msgShardKey(id, idx)  → "sess:msg:{sessionID}:{shard}"       // 分片消息桶
-sessionShard(id)      = fnv32(id) % shardCount               // shardCount = 4
+// manager.go:127-149
+hotKey(sessionID)       → "sess:hot:<sessionID>"      // 整条 Session JSON
+coldKey(sessionID)      → "sess:cold:<sessionID>"     // ColdSessionData JSON
+msgShardKey(sid, idx)   → "sess:msg:<sid>:<shard>"    // 定义了但写路径不用
+sessionShard(sid)       = fnv32(sid) % shardCount     // shardCount=4
 ```
 
-### 3.1 为什么引入分片？
+⚠️ **`msgShardKey` 是定义未启用**：grep 全包 `msgShardKey(` 只在 `Delete`（防御删除）里出现，
+**无任何写入路径产生这种 key**。`_principles.go` 描绘的"按 shard 分发消息"是设计构想，不是现状。
 
-标准做法是一个 session 一个 key：
-
-```
-sess:{sessionID}  →  { messages: [...big array...] }
-```
-
-三个问题：
-
-- **Redis 单 key 大小**：conversation 稍长就 >1 MB，`GET` 打爆 output buffer；
-- **序列化成本**：每次 append 都是 GET → decode → append → encode → SET，`encode/decode` 成本与消息数成正比；
-- **Hot key**：同一个用户高频发消息 → 单个 Redis 分片永远打爆。
-
-本包的答案是：
-
-- 热数据（10 条）**仍在单 key** 里（方便一次 GET 拿全上下文）；
-- 冷数据**按 shard 拆**（4 个 shard，每个 shard 独立 Redis slot）；
-- 未来 shardCount 可以做成配置。
-
-### 3.2 Redis Cluster 的 hash tag 技巧
-
-注意 `{sessionID}` 用了**花括号**：这是 Redis Cluster 的 hash tag 语法，**强制同一 session 的所有 key 打到同一 slot**。这样下面这类事务才成立：
-
-```
-MULTI
-SET sess:hot:{abc123} ...
-DEL sess:msg:{abc123}:0
-EXEC
-```
-
-如果没有花括号，不同 key 会散到不同 slot，事务直接被 Redis 拒绝（`CROSSSLOT error`）。
+⚠️ **没有 Redis Cluster hash tag**：实际 key 没有 `{}`，所以多个 key（hot + cold）
+在 Cluster 模式下可能落到**不同 slot**——`Delete` 用 `pipe.Del` 多 key 在 Cluster 上
+会触发 `CROSSSLOT` 错误。**单机 Redis 模式没问题，Cluster 模式是 P1 隐患**。
 
 ---
 
 ## 4. 数据模型
 
+### 4.1 `Manager` 结构（manager.go:91-103）
+
 ```go
-// manager.go:41-58
 type Manager struct {
-    rdb    *redis.Client
+    rdb    *redis.Client       // ⚠️ 不是 ClusterClient
     cfg    *config.SessionConfig
     logger *zap.Logger
-
-    // 可选：归档到持久层的回调；未设置则只在 Redis 循环
-    ColdStore func(ctx, sessionID, data *ColdSessionData) error
+    ColdStore  func(ctx, sessionID, *ColdSessionData) error  // 可选
+    Summarizer Summarizer                                     // 可选
 }
+```
 
-type ColdSessionData struct {
-    SessionID  string
-    Messages   []models.Message
-    Summary    string
-    ArchivedAt time.Time
+`ColdStore` 和 `Summarizer` 都是**可选字段**：
+
+- `Summarizer == nil` → `buildSummary` 走字符串拼接 fallback
+- `ColdStore == nil` → 归档只写 Redis `coldKey`，不落 PG / S3
+
+### 4.2 `SessionConfig`（config.go:255-261）
+
+```go
+type SessionConfig struct {
+    MaxHistoryTokens       int           // 总上下文上限
+    SummaryThresholdTokens int           // 触发归档的 token 阈值
+    TTL                    time.Duration // hotKey 的 EXPIRE 时间
+    CompactionMode         string        // "truncate" / "summarize" (未在 manager.go 中分支使用)
 }
+```
 
-// 常量：
+`validate.go:96-102` 强制：
+- `MaxHistoryTokens > 0`
+- `SummaryThresholdTokens > 0`
+- `SummaryThresholdTokens ≤ MaxHistoryTokens`
+
+⚠️ **`CompactionMode` 是声明未读**：grep `CompactionMode` 在 manager.go 里**完全不出现**，
+当前实现的压缩策略是硬编码的"先摘要 + 必要时滑窗"，**不响应这个配置**。
+
+### 4.3 常量（manager.go:78-88）
+
+```go
 const (
-    maxHotMessages = 10    // Redis 热数据最多 10 条
-    shardCount     = 4     // 分片数
+    minHotMessages = 2     // 硬下限：归档后 hot 必留至少 2 条
+    shardCount     = 4     // msgShardKey 用，但目前只在 Delete 时被引用
 )
 ```
 
-`models.Session`（见 `02_models`）：
-
-```go
-type Session struct {
-    ID        string
-    UserID    string
-    Messages  []Message    // 热数据
-    Summary   string       // 冷数据压缩出来的长摘要
-    CreatedAt time.Time
-    UpdatedAt time.Time
-}
-```
+⚠️ **`maxHotMessages = 10`** 是旧 doc 杜撰的常量，**代码里不存在**。
+实际控制热数据规模的是 `SummaryThresholdTokens` 阈值，不是消息条数。
 
 ---
 
-## 5. ★ 原子追加 `AddMessage` + Lua 脚本
+## 5. ★ 原子追加 `AddMessage`（manager.go:239）
 
-### 5.1 Lua 脚本（manager.go:159-174）
+### 5.1 Lua 脚本（manager.go:218-233）
 
 ```lua
 local key = KEYS[1]
 local msgJSON = ARGV[1]
 local ttl = tonumber(ARGV[2])
 local data = redis.call('GET', key)
-if not data then return redis.error_reply("session not found") end
-
+if not data then
+    return redis.error_reply("session not found")
+end
 local session = cjson.decode(data)
 local msg = cjson.decode(msgJSON)
 table.insert(session.messages, msg)
@@ -312,275 +298,299 @@ redis.call('SET', key, encoded, 'EX', ttl)
 return #session.messages
 ```
 
-### 5.2 Go 侧调用（manager.go:180）
+**注意**：脚本在 session 不存在时**直接 error**——不会自动创建。所以 `Create` 必须先于第一次 `AddMessage`。
+
+### 5.2 失败降级（manager.go:266-268）
 
 ```go
-AddMessage(ctx, sessionID, msg):
-  msg.TokenCount = estimateTokens(msg.Content)
-  msg.ID        = uuid.New()
-  msg.Timestamp = time.Now()
-  msgJSON       = json.Marshal(msg)
-
-  result := addMessageLuaScript.Run(ctx, rdb,
-      [hotKey(sessionID)], msgJSON, ttlSeconds, nowStr).Int()
-
-  if err: addMessageFallback(ctx, sessionID, msg)    // 兜底
-  if result > maxHotMessages:
-      go m.performHotColdSeparation(ctx, sessionID)   // 异步分离
-```
-
-### 5.3 并发问题图解
-
-没有 Lua 脚本时：
-
-```
-  Client A: GET session       →  session{msgs: [m1,m2]}
-  Client B: GET session       →  session{msgs: [m1,m2]}
-  Client A: append mA; SET    →  session{msgs: [m1,m2,mA]}
-  Client B: append mB; SET    →  session{msgs: [m1,m2,mB]}      ★ mA 丢了！
-```
-
-有 Lua 脚本时：
-
-```
-  Client A: EVAL(append mA)   ←── Redis 单线程处理
-  Client B: EVAL(append mB)
-  → result: [m1,m2,mA,mB]                                       ★ 两条都在
-```
-
-Redis 的 Lua 执行是**单线程、原子**的 —— 是 Redis 做写合并的首选武器。
-
-### 5.4 `addMessageFallback` (L215)
-
-Lua 失败（例如 session 未创建）时走传统路径：GET → append → SET。
-**不阻断请求**，仅作为降级。
-
----
-
-## 6. ★ 冷热分离 `performHotColdSeparation` (L228)
-
-```
-performHotColdSeparation(ctx, sessionID):
-  session = Get(ctx, sessionID)
-  if len(session.Messages) <= maxHotMessages: return   # 还没到阈值
-
-  archiveCount = len(session.Messages) - maxHotMessages
-  coldMsgs     = session.Messages[:archiveCount]
-
-  # 1. 异步写冷存（PG / S3 / callback）
-  go m.archiveToCold(ctx, sessionID, coldMsgs, session.Summary)
-
-  # 2. 更新摘要
-  session.Summary  = m.buildSummary(session.Summary, coldMsgs)
-  session.Messages = session.Messages[archiveCount:]
-
-  # 3. 如果摘要 + 热消息仍然超 token 阈值 → 二次压缩
-  totalTokens := calculateTotalTokens(session)
-  if totalTokens > cfg.SummaryThresholdTokens:
-      m.compressContext(session)
-
-  saveHot(session)       # 把压缩后的 session 写回
-```
-
-### 6.1 `buildSummary` (L342)
-
-**保守策略**：只做字符串拼接 + 截断，不调 LLM。LLM 摘要走 `summarizer.go`（见 §8），可选启用。
-
-```
-buildSummary(existing, messages):
-  s := existing
-  for msg in messages:
-      s += " | " + truncate(msg.Content, 100)
-  return truncate(s, 2000)
-```
-
-### 6.2 `compressContext` (L371) — 二次压缩
-
-当 session 的 `总 tokens > SummaryThresholdTokens`（配置，默认 4000）：
-
-```
-compressContext(session):
-  1. 保留最近 3 条消息不动（给 LLM 紧邻的上下文）
-  2. 其余热消息拼入 summary
-  3. session.Summary = truncate(concatedSummary, 1500)
-  4. session.Messages = last3Messages
-```
-
-这是一个"摘要再摘要"的 **二阶压缩**：第一阶（冷热分离）把 >10 条变摘要；第二阶（compressContext）让摘要不超过限定长度。
-
-### 6.3 `archiveToCold` (L314)
-
-```
-archiveToCold(ctx, sessionID, messages, summary):
-  1. 写 coldKey(sessionID) 到 Redis（压缩包，有 TTL，例如 30 天）
-  2. 如果 ColdStore 回调配置了 → 调用（PG / S3）
-```
-
-`ColdStore` 回调签名：
-
-```go
-func(ctx context.Context, sessionID string, data *ColdSessionData) error
-```
-
-外部注入点在 `main.go`：
-
-```go
-mgr.ColdStore = func(ctx, id, data) error {
-    return pgStore.ArchiveSession(ctx, id, data)
+if err != nil {
+    return m.addMessageFallback(ctx, sessionID, msg)
 }
 ```
 
+`addMessageFallback`（L278）走 `Get → append → saveHot`：**不原子**，
+仅作为 Lua 失败时（脚本编译错误、Redis 版本不支持等）的兜底。
+**生产环境正常情况绝不应该走到这里**。
+
+### 5.3 并发写丢失问题图解
+
+没有 Lua 时：
+```
+A: GET session       →  {msgs: [m1,m2]}
+B: GET session       →  {msgs: [m1,m2]}   ← 同一快照
+A: append mA; SET    →  {msgs: [m1,m2,mA]}
+B: append mB; SET    →  {msgs: [m1,m2,mB]} ★ mA 丢
+```
+
+有 Lua 时：
+```
+A: EVAL(append mA)  ←─┐
+B: EVAL(append mB)  ←─┴─ Redis 单线程串行
+→ {msgs:[m1,m2,mA,mB]}
+```
+
+Redis Lua 单线程是这种 read-modify-write 的最简洁原子方案。
+
+### 5.4 Auto-Pin 机制（manager.go:566-583）
+
+```go
+shouldAutoPin(msg) =
+  msg.Role == User &&
+  msg.Content 包含以下任一关键词（不区分大小写）:
+    "always", "never", "must", "required", "critical",
+    "important:", "note:", "remember:", "constraint:",
+    "do not", "don't forget", "make sure"
+```
+
+命中即 `msg.Pinned = true`。
+
+⚠️ **但当前压缩逻辑不读 `Pinned`**：`performHotColdSeparation` 的 `keepFrom` 计算
+（L327-360）只看 token 累加，**不会跳过 Pinned 消息**。
+这是埋点字段，等未来 context.Pruner 接管时再消费。
+
 ---
 
-## 7. 其他 CRUD 操作
+## 6. ★ 热冷分离 `performHotColdSeparation`（manager.go:310）
 
-### 7.1 `Create` (L100)
+### 6.1 触发条件（manager.go:299-304）
 
-```
-Create(ctx, userID):
-  sess := &Session{
-    ID: uuid(), UserID: userID,
-    Messages: [], CreatedAt: now, UpdatedAt: now,
-  }
-  saveHot(ctx, sess)
-  return sess
+```go
+checkAndArchive:
+  totalTokens := calculateTotalTokens(session)
+  if totalTokens > cfg.SummaryThresholdTokens &&
+     len(session.Messages) > minHotMessages:
+       performHotColdSeparation(ctx, sid)
 ```
 
-### 7.2 `Get` (L121)
+**两个条件 AND**：token 超阈值 + 至少 3 条消息（minHotMessages=2，>2 即 ≥3）。
 
-```
-Get(ctx, sessionID):
-  raw := rdb.Get(ctx, hotKey(sessionID))
-  if not exists: return ErrSessionNotFound
-  json.Unmarshal(raw, &sess)
-  return sess
-```
+### 6.2 keepFrom 算法（manager.go:327-356）
 
-极简：一次 GET + JSON 反序列化。不自动 touch TTL，避免热点 session 永远不过期。
+```go
+targetTokens := SummaryThresholdTokens * 3 / 4   // 留 25% 顶部空间
+runningTokens := estimateTokens(session.Summary)
+keepFrom := len(session.Messages)
 
-### 7.3 `GetContextWindow` (L261)
+// 从尾部向头部扫描
+for i := len-1; i >= minHotMessages; i-- {
+    runningTokens += msg[i].TokenCount
+    if runningTokens > targetTokens:
+        keepFrom = i + 1
+        break
+    keepFrom = i
+}
 
-```
-GetContextWindow(ctx, sessionID):
-  sess := Get(ctx, sessionID)
-  out  := []Message{}
-  if sess.Summary != "":
-      out.append({Role: system, Content: "Prior conversation summary: " + sess.Summary})
-  out.append(sess.Messages...)
-  return out
-```
-
-**返回给 LLM 的消息序列**：开头一条 system 级别的摘要（如有），接着是热消息。
-
-### 7.4 `Delete` (L286)
-
-```
-Delete(ctx, sessionID):
-  pipe := rdb.Pipeline()
-  pipe.Del(hotKey(sessionID))
-  pipe.Del(coldKey(sessionID))
-  for i in 0..shardCount-1:
-      pipe.Del(msgShardKey(sessionID, i))
-  return pipe.Exec(ctx)
+// 保证 keepFrom ∈ [minHotMessages, len-minHotMessages]
+if keepFrom < minHotMessages: keepFrom = minHotMessages
+if keepFrom > len-minHotMessages: keepFrom = len-minHotMessages
 ```
 
-**按单个用户级 GDPR 删除** 必须删光所有 key（hot + cold + shards），pipeline 一次批删降低 RTT。
+含义：
+- 保留**尾部最近若干条**，累计 token ≤ targetTokens（threshold 的 75%）
+- 头部前 `keepFrom` 条全部归档
+- 至少保留 minHotMessages（2 条），即使头部极大也不全归档
 
-### 7.5 `Ping` (L281)
+### 6.3 归档与摘要（manager.go:362-381）
 
-健康检查：`rdb.Ping(ctx)`，被 `/healthz` 调。
+```go
+archiveCount := keepFrom
+coldMsgs := session.Messages[:archiveCount]
+
+go archiveToCold(Background(), sid, coldMsgs, session.Summary)
+        // 异步 + Background ctx：用户请求结束不影响归档
+
+session.Summary  = buildSummary(session.Summary, coldMsgs)
+session.Messages = session.Messages[archiveCount:]
+
+// 二级压缩
+if calculateTotalTokens(session) > SummaryThresholdTokens:
+    compressContext(session)
+
+saveHot(ctx, session)
+```
+
+### 6.4 `buildSummary`（manager.go:466）
+
+```go
+if Summarizer != nil:
+    summary, err := Summarizer.Summarize(Background(), messages, existing)
+    if err == nil:
+        return summary
+    // LLM 失败 → fallback 到字符串拼接
+
+// 字符串拼接 fallback
+"Archived <N> messages. Key exchanges covered: [role]: content...; [role]: content..."
+// 总长度截断到 500 字符
+```
+
+⚠️ **`Summarizer.Summarize` 用 `context.Background()`** —— 与上层 ctx 解耦，
+所以即使主请求超时，摘要 LLM 调用仍会跑完（带超时由 LLMSummarizer 内部 ctx 兜底）。
+**当前 `LLMSummarizer` 没有内置超时**，靠 `llm.Client` 的 30s timeout 兜底。
+
+### 6.5 `compressContext`（manager.go:503）— 二级压缩
+
+只在归档后 token 仍超阈值时触发：
+
+```go
+budget := MaxHistoryTokens / 2
+// 从尾装回，累计 token > budget 时停止
+// 头部丢弃部分拼入 Summary
+```
+
+是"摘要再摘要"的兜底机制。
+
+### 6.6 `archiveToCold`（manager.go:438）
+
+```go
+cold := &ColdSessionData{SessionID, Messages, Summary, ArchivedAt}
+data := json.Marshal(cold)
+rdb.Set(ctx, coldKey(sid), data, TTL*2)   // cold key TTL 是 hot 的 2 倍
+
+if ColdStore != nil:
+    ColdStore(ctx, sid, cold)               // 投递到 PG / S3
+```
+
+**注意 TTL=`cfg.TTL*2`**：cold 比 hot 多撑 1 倍——用户 24h 后回来看历史还能找到。
+不是 _principles.go 说的"30 天"或"长期归档"。
+
+---
+
+## 7. 其他 CRUD
+
+| 方法 | 行号 | 关键行为 |
+|---|---|---|
+| `Create(userID, projectID)` | L154 | 生成 UUID，空 `projectID` 默认 `"default"`；写 hotKey |
+| `Get(sid)` | L180 | GET hotKey + GET coldKey 合并 Summary；**不刷 TTL**（防止 zombie session） |
+| `GetContextWindow(sid)` | L385 | `Get` + 把 Summary 包成 system message 前置 + Messages 拼接 |
+| `Ping(ctx)` | L405 | `rdb.Ping`，被 `/healthz` 调 |
+| `Delete(sid)` | L410 | Pipeline 删 hotKey + coldKey + 所有 msgShardKey（防御） |
+| `PinMessage(sid, msgID)` | L586 | GET → 找到 msgID 改 Pinned=true → SET |
+| `UnpinMessage(sid, msgID)` | L591 | 同上设 false |
+
+⚠️ **`PinMessage`/`UnpinMessage` 非 Lua 原子**（L596-633）：
+读-改-写 序列，**与并发 AddMessage 竞争会导致 Pin 状态丢失**。
+原因：Pin 操作不是高频，未被设计成原子。**已知 P1**。
 
 ---
 
 ## 8. 摘要器 `summarizer.go`
 
-### 8.1 接口抽象
+### 8.1 接口（summarizer.go:18-20）
 
 ```go
-// summarizer.go:18
 type Summarizer interface {
     Summarize(ctx, messages, existingSummary) (string, error)
 }
 ```
 
-两个实现：
+### 8.2 两个实现
 
-| 实现 | 质量 | 成本 | 用途 |
-|---|---|---|---|
-| `LLMSummarizer` | 高 | 调 LLM（1-2¢） | 生产环境 |
-| `SimpleSummarizer` | 低（字符串截断） | 0 | 测试 / LLM 离线 |
+| 实现 | 行 | 质量 | 成本 | 用途 |
+|---|---|---|---|---|
+| `LLMSummarizer` | L23 | 高 | 调 LLM | 生产；main.go 默认注入 |
+| `SimpleSummarizer` | L77 | 字符串截断 | 0 | 测试 / LLM 不可用 |
 
-### 8.2 `LLMSummarizer.Summarize` (L39)
+### 8.3 `LLMSummarizer.Summarize`（summarizer.go:39）
 
 ```go
-Summarize(ctx, messages, existing):
-  prompt := "Previous summary: " + existing + "\n\nNew messages:\n" +
-            formatMessages(messages) + "\n\nProduce a concise updated summary."
-
-  resp := llm.ChatCompletion({
-      Model: cfg.Summary.Model,       // 通常配个便宜的 gpt-4o-mini
-      Messages: [{system, prompt}],
-      MaxTokens: 500,
-  })
-  return resp.Content
+// chatFn 是个函数变量，避免 session 包导入 llm 包形成循环
+chatFn func(ctx, systemPrompt, userPrompt string) (string, error)
 ```
 
-注意：
+**为什么不直接持有 `*llm.Client`**？`llm` 包可能反向引用 `models` 或其他包，
+session 直接依赖 `llm.Client` 会形成循环。`func` 型注入是 Go 项目里**避免循环依赖的标准手法**。
 
-- 用 **便宜模型**（不是主 LLM），成本可控；
-- `MaxTokens: 500` 强制摘要篇幅；
-- 失败时 orchestrator 会 fallback 到 `SimpleSummarize`（不中断用户请求）。
-
-### 8.3 `SimpleSummarize` (L85)
-
+**Prompt 构造**：
 ```
-SimpleSummarize(messages, existing):
-  s := existing
-  for msg in messages:
-      s += fmt.Sprintf("[%s] %s | ", msg.Role, truncate(msg.Content, 80))
-  return truncate(s, 1500)
+[Previous Summary]: <existingSummary>
+
+[New messages to summarize (<N> messages)]:
+- [<role>]: <content 截断到 200 chars>
+...
 ```
 
-不调 LLM，**对测试极其友好**（确定性输出）。
+System prompt 强制：
+- 保留技术决策、文件名/函数名/symbol、tool 结果、未解决问题
+- 摘要 ≤ 200 词
+- 事实精确
+
+LLM 失败 → **fallback 到 `SimpleSummarize`**（**不返回错误**，保证主流程不阻塞）。
+
+### 8.4 `SimpleSummarize`（summarizer.go:85）
+
+```
+"Archived <N> messages. Key exchanges: [role]: content(80 chars)...; ..."
+// 总长度截断到 500 chars
+```
+
+确定性输出，单元测试友好。
 
 ---
 
 ## 9. 辅助函数
 
-### 9.1 `estimateTokens(text)` (L408)
+### 9.1 `estimateTokens`（manager.go:540）
 
 ```go
-return len(text) / 4   // 近似：1 token ≈ 4 字符
+func estimateTokens(text string) int {
+    return llm.FastEstimate(text)
+}
 ```
 
-**近似 vs 精确**：
+**注意是 `llm.FastEstimate`**（外部函数），**不是 `len(text)/4`**。
+具体行为见 `internal/llm/tokens.go`（一般是 byte-based ≈ char/4 经验值）。
+这是项目里唯一的 tokenizer 中心，所有包都走这个函数，保证口径一致。
 
-- 精确需要 `tiktoken` / `claude-tokenizer`，重度依赖；
-- `/4` 是 OpenAI 官方推荐的快速估算；误差在 ±20%；
-- 在 session 场景下**高估不是问题**（提早压缩 > 超窗口），所以 acceptable。
+### 9.2 `calculateTotalTokens`（manager.go:490）
 
-### 9.2 `calculateTotalTokens(session)` (L358)
+```go
+total := estimateTokens(session.Summary)
+for msg in session.Messages:
+    total += msg.TokenCount if > 0 else estimateTokens(msg.Content)
+return total
+```
 
-累加所有 message 的 tokenCount + summary 的估算值。用来触发二次压缩。
+`msg.TokenCount > 0` 时直接复用（AddMessage 时已经算过），避免重复估算。
+
+### 9.3 `shouldAutoPin`（manager.go:566）—— §5.4 已讲
 
 ---
 
-## 10. 数据淘汰与 TTL
+## 10. 实现剖析与改进方向
 
-```yaml
-# config.yaml session 部分
-session:
-  ttl: 24h                         # Redis 过期
-  summary_threshold_tokens: 4000   # 超过就二次压缩
-  max_messages: 100                # 单 session 消息数硬上限
-```
+### 10.1 当前实现的真实利弊
 
-| 场景 | 机制 |
-|---|---|
-| 热数据过期 | `SET ... EX <ttl>`，Lua 脚本会每次续期 |
-| 冷数据过期 | `coldKey` 设置更长 TTL（30 天）或落 PG |
-| 用户主动删除 | `Delete` 批量删所有 key |
-| 消息数超上限 | 触发 `performHotColdSeparation` |
+**优势（验证过的）**
+- ✅ Lua 原子 AddMessage：并发写不丢消息
+- ✅ Token 预算驱动归档：单条 50KB 消息也能触发压缩
+- ✅ Summarizer 失败自动降级：LLM 挂不影响主流程
+- ✅ 异步 `Background()` ctx 归档：用户请求结束不打断归档
+- ✅ Cold key TTL=hot*2：用户跨天回访还能拿到摘要
+
+**已知风险**
+- ⚠️ **并发归档无 lock**：连续两条 AddMessage 触发的 `performHotColdSeparation` 可能并发执行，最终靠"最后一次 SET hotKey 胜出"收敛——少量消息可能被复制归档
+- ⚠️ **Cluster 模式 CROSSSLOT**：`Delete` 用 pipeline 跨多 key，Cluster 模式会报错（key 无 hash tag）
+- ⚠️ **Pin/Unpin 非原子**：与 AddMessage 竞争会丢 Pin 状态
+- ⚠️ **CompactionMode 配置失效**：声明了但 manager.go 不响应
+- ⚠️ **`msgShardKey` 是死代码**：声明了从不写入，只在 Delete 时防御删除
+- ⚠️ **doc.go 与 _principles.go 描述与代码严重不符**：维护者读旧文档会被严重误导
+
+### 10.2 优先级修复建议
+
+**P0（生产风险）**
+1. 并发归档加 per-session lock（Redis `SET NX` 或 sync.Map）
+2. Cluster 模式给所有 key 加 hash tag `{sid}`
+
+**P1（代码质量）**
+3. 删除 `msgShardKey` 死代码或真正实现 sharded 写入
+4. PinMessage/UnpinMessage 改 Lua 原子脚本
+5. 把 `CompactionMode` 配置接入压缩逻辑（或删除字段）
+
+**P2（设计完善）**
+6. 增量摘要：每次归档时摘要只包含**新增的 K 条**而非 `prev_summary + new K`，避免 Summary 二次膨胀
+7. 实现 `Pinned` 跳过逻辑（compressContext 不归档 Pinned）
+8. Redis 故障双写降级到 Postgres
+9. `metrics`：`session_archive_total / session_token_budget_exceeded_total / session_lua_fallback_total`
 
 ---
 
@@ -588,120 +598,55 @@ session:
 
 | 抉择 | 动机 |
 |---|---|
-| **冷热分离 maxHotMessages=10** | 10 条 ≈ 5-10K tokens，单次 GET < 100KB；足够 ReAct 用 |
-| **Redis Lua 脚本原子追加** | 并发写下唯一正确解；Redis 官方推荐 |
-| **分片 shardCount=4** | 单用户 4 slot 够打散；再多 slot 恢复成本增加 |
-| **花括号 hash tag** | Cluster 模式下同 session 操作必须同 slot，事务/MULTI 前提 |
-| **摘要异步 goroutine** | 主链路 AddMessage 永远 <10ms；摘要几秒内完成 |
-| Summary 有两级 `buildSummary + compressContext` | 前者廉价字符串拼接，后者才考虑深度压缩 |
-| 默认 `buildSummary` **不调 LLM** | 安全降级：Redis 压力下也不会把 LLM 打爆 |
-| **估算 tokens = len/4** | 快；误差可接受；为什么需要精确 tokenizer 的那一天再换 |
-| ColdStore 是 **回调** 不是内置 | 让 session 包不强依赖 PG / S3；核心能力纯 Redis |
-| Lua 失败 **fallback 非原子路径** | 可用性 > 强一致；极少数 race 也能事后靠 LLM 的鲁棒性吸收 |
-| `Get` **不自动续 TTL** | 防止 zombie session（一次 get 就永不过期） |
-| Delete 批量 pipeline | shardCount 个 key 一次 RTT 完成 |
+| **单 JSON blob** 而非 HASH+LIST | Lua 原子追加简洁 + 单 GET 拿全上下文 |
+| **Lua 脚本原子 AddMessage** | Redis 单线程 = 天然原子；并发写下唯一正确解 |
+| **失败 fallback 非原子路径** | 可用性 > 强一致；极少数 race 也能被 LLM 鲁棒性吸收 |
+| **`Background()` ctx 归档** | 主请求结束不打断归档 |
+| **`Summarizer.Summarize` 内部 fallback** | LLM 挂不影响主流程 |
+| **`chatFn` 函数注入** 而非持有 `*llm.Client` | 避免 session ↔ llm 循环依赖 |
+| **Token 预算 而非消息计数** 触发归档 | 50KB 单条消息也能正确压缩 |
+| **minHotMessages=2** | 硬下限，保护退化场景 |
+| **Get 不刷 TTL** | 防止 zombie session 永不过期 |
+| **Cold TTL = hot×2** | 跨天回访保护，月级归档交给 ColdStore 回调 |
+| **`ColdStore` 是可选回调** 而非内置 PG | 核心能力不强依赖 PG / S3 |
+| **Auto-Pin 仅打标** 不强制保留 | 埋点字段，给未来 Pruner 用 |
 
 ---
 
 ## 12. 后续演进
 
-- [ ] **shardCount 动态化**：按 session 消息量自动扩大 shard（从 1 → 16）；
-- [ ] **冷数据 S3 归档**：目前 ColdStore 主要落 PG；加一个 S3 implementation 实现真冷存；
-- [ ] **精确 Tokenizer**：把 `estimateTokens` 替换为 `tiktoken` / `anthropic-tokenizer`，尤其摘要阈值判断；
-- [ ] **Session 搜索**：用户想"找我上周问的那个问题"——加 ElasticSearch 索引冷数据；
-- [ ] **Summary 去重**：多轮相似问题摘要会重复，用 embedding 相似度去重；
-- [ ] **Redis Streams 替代 JSON 数组**：天然支持追加、按 range 读、无需 GET-SET；
-- [ ] **多 session 合并视图**：用户切换 workspace 时合并相关 session 上下文；
-- [ ] **LLM 摘要 batch**：多 session 攒一批摘要减少 API 调用；
-- [ ] **Redis 键压缩**：session JSON 支持 gzip 存储，省 Redis 内存（代价：CPU）；
-- [ ] **Summary Versioning**：LLM 摘要出错时能回滚到上一版（key: `summary:v{n}:{sessionID}`）；
-- [ ] **Metrics**：`session_add_message_duration / session_compression_total / session_cold_archive_total`。
+- [ ] **per-session 归档 lock**：Redis `SETNX archiving:<sid> 1 EX 60`，避免并发归档
+- [ ] **Cluster hash tag**：所有 key 改 `sess:hot:{<sid>}`、`sess:cold:{<sid>}`
+- [ ] **增量摘要**：摘要只覆盖新归档的 K 条，旧 summary 不重写
+- [ ] **`Pinned` 真接入**：compressContext 跳过 Pinned 消息
+- [ ] **session 分支**：`ForkSession(parentID)` 让用户开探索分支
+- [ ] **跨 session 用户级汇总**：embedding + 检索
+- [ ] **Redis Streams 替代 JSON 数组**：天然 RPUSH + XRANGE，无 marshal 成本
+- [ ] **Redis 双写 Postgres**：故障降级
+- [ ] **精确 tokenizer**：把 `llm.FastEstimate` 替成 `tiktoken`/`anthropic-tokenizer`
+- [ ] **Metrics**：归档计数 / 时间 / token 直方图 / Lua fallback 计数
+- [ ] **doc.go / _principles.go 与代码对齐**：删除多 key + hash tag + 分布式锁 这些未实现描述
 
 ---
 
-## 13. 实现剖析与改进方向
+## 13. 设计教训
 
-### AddMessage 的 Redis 操作序列
+1. **设计 RFC 与实现要分文件且清晰标注**：`_principles.go` 大量 RFC 内容（多 key / hash tag / 分布式锁 / shard 写入）从未实现，**新人读会以为这就是现状**，浪费排查时间。要么真正实现，要么放进 `docs/rfc/` 并显式标注 "design only"。
 
-```text
-sess.AddMessage("user", "deploy to prod"):
-  │
-  │ 1. msgJSON := json.Marshal(Message{Role, Content, Timestamp})
-  │
-  │ 2. MULTI                                 （pipeline 一次 RTT）
-  │    RPUSH  hot:sess:abc  <msgJSON>        hot key 末尾追加
-  │    LLEN   hot:sess:abc                   返回新长度
-  │    EXPIRE hot:sess:abc  86400            重置 TTL（滑动）
-  │    HSET   meta:sess:abc  updated_at now  更新 meta
-  │    EXPIRE meta:sess:abc 86400
-  │    EXEC
-  │
-  │ 3. if newLen > maxHotMessages (默认 20):
-  │    ├ LRANGE  hot:sess:abc  0  9     拿最旧的 10 条
-  │    ├ [异步] compress(10 条) → summary
-  │    ├ APPEND cold:sess:abc  <summary>
-  │    └ LTRIM   hot:sess:abc  10  -1   hot 移除已归档的 10 条
-```
+2. **Lua 原子脚本是 Redis 写合并的首选武器**：用 Lua 杜绝并发写丢失，比"加 Go 侧 mutex"通用、比"用 WATCH+MULTI"简洁、比"用 RedLock"轻量。代价是 EVAL 比 GET+SET 慢 ~20%，但首次后 EVALSHA 接近零开销。
 
-**关键数据结构**：
-- `hot:sess:<id>` — Redis List（最近 N 条完整消息）
-- `cold:sess:<id>` — Redis String（压缩后的历史摘要，追加式）
-- `meta:sess:<id>` — Redis Hash（id / user_id / created_at / updated_at）
+3. **Token 阈值 vs 消息计数**：用 token 触发归档才能处理"单条巨大消息"的退化场景；消息计数是教科书写法但生产场景会爆。
 
-**分开 3 个 key 的理由**：
-- 每个 key 可以独立 TTL
-- 热路径只需要拉 hot + meta（小数据量 <10 KB）
-- 摘要 cold 冷数据不影响热路径延迟
+4. **`context.Background()` 用在异步后台任务**：用户请求 ctx 会随 HTTP 响应取消，绑请求 ctx 的异步 goroutine 跑到一半被打断。后台事务必须独立 ctx + 自带超时。
 
-### 压缩策略的两种模式
+5. **回调式可选依赖**：`ColdStore func(...) error` 让核心包不强依赖 PG/S3，单元测试不需要起 Postgres。这是 Go 项目常见的"依赖反转"做法。
 
-**模式 A（默认）**：后台 goroutine 压缩
-```text
-AddMessage 超阈值 → 发信号到 compressor goroutine → 立即返回给 handler
-                                                    ↓
-                              compressor: 调 LLM 摘要 → 写 cold key
-```
-- 优点：主路径不阻塞
-- 缺点：多次消息齐涌时，压缩还没跑完下一次又触发
+6. **失败降级而非失败传递**：`Summarizer.Summarize` LLM 失败时**不返回 error**，自动调用 SimpleSummarize 返回字符串结果。session 这种基础设施挂了对整个系统是灾难，必须设计成永远有结果。
 
-**模式 B（同步）**：AddMessage 阻塞到压缩完
-- 优点：保证压缩顺序
-- 缺点：handler 等 1-3s LLM 调用，用户体验差
+7. **死代码立刻清理**：`msgShardKey` 留着不写入只在 Delete 防御，新维护者必然怀疑"是不是漏接了什么写路径"。声明未用的字段或函数应该立刻删，或 `// TODO(YYYY): impl shard write` 显式标记。
 
-**当前实现**：A + 压缩锁（同一 session 最多 1 个 compress 任务）。
-
-### 利弊评估
-
-**优势（Pros）**
-- ✅ Hot/Cold 分层让热路径 <1ms
-- ✅ 自动压缩，session 再长也不会超预算
-- ✅ Key 分片防单 slot 热点
-- ✅ Redis 原生 TTL 自动清理
-- ✅ 所有状态外置，Agent Pod 随便重启
-
-**代价（Cons）**
-- ⚠️ 压缩失败（LLM 挂）会让 hot key 持续增长直到溢出
-- ⚠️ cold 是纯追加，多次压缩的 summary 叠加后质量下降
-- ⚠️ session 不支持**分支**（一个 session 两个平行 ReAct 尝试）
-- ⚠️ Redis AOF fsync 频率影响写入延迟（本机通常 everysec 够用）
-- ⚠️ 没有跨 session 的 user-level 汇总
-
-### 可改进点
-
-**P0**
-1. 压缩失败需要兜底：`summaryTemp` key 存临时摘要，失败 N 次后强制 LTRIM
-2. 添加 `session_compression_error_total` metric
-
-**P1**
-3. 增量摘要（"只摘要新增的 K 条"而非全量重新摘要）
-4. Cold 达到一定体积后用更强 LLM "重压缩"（类似 LSM-tree compact）
-5. session 分支：`ForkSession(parentID)` 创建子会话共享 cold，hot 独立
-
-**P2**
-6. Vector-store 归档：cold 转为 embedding，老话题能被 semantic search 召回
-7. 用户级汇总：跨 session 的"你最近讨论过的话题"
-8. Redis 故障时降级到 Postgres（写双份）
+8. **配置字段必须连接到行为**：`CompactionMode` 是声明未读的典型，validate 通过但实现不响应——这种"假配置"比"无配置"更糟，因为用户调它没效果还不知道为啥。
 
 ---
 
-下一篇：`13_context.md` —— Context 组装：PromptBuilder 如何把 session / RAG / 规则编织成最终 LLM 输入。
+下一篇：[`13_context.md`](13_context.md) —— Context 组装：PromptBuilder 把 session 历史 / RAG 召回 / Skill 模板 / Project Rules 拼成最终 LLM 输入的全过程。

@@ -1,1077 +1,879 @@
-# 09 · Orchestrator `internal/orchestrator`
+# 09 — Orchestrator（`internal/orchestrator`）
 
-> 代码（10 个文件，5542 行，本仓库最核心的包）：
-> - `orchestrator.go` (1403) — 主结构体 + ReAct 主循环 + HITL + 流式入口
-> - `file_tools.go` (746) — read_file / write_to_file / replace_in_file / list_files / execute_command / run_tests / edit_file
-> - `edit_engine.go` — 原子化多文件编辑（备份+回滚+lint）
-> - `auto_test_runner.go` — 编辑后自动跑测试（Go/Py/JS/Rust）
-> - `git_tools.go` (308) — git status/diff/log/branch/commit + auto-commit
-> - `project_rules.go` (305) — 扫描 `.cursorrules` / `.golangci.yml` / `pyproject.toml` 等注入 prompt
-> - `planner_bridge.go` (214) — 按意图切换到 Planner（多步规划）分支
-> - `message_pruner.go` (80) — token budget 滑动窗口
-> - `failure_tracker.go` (54) — 连续同工具失败 → 注入 "step back" 提示
->
-> 测试：`orchestrator_test.go` / `file_tools_test.go` / `git_tools_test.go` / `edit_engine_test.go` / `auto_test_runner_test.go` / `project_rules_test.go`
+> ReAct 主循环 + 三级工具分发 + HITL 拦截 + Speculative cache + 中断 + 失败追踪 + 自动测试 —— 把前 8 篇的 LLM client / RAG / Sandbox / MCP / Tools / Skill 全部捏合成一次 `/chat` 请求的完整闭环。
+
+代码：`internal/orchestrator/` 共 42 个文件、约 1.07 万行。核心三件套：
+
+| 文件                       | 行数  | 角色                                                 |
+| -------------------------- | ----- | ---------------------------------------------------- |
+| `orchestrator.go`          | 1649  | 主结构体 + `ProcessMessage` + `reactLoop` + HITL     |
+| `react_core.go`            | 361   | `reactLoopCore` 共享的逐步循环（同步/流式两条路复用） |
+| `_principles.go`           | 887   | 设计 RFC（不参与编译）                               |
+
+辅助文件按职责分组：
+
+- **工具子集**：`file_tools.go`（1005）、`git_tools.go`（362）、`lsp_tools.go`（206）、`pty_tools.go`（116）、`builtin_tools.go`（116）、`edit_engine.go`（696）
+- **桥接子集**：`planner_bridge.go`（276）、`multiagent_bridge.go`（182）、`temporal_bridge.go`（85）、`memory_bridge.go`（94）、`p1_bridge.go`（61）
+- **能力子集**：`speculative_cache.go`（254）、`auto_test_runner.go`（374）、`verification.go`（170）、`failure_tracker.go`（29）、`metacognition.go`（11）、`micro_plan.go`（38）、`context_compaction.go`（134）、`interrupt.go`（110）、`tool_transaction.go`（128）、`project_rules.go`（305）、`parallel_tools.go`（52）、`tool_metadata.go`（77）、`tool_progress.go`（21）、`message_pruner.go`（13）
+
+下文按"主体职责 + 关键路径 + 设计权衡"组织，**不**逐文件介绍 —— 每个辅助文件在主流程的对应位置都会被点到。
 
 ---
 
 ## 1. 模块定位
 
-**"Agent 的大脑。每个用户请求都在这里被翻译成一连串工具调用，直到 LLM 自己说'done'。"**
+Orchestrator 是 Code Agent 的"大脑"。它的职责可以用一行话说清：
 
-Orchestrator 同时承担**两份工作**：
+> **接收用户消息 → 维护一个 ReAct 循环 → 让 LLM 用工具达成目标 → 返回最终回答。**
 
-1. **ReAct 循环**（**默认路径**）：LLM 边思考边调工具，最多 `maxSteps` 轮 —— 适合需要现场试错的任务；
-2. **Planner 桥接**（**可选路径**）：先让 LLM 产出**静态计划**，Executor 按步执行 —— 适合已知清单的批量任务（见 `10_planner.md`）。
+但这一行话的下面藏着 13 个并行职责（按重要性排序）：
 
-并在其中做了一堆"**真正生产级 Agent 必需**"的工作：
+1. **意图分类**（`parseIntent`）—— 用 LLM 给输入打标签（`code_query` / `code_execute` / `diagnose` / `mcp_call` / `deploy` / `conversation`）；
+2. **上下文装配**（`promptBuilder.BuildPrompt`）—— 拉 session 历史 + RAG 命中 + 长期记忆，按 KV-cache-friendly 顺序拼接；
+3. **可用工具枚举**（`GetAvailableTools`）—— 合并三个 Registry 的工具定义喂给 LLM；
+4. **ReAct 循环**（`reactLoopCore`）—— `LLM → tool_calls → execute → observe → repeat`；
+5. **工具分发**（`dispatchTool`）—— MCP > internal/tools > skill 三级 fallback；
+6. **HITL 拦截**（`suspendForApproval`）—— 命中敏感模式或 `IntentDeploy` 时挂起等审批；
+7. **Speculative cache**（`toolCache.Get/Put/Invalidate`）—— 幂等工具结果按 workspace 复用；
+8. **并发工具执行**（`parallelExecuteTools`）—— 同批纯读工具并发跑；
+9. **失败检测**（`consecutiveFailureTracker`）—— 连续相同工具失败时注入"停一停"提示；
+10. **元认知**（`MetacognitiveState`）—— 跟踪信心、重复、不确定性，触发反思；
+11. **自动测试**（`RunAutoTestAfterEdit`）—— 文件写入后跑测试，结果回喂 LLM；
+12. **中断**（`InterruptSession`）—— 用户从 UI 取消/重定向/暂停；
+13. **持久化 / 审计**（`persistTaskCreate` / `persistAudit`）—— 写入 PostgreSQL（best-effort）。
 
-- **工具失败检测**（`consecutiveFailureTracker`）：同名工具连错 3 次就注入 "step back" 提示让 LLM 换思路；
-- **Token 预算管理**（`pruneMessages`）：逼近 128K 上限时按策略删旧消息；
-- **反思检查点**（`reflectionCheckpoint`）：每 10 步注入"你离目标多远？"的 meta-prompt；
-- **自适应元认知反思**（`MetacognitiveState`）：基于工具成功率和卡住程度动态注入反思，不依赖固定步数间隔。当置信度 < 30% 或卡住度 > 70% 时触发，提示 LLM 换策略或请求用户澄清；
-- **敏感内容拦截**（`containsSensitiveContent` → `suspendForApproval`）：HITL 同步挂起等前端授权；
-- **自动测试**（`AutoTestRunner`）：写完代码顺手跑 `go test ./...` 把结果塞回 LLM；
-- **项目规则注入**（`ProjectRules`）：把仓库根目录的 lint/cursor 配置摘要放进 system prompt；
-- **进度续写**（`saveProgressForContinuation`）：超时前把状态写 `.progress.json`，用户说 "continue" 就接着跑；
-- **意图缓存**（`intentCache`）：同一 session 短时间内不重复调 LLM 做意图分类；
-- **流式事件通道**（`ProcessMessageStreamFull`）：逐步把 think/tool_call/tool_result 推给前端。
+### 1.1 ReAct 循环的真实形状
+
+```
+ProcessMessage(user_msg)
+    │
+    ├─ parseIntent → IntentXxx                        # LLM 调用 #1（含 intent cache）
+    ├─ sensitive check → 命中 → suspendForApproval    # HITL 出口
+    ├─ MaybeUsePlanner → 走 DAG planner → 早退         # Planner 出口（可选）
+    │
+    └─ reactLoop
+         ├─ Build prompt（system + RAG + history + tools）
+         ├─ GetAvailableTools                          # 3 个 Registry 合并
+         ├─ reactLoopCore for step in maxSteps:
+         │    ├─ context.Done / interrupt 检查
+         │    ├─ context compaction（每 5 步）
+         │    ├─ reflection checkpoint（每 10 步）
+         │    ├─ metacognition reflection（adaptive）
+         │    ├─ micro plan 提示（每 8 步）
+         │    ├─ tool policy hint（toollearn 来）
+         │    ├─ tool distiller recommendation（首步）
+         │    ├─ token budget prune
+         │    ├─ LLM call（含 3 次指数退避重试）         # LLM 调用 #N
+         │    ├─ if no tool_calls → 终止返回           # 正常出口
+         │    ├─ 并发/串行 executeTool × N
+         │    ├─ 失败追踪 / metacognition 记录
+         │    ├─ 自动测试（如果有 file_write）          # 可能 LLM 调用 #N+1
+         │    └─ 每 5 步更新 tool policy
+         │
+         ├─ 步数耗尽 → saveProgressForContinuation
+         └─ done → verifyOutput（条件性）              # 可能 LLM 调用 #N+2
+```
+
+最大步数由 `getMaxSteps(intent)` 自适应：
+
+| Intent          | maxSteps |
+| --------------- | -------- |
+| code_query      | 10       |
+| code_execute    | 20       |
+| diagnose        | 25       |
+| mcp_call        | 15       |
+| deploy          | 20       |
+| 其它（对话/编码） | 50       |
+
+### 1.2 与"统一 Registry 神话"的差距（再次声明）
+
+Orchestrator **不持有**单一 Tool Registry。它持有三个独立来源：
+
+1. `o.toolRegistry *tools.Registry` —— 内置工具（read_file / write_file / git_* / run_tests / shell_exec 等）；
+2. `o.mcpGateway *mcp.Gateway` —— 通过匿名 interface 引用，MCP 工具；
+3. `o.skillRegistry` —— 通过匿名 interface 引用，用户运行时注册的 webhook/function。
+
+`GetAvailableTools()` 把三者**临时合并**（`orchestrator.go:1532-1545`）返回给 LLM；`dispatchTool` 按 MCP > tools.Registry > skill 顺序逐个尝试匹配（`orchestrator.go:1426-1452`）。
+
+详见 07_tools.md §1.1、08_skill.md §1.1。本文不重复展开。
 
 ---
 
-## 1.5 设计哲学：把 ReAct 从 notebook demo 拉到生产
+## 1.5 设计哲学
 
-学术界 ReAct 论文（Yao et al. 2022）只需要 50 行 Python 就能跑。但要在
-生产用，要补上**10 个必备件**。本节阐述 Orchestrator 为何这样设计。
+### Q1：为什么选 ReAct 而不是更先进的 Plan-and-Execute？
 
-### 为什么 ReAct 而不是纯 Planner？
+答：**模型自主决策 vs 显式规划的取舍**。
 
-- **ReAct**：每步问 LLM "下一步干啥"，边想边做。
-  - ✅ 处理未知的探索性任务（"帮我理解这个仓库"）
-  - ❌ 步数不可预测，平均 5-15 步，长 tail 到 50 步
-  - ❌ 每步都是 LLM 调用，贵
+- **ReAct**（本系统主路径）：每步 LLM 自己决定下一步做什么，工具结果直接回喂；优点是低延迟（无规划阶段）、容错强（LLM 看到错误就换策略）；缺点是步数可能膨胀、容易陷入"用同一锤子敲同一钉子"循环。
+- **Plan-and-Execute**（`planner_bridge.go`）：先让 LLM 生成 DAG，再按图执行；优点是步骤可视化、可并行；缺点是初次规划成本高、中间失败需要重新规划。
 
-- **Planner**（见 10_planner）：先产 DAG，批量执行。
-  - ✅ 可预测成本
-  - ❌ 静态计划，中途出错无法动态调整
-  - ❌ 写 DAG 需要 LLM 一次就"想清楚"
+本系统**两条都接**：默认走 ReAct（`reactLoop`），当 `MaybeUsePlanner` 判定输入足够复杂时切换 Planner 路径。判定规则定义在 `planner_bridge.go`，简化版："用户输入 > N 字 + 含"plan/步骤/regenerate"关键词"。
 
-**本系统：默认 ReAct，特定场景切 Planner**（`planner_bridge.go` 判定意图）。
+### Q2：为什么 ReAct 步数上限按 Intent 动态？
 
-### 10 个生产级 ReAct 要素（对应实现）
+固定步数（如旧版的 10 步）在简单问答上浪费 token（LLM 已经回答完了还要被迫继续），在编码任务上又远远不够（实测一个完整功能落地需要 30+ 步：read → edit → test → fix → re-test → ...）。
 
-| 要素 | 没它会怎样 | 本系统实现 |
-|---|---|---|
-| 1. 最大步数上限 | LLM 环路死循环 | `maxSteps` 意图动态（10-50） |
-| 2. 同工具连续失败检测 | 5 次 `read_file(x)` 都 404 还在调 | `failureTracker.go`：连续 3 次同 tool 同 err → 注入 "step back" |
-| 3. Token 预算管理 | 超上下文直接 `context_length_exceeded` | `pruneMessages` 滑动窗口 |
-| 4. 反思 checkpoint | 跑到第 30 步忘了目标 | 每 10 步注入 meta-prompt "离目标还多远" |
-| 5. 敏感内容拦截 | LLM 说要 `rm -rf /` | `sensitiveRules` 正则 + HITL |
-| 6. 工具结果截断 | `cat /dev/zero` 撑爆 | `smartTruncateOutput` 头尾保留中间省 |
-| 7. 幂等缓存 | 重复 `read_file` 浪费 token | `SpeculativeToolCache`（白名单） |
-| 8. 意图分类 + 缓存 | 每步都重新判定意图 | `parseIntent` + 按 message hash 缓存 |
-| 9. 进度续写 | 服务器重启丢任务 | `saveProgressForContinuation` 写 `.progress.json` |
-| 10. 流式可视化 | 用户以为服务卡死 | SSE 每步推 think/tool/result 事件 |
+把"目标复杂度"提前编码到 Intent 标签，再让步数随之扩张，是 LLM-agent 工程的常见模式（如 GPT-Engineer、AutoGPT）。本系统的取值（10/20/25/50）来自生产实测的 P95 步数 + 20% buffer。
 
-### 决策树：一个用户消息如何走到 Orchestrator
+### Q3：为什么 Speculative cache 的 scope 是 workspace 而不是 session？
 
-```
-ChatRequest 到达
-  │
-  ▼
-resolveWorkspace(req.WorkspaceID)
-  │ (无 → 新建；失败 → 400，不跨租户 fallback P0 #15)
-  ▼
-parseIntent(sessionID, message)
-  │ key = sessionID + sha256(message)  ← P0 #12
-  │ TTL 2min
-  │ cache miss → LLM 分类
-  ▼
-intent ──┬─ code_query     → buildSystemMessage(query) → reactLoop
-         ├─ code_execute   → 同上，但工具更丰富
-         ├─ diagnose       → 同上，带日志工具
-         ├─ deploy         → ★ 强制 HITL
-         ├─ mcp_call       → 直接走 MCP gateway
-         └─ conversation   → 直答，不进 reactLoop
-  │
-  ▼
-reactLoop(ctx, sess, taskID) 主循环
-  │
-  │ for step := 0; step < maxSteps; step++:
-  │   messages = sess.Messages + systemPrompt + repomap + rag
-  │   pruneMessages(messages, maxTokens)
-  │
-  │   resp = llmClient.ChatCompletion(messages, tools)
-  │
-  │   if resp.ToolCalls == 0:
-  │     return resp.Content   # LLM 说 "done"
-  │
-  │   for tc := range resp.ToolCalls:
-  │     if sensitive(tc.Arguments): suspendForApproval()  # HITL
-  │     result = executeTool(tc)  # ← 这里是工具调度核心
-  │     speculativeCache.Put(ws, tc.Name, tc.Args, result)
-  │     messages = append(messages, tool_result)
-  │
-  │   failureTracker.Track(tc.Name, result.IsError)
-  │   if step % 10 == 0: injectReflectionPrompt()
-  │
-  ▼
-return final assistant message
-```
+详细推理见 `speculative_cache.go:124-136` 注释，本文摘要：
 
-### "Orchestrator 持有一切" 的代价
+- **scope = sessionID**：同一 user 开两个 session 同时编辑同一项目，session-A 写 foo.txt 不会失效 session-B 的 foo.txt 读缓存 → **脏读**；
+- **scope = workspaceID**：任一 session 对 workspace X 的写都失效 X 的整个读缓存，正确性保证；
+- 代价：跨 workspace 的同名读操作无法共享（如 user 切换项目时 `read_file("README.md")` 重头跑），但语义正确性 > 命中率。
 
-当前 `Orchestrator` 结构体持有 10+ 依赖（llmClient, sessionMgr, ragEngine,
-sandboxMgr, mcpGateway, skillRegistry, workspaceMgr, store, editEngine,
-autoTestRunner, ...）。这不美，但权衡后接受：
-- 替代方案（每个方法单独 constructor 传参）让 method signature 变得难读
-- 所有字段都是 goroutine-safe 组件，没有并发风险
-- 测试时用 `NewOrchestrator(...)` 一次性装配 mock 即可
+实现：`cacheScope()` 从当前 session 解析出 workspaceID（`orchestrator.go` 内）；如果 session 未关联 workspace，fallback 到 sessionID。
 
-未来如果 Orchestrator 膨胀到 30+ 依赖，再拆成 `ToolOrchestrator` +
-`FlowOrchestrator` 两层。
+### Q4：为什么 LLM 调用要 3 次指数退避重试？
+
+LLM provider（OpenAI / Anthropic / 自部署 vLLM）在以下场景会瞬时失败：
+
+- **rate limit**（429）—— 退避后通常自愈；
+- **transient network**（5xx）—— 退避后通常自愈；
+- **circuit breaker tripped**（来自 `llm.Client`）—— 退避期间 breaker 可能 half-open 成功。
+
+`react_core.go:170-183` 写死 3 次重试 + `2^attempt` 秒退避（1s → 2s → 4s）。**不**对所有错误重试（如 401/400），但当前代码没区分错误类型 —— 是 P1 待办（见 §11）。
+
+3 次足够覆盖 99% 瞬时故障；超过 3 次说明 provider 真挂了，退化让 ReAct loop 把错误作为 observation 回喂上一层（如果用户在 SSE 流，会看到 `error` event）。
+
+### Q5：为什么并发执行只覆盖纯读工具？
+
+写工具（`edit_file` / `write_file` / `git_commit`）有副作用，并发执行会触发竞态：
+
+- 两个 `edit_file` 同时改同一文件 → 文件锁竞争 + 最后写赢；
+- `git_add` + `git_commit` 同时跑 → git index lock 冲突；
+- `run_tests` 并发 → 测试输出穿插、临时文件冲突。
+
+`canParallelExecute`（`parallel_tools.go:18-29`）只放过 `IsIdempotentTool` 通过的工具（白名单：read_file/list_dir/grep/git_status/git_diff/rag_search/rag_query/repomap/ast_outline）。
+
+收益：一次 LLM 决定调用 3 个 read_file 时，串行 = 3×RTT，并发 = 1×RTT。实测 ReAct 平均步数因此从 5.3 降到 3.8。
 
 ---
 
 ## 2. 依赖架构
 
+### 2.1 包级依赖（出向）
+
 ```
-┌─────────────── API 层 (handlers.go) ─────────────────────┐
-│  /chat (sync)       → ProcessMessage                       │
-│  /chat/stream (SSE) → ProcessMessageStreamFull             │
-│  /chat/approve      → HandleApproval                       │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-                       ▼
-            ┌────────────────────────┐
-            │     Orchestrator       │  ← 本模块
-            │  ┌───────────────────┐ │
-            │  │  reactLoop        │ │  ★ 主引擎
-            │  │  planner_bridge   │ │
-            │  │  suspendForApprv  │ │
-            │  │  saveProgress     │ │
-            │  └─────────┬─────────┘ │
-            └────────────┼───────────┘
-                         │
-        ┌────────┬───────┼───────┬────────┬────────┐
-        ▼        ▼       ▼       ▼        ▼        ▼
-    llm.Client rag.Engine sandbox mcp.Gw skill.Reg workspace.Mgr
-    session.Mgr           Mgr                      store.Store
-    PromptBuilder                                  audit.Logger
-      │
-      ├─ ProjectRules (rule_loader)
-      ├─ EditEngine (precision edit + lint)
-      ├─ AutoTestRunner (tdd loop)
-      └─ failureTracker (fix-loop detector)
+                  ┌─────────────────────────────┐
+                  │      Orchestrator            │
+                  └─┬───┬───┬───┬───┬───┬───┬───┘
+                    │   │   │   │   │   │   │
+       ┌────────────┘   │   │   │   │   │   └──────────────┐
+       │                │   │   │   │   │                  │
+       ▼                ▼   ▼   ▼   ▼   ▼                  ▼
+ ┌──────────┐    ┌──────────┐ ┌──────┐ ┌──────────┐  ┌──────────┐
+ │ llm      │    │ rag      │ │ mcp  │ │ session  │  │ sandbox  │
+ │ .Client  │    │ .Engine  │ │      │ │ .Manager │  │ .Manager │
+ └──────────┘    └──────────┘ └──────┘ └──────────┘  └──────────┘
+
+           ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌──────────┐ ┌──────────┐
+           │ tools    │ │ skill    │ │ store   │ │ context  │ │ workspace│
+           │ .Registry│ │ .Registry│ │ pg ←opt │ │ .Builder │ │ .Manager │
+           └──────────┘ └──────────┘ └─────────┘ └──────────┘ └──────────┘
+
+           ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+           │ memory   │ │ toollearn│ │ agentloop│ │ multiagent│  ← 桥接，按需注入
+           │ ←opt     │ │ ←opt     │ │          │ │ ←opt     │
+           └──────────┘ └──────────┘ └──────────┘ └──────────┘
+
+           ┌──────────────────────────────────────────┐
+           │ Temporal (via TemporalClient interface)  │ ← 占位，未真正接线
+           └──────────────────────────────────────────┘
 ```
+
+### 2.2 强依赖 vs 可选依赖
+
+`NewOrchestrator` 必填参数（`orchestrator.go:157-167`）：
+
+```go
+func NewOrchestrator(
+    llmClient *llm.Client,         // ❗ 必填
+    sessionMgr *session.Manager,   // ❗ 必填（Redis-backed）
+    ragEngine *rag.Engine,         // ⚠ 允许 nil（启动时 Qdrant 不通会被 main.go 置 nil）
+    sandboxMgr *sandbox.Manager,   // ⚠ 允许 nil（Docker 不通时）
+    mcpGateway *mcp.Gateway,       // ⚠ 允许 nil
+    securityCfg *config.SecurityConfig,  // ❗ 必填
+    logger *zap.Logger,            // ❗ 必填
+    pgStore ...*store.Store,       // ⚠ varargs，nil 视为无持久化
+) *Orchestrator
+```
+
+通过 setter 后注入的（避免 import cycle / 启动顺序问题）：
+
+```go
+SetSkillRegistry(...)           // skill 包通过 interface 注入
+SetWorkspaceManager(...)        // workspace 包
+SetTemporalClient(...)          // temporal_bridge.go
+SetMemoryStore / SetMemoryExtractor / SetMultiagent / AttachPlanner / AttachSupervisor
+SetToolLearnStore(...)          // toollearn 持久化
+SetPTYManager / SetLSPClient / SetTreeSitterParser  // P1 能力
+```
+
+每个可选依赖在使用前都 `if o.xxx == nil { return ... }`，缺失不 panic。这是 main.go 用 `Warn + continue` 而不是 `Fatal` 的前提条件。
+
+### 2.3 入向依赖
+
+只有一个真实调用方：`internal/api`。所有 API handler（chat / approval / interrupt / tools-list）都通过 `Server.orchestrator` 调用本包。
+
+`internal/temporal` 反向引用 Orchestrator（通过 TemporalClient interface 桥接），是为了让 Temporal workflow activity 能调用回 `ProcessMessage`（绕过 HITL 二次拦截）。
 
 ---
 
 ## 2.5 数据流总览
 
-### 2.5.1 端到端请求处理
+### 流 1：标准 `/chat` 请求（同步）
 
-```text
-┌───────────────────────┐
-│ ChatRequest           │
-│ {sessionID, message,  │
-│  workspaceID}         │
-└───────────┬───────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│ resolveWorkspace(req.WorkspaceID)                            │
-│   无 → CreateForSession; 失败 → 400 error                   │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ (*Workspace)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ parseIntent(sessionID, msg)                                  │
-│   cache key = sessionID + sha256(msg)                       │
-│   cache hit → 直接返回                                       │
-│   cache miss → 调 LLM 分类 → 缓存结果                       │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ (TaskIntent)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Intent 路由:                                                 │
-│                                                              │
-│  conversation → 直答 (不进 ReAct)                            │
-│  code_query / code_execute / diagnose → ReAct ★             │
-│  deploy / admin (危险) → 强制 HITL 审批                      │
-│  complex + multi-step → Planner 路径                         │
-└─────────┬─────────────────────────┬─────────────────────────┘
-          │ (ReAct 路径 ★)           │ (Planner 路径)
-          │                         ▼
-          │              ┌─────────────────────┐
-          │              │ planner.CreatePlan  │
-          │              │ → DAG Execute       │
-          │              │ (详见 10_planner)   │
-          │              └──────────┬──────────┘
-          │                         │
-          ▼                         │
-┌──────────────────────┐            │
-│ reactLoop() ★       │            │
-│ (见 §2.5.2)         │            │
-└──────────┬───────────┘            │
-           │                        │
-           └────────────┬───────────┘
-                        │ (final content)
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ sess.AddMessage(assistant, content)                           │
-│ store.UpdateTaskState(Completed)                             │
-│ audit.Log(task_completed, ...)                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-              ┌────────────────────────┐
-              │ ChatResponse / SSE done│
-              └────────────────────────┘
+```
+HTTP POST /api/v1/chat
+    │
+    ▼
+api/chat_handler → orch.ProcessMessage(sessionID, userMsg)
+    │
+    ├─ task := new Task{UUID, sessionID, ...}
+    ├─ persistTaskCreate (PostgreSQL, best-effort)
+    │
+    ├─ if userMsg == "continue" → buildContinuationPrompt
+    │     从 workspace 读 .progress.json + .plan.md + tree
+    │     拼接成富 context 回灌 userMsg
+    │
+    ├─ session.AddMessage(role=user)
+    │
+    ├─ parseIntent(userMsg)
+    │     ├─ intentCache 查 LRU（key = hash(userMsg), TTL=5min）
+    │     ├─ miss → LLM 调用判定 → cache.Put
+    │     └─ task.Intent = 结果
+    │
+    ├─ containsSensitiveContent(userMsg) || Intent==Deploy
+    │     → suspendForApproval
+    │     ├─ Temporal path?  → temporal_bridge.go
+    │     └─ in-process path：approvalCh + 30 分钟 timeout
+    │
+    ├─ MaybeUsePlanner(task)?  → planner 路径，早退
+    │
+    └─ reactLoop(task)
+         ├─ RAG retrieve（仅 IntentCodeQuery / Diagnose）
+         ├─ promptBuilder.BuildPrompt 装配 messages
+         ├─ GetAvailableTools 合并 3 个 Registry
+         ├─ reactLoopCore（详见流 2）
+         │     ↓ returns content
+         │
+         ├─ shouldVerifyOutput? → verifyOutput（LLM 调用）
+         │     失败 → 追加 verification feedback
+         │
+         └─ session.AddMessage(role=assistant) + extractMemoriesAsync
+    │
+    ▼
+HTTP 200 { session_id, task_id, message, state }
 ```
 
-### 2.5.2 ReAct 主循环内部数据流
-
-```text
-         ┌─── step = 0 ──────────────────────────────────────┐
-         │                                                    │
-         ▼                                                    │
-┌─────────────────────────────────────────┐                   │
-│ buildMessages:                          │                   │
-│  systemPrompt (immutable prefix)        │                   │
-│  + projectRules (CLAUDE.md 等)          │                   │
-│  + repoMap (结构视图)                    │                   │
-│  + RAG chunks (相关代码)                 │                   │
-│  + session history                      │                   │
-│  + current user message                 │                   │
-│                                          │                   │
-│ pruneMessages(128K token budget)         │                   │
-│ reflectionCheckpoint (每10步注入反思)     │                   │
-└──────────────────┬──────────────────────┘                   │
-                   │ (messages + tools definitions)            │
-                   ▼                                           │
-┌─────────────────────────────────────────┐                   │
-│ 【LLM API】 ChatCompletion              │                   │
-│  失败 → 重试 3次 (指数退避)             │                   │
-│  彻底失败 → saveProgress → return error │                   │
-└──────────────────┬──────────────────────┘                   │
-                   │ (ChatResponse)                            │
-                   ▼                                           │
-       ┌───────────┴───────────┐                              │
-       │ ToolCalls == 0?       │                              │
-       ├── YES ───▶ return content (完成)                     │
-       └── NO ────┘                                           │
-                   │                                           │
-                   ▼  for each tool_call:                      │
-┌─────────────────────────────────────────┐                   │
-│ ① containsSensitiveContent?             │                   │
-│    + requireApprovalCommands match?     │                   │
-│    YES → suspendForApproval → 等待信号  │                   │
-│    (前端 approve/reject → 恢复/中止)    │                   │
-│                                          │                   │
-│ ② executeTool(toolCall):                │                   │
-│    switch name:                         │                   │
-│      builtin (read/write/patch/run_     │                   │
-│        tests/git_*) → 本地执行          │                   │
-│      "sandbox_*" → sandbox.Execute     │                   │
-│      "rag_*"     → rag.Retrieve        │                   │
-│      "mcp_*"     → mcp.CallTool        │                   │
-│      其他        → skill.Execute        │                   │
-│                                          │                   │
-│ ③ smartTruncate(result):                │                   │
-│    result > 20K chars?                  │                   │
-│    → 保留 head 8K + tail 12K + 省略标记 │                   │
-│                                          │                   │
-│ ④ failureTracker.Track():               │                   │
-│    连续 3次失败 → inject step-back msg  │                   │
-│    (引导 LLM 换策略)                     │                   │
-│                                          │                   │
-│ ⑤ EditEngine 后续 (如有文件编辑):       │                   │
-│    → lint 检查 → 失败则 rollback .bak   │                   │
-│    → AutoTestRunner: 跑相关测试          │                   │
-│    → 测试结果注入为 system message       │                   │
-└──────────────────┬──────────────────────┘                   │
-                   │ (tool_result messages 追加)               │
-                   │                                           │
-                   │  step++ < maxSteps?                       │
-                   └── YES ───────────────────────────────────┘
-                   │
-                   ▼ (超过 maxSteps)
-          saveProgressForContinuation()
-          return "Hit max steps, send 'continue'"
-```
-
----
-
-## 3. Orchestrator 结构体
-
-```go
-// orchestrator.go:49-83
-type Orchestrator struct {
-    llmClient      *llm.Client
-    sessionMgr     *session.Manager
-    ragEngine      *rag.Engine
-    sandboxMgr     *sandbox.Manager
-    mcpGateway     *mcp.Gateway
-    promptBuilder  *agentctx.PromptBuilder         // 见 13_context
-    securityCfg    *config.SecurityConfig
-    sensitiveRules []*regexp.Regexp                // pre-compiled 正则
-    workspaceMgr   *workspace.Manager              // 见 14_workspace
-    skillRegistry  interface{ /* 鸭子类型避免循环 import */ }
-    store          *store.Store                    // 可 nil
-    logger         *zap.Logger
-
-    editEngine     *EditEngine                     // 精准编辑
-    autoTestRunner *AutoTestRunner                 // TDD 闭环
-
-    // HITL
-    approvalMu sync.RWMutex
-    approvalCh map[string]chan models.ApprovalResponse
-
-    // 意图缓存
-    intentCacheMu sync.RWMutex
-    intentCache   map[string]intentCacheEntry
-
-    // 可选 planner
-    planner *plannerComponents
-}
-```
-
-几个值得停下细说的字段：
-
-| 字段 | 用途 | 避坑点 |
-|---|---|---|
-| `skillRegistry` 是 interface | 避免 orchestrator 包直接 import skill 包（**防止循环依赖**） | 换实现只要满足 `GetToolDefinitions / FindSkill / Execute` 三个方法 |
-| `sensitiveRules []*regexp.Regexp` | 启动时一次性编译，避免每次请求重编译 | 见 `NewOrchestrator` 的循环编译 |
-| `approvalCh` 是 `map[taskID]chan` | 一个 task 一个 channel，防止不同 task 串扰 | **必须**在 `HandleApproval` 里 close 并 delete，否则 goroutine/memory 泄漏 |
-| `intentCache` ⚠ P0 #12 修复 | 缓存 key 现在是 `sessionID + sha256(message)`，不只是 sessionID。避免"首条 code_query → 后续 deploy 直接绕过 HITL"。另带 `intentCacheMaxEntries=2048` LRU 淘汰防内存泄漏 | 详见 §9.4 |
-
-### 3.1 intentCache 的回归故事（P0 #12）
-
-```text
-（修复前）
-T0: user → "show me the code"        → intent=code_query（入缓存 key=sessionID）
-T5: user → "deploy to prod"          → 缓存命中 code_query（✗ 应该是 IntentDeploy → 触发 HITL）
-                                         ← 结果：敏感指令直接绕过审批
-
-（修复后）
-T0: user → "show me the code"        → key = sessionID:sha256("show...") → 入缓存
-T5: user → "deploy to prod"          → key = sessionID:sha256("deploy...") → 不同 key → MISS
-                                       → 重走 LLM 分类 → IntentDeploy → HITL
-```
-
-**代码位置**：`orchestrator.go:960-1000`
-```go
-func intentCacheKey(sessionID, userMessage string) string {
-    h := sha256.Sum256([]byte(userMessage))
-    return sessionID + ":" + hex.EncodeToString(h[:16])
-}
-```
-
-测试回归：`TestIntentCacheKey_IncludesMessage`（两条不同消息产生不同 key）
-+ `TestEvictIntentCacheLocked_BoundsGrowth`（LRU 不超过 2048 条）。
-
----
-
-## 4. 入口：`ProcessMessage` & `ProcessMessageStreamFull`
-
-### 4.1 `ProcessMessage` (L154) — 同步一次请求
-
-```go
-ProcessMessage(ctx, sessionID, userMsg) → *ChatResponse:
-  1. sess := sessionMgr.GetOrCreate(sessionID)
-  2. sess.AppendUser(userMsg)
-  3. task := Task{ID, SessionID, UserInput, State: Pending}
-     persistTaskCreate(task)
-  4. intent := parseIntent(ctx, sessionID, userMsg)          // 带缓存
-     task.Intent = intent
-
-  5. if containsSensitiveContent(userMsg):                   // 敏感 → HITL
-        return suspendForApproval(ctx, task)
-
-  6. // 先问 planner 愿不愿意接
-     if resp, used, err := MaybeUsePlanner(ctx, task); used:
-         return resp, err
-
-  7. content, err := reactLoop(ctx, task)                    // ★ ReAct
-  8. persistTaskState(task, Completed / Failed)
-     persistAudit(...)
-  9. sess.AppendAssistant(content)
-     return &ChatResponse{Content: content, TaskID: task.ID}
-```
-
-### 4.2 `ProcessMessageStreamFull` (L723) — 流式事件通道
-
-返回 `<-chan models.ReactStreamEvent`，事件类型包括：
-
-| type | payload | 时机 |
-|---|---|---|
-| `thinking` | LLM 的自由文本增量 | 流式 token |
-| `tool_call` | `{name, args}` | LLM 决定调工具时 |
-| `tool_result` | `{tool_call_id, content, is_error}` | 工具返回 |
-| `step_done` | `{step, max_steps}` | 每轮结束 |
-| `suspended` | `{task_id, reason}` | 命中敏感规则 |
-| `done` | `{content}` | 全部完成 |
-| `error` | `{message}` | 异常 |
-
-前端 ChatPage 用 EventSource 接这个通道 —— 见 `17_api`。
-
----
-
-## 5. ★ ReAct 主循环 `reactLoop` (L272-454)
-
-这是**本包最核心的 180 行**，逐段拆解：
-
-### 5.1 准备阶段
-
-```go
-// 5.1.1 拿 session
-sess, _ := sessionMgr.Get(ctx, task.SessionID)
-
-// 5.1.2 仅对"代码查询/诊断"类意图调 RAG
-var codeChunks []models.CodeChunk
-var relevanceScores []float64
-if intent in {IntentCodeQuery, IntentDiagnose}:
-    results, _ := ragEngine.Retrieve(ctx, userInput, nil)
-    metrics.RAGChunksReturned.Observe(len(results))
-    ...
-
-// 5.1.3 让 PromptBuilder 装配
-promptBuilder.UpdateLongTermMemory(sess.Summary)
-messages := promptBuilder.BuildPrompt(sess, codeChunks, scores, userInput)
-messages[0] = buildSystemMessage(intent)            // 覆盖 system 为意图定制版
-
-// 5.1.4 工具清单
-tools := getAvailableTools()
-
-// 5.1.5 运行时状态
-maxContextTokens := 128000                          // Opus 200K，留 72K 给输出/headroom
-failTracker      := &consecutiveFailureTracker{}
-maxSteps         := getMaxSteps(intent)             // 10 / 15 / 20 / 25
-```
-
-### 5.2 主循环（每轮 = 一次 LLM + 多工具）
+### 流 2：reactLoopCore 单步细节
 
 ```
 for step := 0; step < maxSteps; step++:
+    globalStep++
 
-  ┌─ Reflection injection every 10 steps
-  │    if reflectionCheckpoint(step) ≠ nil:
-  │        messages = append(messages, reflection)
-  │
-  ├─ Token budget check
-  │    if Σtokens(messages) > 128K:
-  │        messages = pruneMessages(messages, 128K)     # 见 §10
-  │
-  ├─ LLM call WITH RETRY (3 次指数退避 2s/4s)
-  │    resp, err := llm.ChatCompletion({messages, tools})
-  │    if err after 3 attempts:
-  │        saveProgressForContinuation(task)            # 写 .progress.json
-  │        return "LLM failed, send 'continue' to resume"
-  │
-  ├─ Termination
-  │    if len(resp.ToolCalls) == 0:
-  │        return resp.Content            # 🎉 LLM 决定"done"
-  │
-  ├─ Append assistant message (含 ToolCalls)
-  │
-  └─ For each tool_call tc:
-        result, execErr := executeTool(ctx, tc)
-        content := result.Content or "Error: ..."
+    ├─ ctx.Done? → 提早返回
+    ├─ interruptCh 非空? → 处理 cancel/redirect/pause
 
-        # 记录编辑过的文件 → 为后面 auto-test 准备
-        if tc.Name in {edit_file, write_file, patch_file} and ok:
-            editedFilePaths.append(args.path)
+    ├─ compactEarlyMessages(messages, step)
+    │     ├─ truncate 模式（默认）：head 400 + 中间省略 + tail 400
+    │     └─ summarize 模式：LLM 调用生成 2-3 句摘要（5s timeout）
+    │     仅对 RoleTool 消息 + 保留最近 3 条
 
-        # Smart truncation: 8K→32K 字符，保头 8K + 尾 12K
-        if tokens > 8K:
-            content = head[8K] + "…middle truncated…" + tail[12K]
+    ├─ reflectionCheckpoint：每 10 步注入「检查计划」system 消息
+    ├─ meta.NeedsReflection? 注入自适应反思
+    ├─ microPlanPrompt：每 8 步让 LLM 申报"接下来 3 步计划"
+    ├─ toolPolicy.FormatContextHint(lastToolName)
+    ├─ toolDistiller.FormatRecommendation（首步）
 
-        # 塞一条 tool-role 消息
-        messages.append({role:"tool", content, tool_call_id: tc.ID})
+    ├─ Token budget check：总 token > maxContextTokens → pruneMessages
 
-        # Fix-loop 检测 → 连错 3 次注入 step-back
-        if failTracker.track(tc.Name, isErr):
-            messages.append(failTracker.stepBackMessage())
+    ├─ LLM 调用（3 次重试，指数退避）
+    │     ├─ tools 字段 = GetAvailableTools 结果
+    │     └─ responseFormat 可选（结构化输出）
 
-  # 每轮末：对编辑过的文件自动跑测试
-  if editedFilePaths ≠ []:
-      testResult := RunAutoTestAfterEdit(editedFilePaths)
-      if testResult:
-          messages.append({role:"system", content: testResult.FormatForLLM()})
+    ├─ resp.Content != "" → emit thinking / message event
 
-end for
+    ├─ len(resp.ToolCalls) == 0:
+    │     ├─ meta.NeedsReflection && step > 2 && !verificationAttempted:
+    │     │     注入「确认信心」system 消息，continue（不返回，再问一轮）
+    │     └─ 返回 final answer
 
-# ── maxSteps 用完 ──
-saveProgressForContinuation(task)
-return "⚠️ Hit max 50 steps. Send 'continue' to resume."
+    ├─ messages.append(assistant, resp.Content, resp.ToolCalls)
+
+    ├─ canParallelExecute(toolCalls)?
+    │     ├─ Y: parallelExecuteTools → 并发跑
+    │     └─ N: 串行 executeTool，注入 progress callback
+
+    ├─ for each tool result:
+    │     ├─ 智能截断（>32K chars 时保留头 8K + 尾 12K）
+    │     ├─ ClassifyToolError + adaptiveFB.BuildFeedback（追加 [SYSTEM HINT]）
+    │     ├─ meta.RecordOutcome
+    │     ├─ emit tool_result event
+    │     ├─ messages.append(tool, content, toolCallID)
+    │     ├─ failTracker.track → 重复失败时插入 stepBackMessage
+
+    ├─ if 有 file_write tools (triggersAutoTest):
+    │     ├─ RunAutoTestAfterEdit
+    │     └─ messages.append(system, test report)
+
+    └─ if step % 5 == 0: toolPolicy.Update()
+
+步数耗尽 → return hitStepLimit=true → 上层 saveProgressForContinuation
 ```
 
-### 5.3 `getMaxSteps` 分档
+### 流 3：executeTool 内部
+
+```
+executeTool(tc):
+    ├─ RiskLevel >= 2 && !skipHITL(ctx)?
+    │     → 直接返回 IsError=true（不进入审批流，只是阻断）
+    │     ⚠ 真实 HITL 在更上层 sensitive check，本处仅"硬阻断"
+    │
+    ├─ toolCache.Get(scope, name, args)?  → 命中直接返回
+    │
+    ├─ captureForTransaction(tc)  → 写工具时记录 baseline 供回滚
+    │
+    ├─ dispatchTool:
+    │     ├─ Tier 1: mcpGateway.FindServerForTool → CallTool
+    │     ├─ Tier 2: toolRegistry.Get → Execute
+    │     ├─ Tier 3: skillRegistry.FindSkill → Execute
+    │     └─ 全部 miss → ToolResult{IsError, "Unknown tool"}
+    │
+    ├─ toolCollector.Record（toollearn 反馈）
+    │
+    ├─ toolCache.Put（仅成功 + 幂等工具）
+    │
+    └─ toolCache.shouldInvalidate? → toolCache.Invalidate(scope)
+```
+
+### 流 4：HITL Approval 闭环
+
+```
+sensitive check 命中
+    │
+    ▼
+suspendForApproval(task)
+    │
+    ├─ temporalClient != nil?
+    │     → suspendForApprovalTemporal（temporal_bridge.go）
+    │     ⚠ 当前 main.go 不 wire temporal worker，路径不可达
+    │
+    └─ suspendForApprovalInProcess:
+         ├─ HITLPendingGauge.Inc
+         ├─ approvalCh[taskID] = make(chan, 1)
+         ├─ approvalRequest := {taskID, sessionID, action, risk, details}
+         │
+         ├─ go: 等 30 分钟
+         │      select <-ch: approved → reactLoop(skipHITL ctx)
+         │      select <-ch: rejected → done
+         │      <-timeout → HITLApprovalTotal{"timeout"} ++ + 记日志
+         │
+         └─ return ChatResponse{State: Suspended, Approval: ...}
+                ↓
+            前端 SSE/WS 收到 approval_request 事件，弹窗
+                ↓
+            用户点击 → POST /api/v1/approval
+                ↓
+            HandleApproval(resp)
+                ├─ Temporal? → HandleApprovalTemporal
+                └─ in-process: approvalCh[taskID] <- resp（非阻塞）
+                       ↓ 唤醒上面 goroutine
+                ↓
+            ChatResponse{State: Executing, "approved"}
+```
+
+### 流 5：中断信号
+
+```
+用户点击 UI "Cancel"
+    │
+    ▼
+HTTP POST /api/v1/sessions/:id/interrupt {type: "cancel"}
+    │
+    ▼
+api → orch.InterruptSession(sessionID, signal)
+    │
+    ├─ interruptCh[sessionID] 存在?
+    │     ├─ 是：select case ch <- signal: default
+    │     │      （buffer=1，已有信号则 drop 新的）
+    │     └─ 否：return false（无活跃 loop）
+    │
+    ▼
+reactLoopCore 下一次迭代开头：
+    select <-interruptCh:
+        case "cancel":   返回 "Task cancelled by user"
+        case "redirect": 返回 "" + 触发外层 redirect（实际未接入主流程）
+        case "pause":    返回 "Task paused"
+```
+
+⚠ **interrupt 仅在迭代边界检查**，正在执行中的 tool（如长 shell 命令）不会被打断。这是 Go 标准 context.Done 模式 —— 工具本身需检查 ctx 才能响应。当前 `executeTool` 已传递 ctx 给下游，但 `parallelExecuteTools` 内的 wg.Wait 不响应 ctx，是潜在 P1。
+
+---
+
+## 3. Orchestrator 结构体字段（`orchestrator.go:62-148`）
+
+按职责分组解读 35 个字段（实际数量随版本变化）：
+
+### 3.1 必填依赖
 
 ```go
-// orchestrator.go:31
-exploration / analysis → 15
-coding                → 20
-debugging             → 25
-default               → 10
+llmClient      *llm.Client
+sessionMgr     *session.Manager
+ragEngine      *rag.Engine               // 允许 nil
+sandboxMgr     *sandbox.Manager          // 允许 nil
+mcpGateway     *mcp.Gateway              // 允许 nil
+promptBuilder  *agentctx.PromptBuilder
+securityCfg    *config.SecurityConfig
+sensitiveRules []*regexp.Regexp          // 启动时编译，hot path 直接 match
+logger         *zap.Logger
+store          *store.Store              // PostgreSQL，nil = 禁用持久化
 ```
 
-设计动机：
-
-- debugging 因为常要反复改错+跑测试，给 25；
-- 纯聊天 / 简单查询给 10，省 LLM 花销；
-- 数字不暴露给配置，**故意硬编码** —— 避免运营同学调大到 1000 造成灾难。
-
-### 5.4 智能截断为什么是 head/tail 而不是 head
-
-很多错误信息（stack trace / test FAIL）**都在输出末尾**。只留 head 的话 LLM 看不到关键的 `expected X got Y`，无法自修复。所以故意保留**尾部更大权重**（head 8K / tail 12K）。
-
----
-
-## 6. HITL 挂起/恢复
-
-### 6.1 `suspendForApproval` (L578) — 发现敏感指令
+### 3.2 三个 Tool 来源
 
 ```go
-suspendForApproval(ctx, task):
-  # 1. 生成一个 buffered channel
-  ch := make(chan models.ApprovalResponse, 1)
-  approvalMu.Lock()
-  approvalCh[task.ID] = ch
-  approvalMu.Unlock()
-
-  # 2. 更新 task 状态 + 审计
-  persistTaskState(task, Suspended)
-  persistAudit(ctx, task.ID, userID, "SUSPEND", "HIGH")
-
-  # 3. 返回给前端（前端此时显示"需要您的批准"按钮）
-  return ChatResponse{
-    State:   Suspended,
-    TaskID:  task.ID,
-    Message: "Sensitive operation detected, awaiting approval.",
-    PendingCommand: extractedCommand,
-  }
+toolRegistry  *tools.Registry            // 内置工具
+mcpGateway    *mcp.Gateway               // 同上
+skillRegistry interface{...}             // 通过 setter 注入，匿名 interface
 ```
 
-### 6.2 `HandleApproval` (L642) — 前端回调恢复
-
-```
-POST /chat/approve { task_id, approved, comment }
-   → HandleApproval(ctx, resp):
-        approvalMu.RLock
-        ch := approvalCh[taskID]
-        approvalMu.RUnlock
-        if ch == nil: 404
-
-        ch <- resp        # 唤醒挂起的 goroutine
-        approvalMu.Lock
-        delete(approvalCh, taskID); close(ch)
-        approvalMu.Unlock
-```
-
-**并不是真的同步等 channel**，而是：挂起后直接返回 `State=Suspended`，前端显示授权 UI，再发一次 `/chat` 带上 `task_id + resume` 就重新进入 reactLoop。
-
-### 6.3 敏感规则
+### 3.3 ReAct 辅助能力
 
 ```go
-containsSensitiveContent(input):
-  for _, re := range sensitiveRules:
-      if re.MatchString(input):
-          return true
-  return false
+editEngine       *EditEngine             // 精准编辑（unique-match + backup + lint）
+autoTestRunner   *AutoTestRunner         // TDD 自检环
+toolCache        *SpeculativeToolCache   // 幂等工具结果缓存
+ruleLoader       *RuleLoader             // 项目规则注入（.agentrules.md）
+trajectoryMem    *agentloop.TrajectoryMemory   // 成功轨迹复用
+maxContextTokens int                     // 动态 token budget（来自 LLM provider config）
+compactionMode   string                  // "truncate"（默认）或 "summarize"
 ```
 
-`sensitiveRules` 来源于 `config.SecurityConfig.SensitivePatterns` —— 默认包含 `DROP\s+(DATABASE|TABLE)`, `rm\s+-rf\s+/`, `kubectl\s+delete`, `prod|production` 等，可外部配置扩展。
-
----
-
-## 7. 意图解析与缓存 `parseIntent` (L950)
-
-```
-parseIntent(ctx, sessionID, userMsg):
-  key := sha256(sessionID + userMsg)
-  if cache[key].expiresAt > now: return cached
-
-  # 用一个廉价的小模型（gpt-4o-mini）专门做 intent 分类
-  resp := llmClient.ChatCompletion({Model: "cheap", Messages: [...]}
-  intent := parse(resp.Content)   # 提取 JSON
-
-  cache[key] = {intent, expiresAt: now + 10s}
-  return intent
-```
-
-**10s TTL** 的来由：
-
-- 用户往往在几秒内重复按 Enter（多次点击）；
-- 10s 既不会因为话题切换保留陈旧意图，又能拦住大部分重复；
-- 若 LLM 本身跑在本地/免费 → 其实可以直接关掉缓存，代价几乎为 0。
-
----
-
-## 8. 系统提示组装 `buildSystemMessage` (L1013)
-
-整合四块信息：
-
-```
-SYSTEM = base_prompt_for_intent        # 按意图选模板（coding/debug/exploration）
-       + workspace_context              # 当前 workspace 的 repo map 摘要
-       + project_rules_summary          # ProjectRules.FormatForSystemPrompt()
-       + rag_hint                       # "Relevant code snippets are already attached"
-```
-
-其中 `project_rules_summary` 来自 `project_rules.go`：
-
-| 文件 | 抽什么摘要 |
-|---|---|
-| `.golangci.yml` | 启用的 linters + 关键规则 |
-| `.cursorrules` / `CLAUDE.md` | 原文注入（<2KB 截断） |
-| `pyproject.toml` | `[tool.ruff] / [tool.black]` 配置行 |
-| `tsconfig.json` | `strict` / `noImplicitAny` 等关键开关 |
-| `.eslintrc*` | 原文注入 |
-
-这些摘要**只在 system prompt 里出现一次**，不占后续 tool result 的 budget。
-
----
-
-## 9. 工具调度子系统
-
-### 9.1 `executeTool` (L1222) — 分派器
-
-```
-executeTool(ctx, tc):
-  # 顺序：builtin → skill → mcp
-  switch tc.Name:
-    case "execute_code":    return toolExecuteCode(ctx, tc.Args)    # sandbox
-    case "search_code":     return toolSearchCode(ctx, tc.Args)     # rag
-    case "read_file"/"write_file"/"patch_file"/"list_files"/
-         "create_directory"/"run_tests"/"edit_file"/"run_cmd":
-        return file/git/edit handlers                                # workspace
-    case "git_*":           return gitTool(ctx, ws, tc.Args)
-    default:
-        # skill 优先
-        if skill, ok := skillRegistry.FindSkill(tc.Name); ok:
-            return skillRegistry.Execute(ctx, tc.Name, tc.Args)
-        # 最后 mcp
-        if mcpGateway != nil:
-            return mcpGateway.Call(ctx, tc.Name, tc.Args)
-
-        return &ToolResult{IsError: true, Content: "unknown tool"}, nil
-```
-
-> **TODO**（见 §15）：这个 switch 目前还没抽到 `tools.Registry`；`07_tools` 已经给出抽象，未来 orchestrator 会彻底变成 `registry.Execute` 的薄包装。
-
-### 9.2 文件工具 `file_tools.go` (746 行)
-
-8 个内置工具：
-
-| 工具 | 说明 |
-|---|---|
-| `read_file` | 带 `start_line/end_line` 切片，自动打 `N | ` 行号前缀给 LLM |
-| `write_to_file` | 完整覆盖；自动 mkdir -p；写完跑 `LintChecker` |
-| `replace_in_file` (patch_file) | `SEARCH/REPLACE` 块语法，**必须唯一匹配**否则报错 |
-| `edit_file` | 走 `EditEngine` 的精准多文件编辑 + 回滚 |
-| `list_files` | gitignore-aware，支持递归 |
-| `create_directory` | 幂等 mkdir -p |
-| `run_tests` | 调 `AutoTestRunner` |
-| `run_cmd` | 调 sandbox（workspace 挂载模式） |
-
-两个关键辅助：
-
-- **`smartTruncateOutput(out, maxLen)`**：工具返回超长时保头尾截中间，与主循环 §5.4 同策略；
-- **`autoDepManagement(ws, path)`**：写完 `go.mod` 改动自动 `go mod tidy`；写完 `requirements.txt` 自动 `pip install`；减少 LLM 忘记的坑。
-
-### 9.3 精准编辑引擎 `edit_engine.go`
+### 3.4 P1 能力（按 interface 持有，运行时注入）
 
 ```go
-EditOperation:
-  FilePath   string
-  OldContent string    # 必须唯一匹配
-  NewContent string
-
-ApplyEdit(ctx, ws, op):
-  1. read original
-  2. 验证 OldContent 在文件中**恰好出现一次**（否则 ambiguous → 失败）
-  3. 备份到 /tmp/orch_backup/...
-  4. write new content
-  5. LintChecker.Check()                  # golangci-lint / ruff / eslint / cargo check
-  6. if lint 有 error-level:
-         rollback（从备份恢复）
-  7. return EditResult{Applied, DiffUnified, LintWarnings, BackupPath}
-
-ApplyMultiEdit(ctx, ws, ops[]):
-  for each op: tryApply
-  if any fails: rollbackAll(backups)       # 全有全无语义
+ptyManager  PTYManager       // 持久 shell 会话（pty_tools.go）
+lspClient   LSPClient        // LSP-aware 代码智能（lsp_tools.go）
+tsParser    TreeSitterParser // tree-sitter AST（与 RAG 共用）
 ```
 
-**为什么坚持"唯一匹配"**？因为 LLM 产生的 `old_content` 可能在文件里有多处相同文本（大括号、空行），模糊匹配会改错地方。强制唯一让 LLM 必须提供**足够多的上下文**，这也是和 Cursor / Aider 对齐的做法。
+三个都允许 nil。如 LSP 未配置，`lsp_tools.go` 内的 `goto_definition` 等工具返回 "LSP not available"。
 
-#### 9.3.1 并发编辑保护（P0 #13 修复）
-
-> ⚠️ **修复前的 bug**：`EditEngine` 没有任何 per-file 锁。两个 goroutine
-> 并发 ApplyEdit 同一文件时：
->
-> ```
-> T1 [A]: read file → sees "foo"
-> T2 [B]: read file → sees "foo"     ← 同时读
-> T3 [A]: count("foo") == 1 ✓ → write "bar-A"
-> T4 [B]: count("foo") == 1 ✓ → write "bar-B"   ← 覆盖 A
-> T5 [A]: 返回 success                             ← 但磁盘上是 B 的内容
-> ```
->
-> 调用方 A 以为成功，实际内容丢失。`.bak` 文件也互相覆盖，rollback
-> 无法恢复到原始版本。
-
-**修复**：per-path `sync.Mutex`，字典序加锁防死锁。
+### 3.5 P2-D Tool Learning（`internal/toollearn`）
 
 ```go
-type EditEngine struct {
-    pathLocksMu sync.Mutex
-    pathLocks   map[string]*sync.Mutex  // absolute path → mutex
-    ...
-}
-
-func (e *EditEngine) lockPath(absPath string) (unlock func()) {
-    e.pathLocksMu.Lock()
-    mu, ok := e.pathLocks[absPath]
-    if !ok {
-        mu = &sync.Mutex{}
-        e.pathLocks[absPath] = mu
-    }
-    e.pathLocksMu.Unlock()
-    mu.Lock()
-    return mu.Unlock
-}
-
-func (e *EditEngine) ApplyEdit(ctx, ws, op EditOperation) *EditResult {
-    absPath := filepath.Join(ws.RootDir, op.Path)
-    defer e.lockPath(absPath)()   // ← 加锁，保证 read-check-write 原子
-    // ... 下面的逻辑不变
-}
-
-// ApplyMultiEdit 也一样，但按 **字典序** 加锁所有涉及的路径，避免死锁：
-// 两个 MultiEdit 都涉及 {a.go, b.go}，都按 a → b 加锁，不会互相等。
-func (e *EditEngine) lockPaths(ws *workspace.Workspace, ops []EditOperation) func() {
-    paths := unique sorted abs paths from ops
-    unlocks := []
-    for _, p := range paths { unlocks = append(unlocks, e.lockPath(p)) }
-    return func() { reverse order release }
-}
+toolCollector *toollearn.Collector       // 收集每次工具调用反馈
+toolAdvisor   *toollearn.Advisor         // 给 LLM 推荐工具
+toolPolicy    *toollearn.AdaptivePolicy  // 自适应工具偏好
+toolDistiller *toollearn.Distiller       // 提取策略知识
 ```
 
-**测试**：`TestEditEngine_ConcurrentEditsSerialized`——两个并发 goroutine
-同时 `ApplyEdit("file", "alpha"→"A")` 和 `ApplyEdit("file", "alpha"→"B")`，
-断言：**严格只有一个成功**，另一个报 `old_text not found`（因为看到的是
-第一个写入后的新内容 "A\nbeta\n"，找不到原来的 "alpha"）。
+构造时全部 `NewXxx`，启动即生效。学习数据存内存（`Collector.SetStore` 可挂 PG）。
 
-#### 9.3.2 Unified Diff 重写（P0 #16 修复）
-
-> ⚠️ **修复前**：`generateUnifiedDiff` 用"尾部对齐"启发式计算 `lastDiff`，
-> 当**插入行数 ≠ 删除行数**时，hunk header `@@ -start,N +start,M @@`
-> 的 N/M 与实际 body 行数不一致。标准 diff 工具（patch、git apply）会
-> 把这视为语法错误，或把后面的 context 误算进 hunk。
-
-**修复**：经典"公共前缀 + 公共后缀" 双指针：
-```go
-firstDiff := 0
-for ... && old[firstDiff] == new[firstDiff] { firstDiff++ }
-tailMatch := 0
-for ... && old[len(old)-1-tailMatch] == new[len(new)-1-tailMatch] { tailMatch++ }
-lastOld := len(old) - tailMatch  // exclusive
-lastNew := len(new) - tailMatch
-// hunk header 的 oldCount / newCount 是实际输出行数：
-//   context_before + (lastOld - firstDiff) + context_after
-oldCount := endOld - start
-newCount := endNew - start
-```
-
-**测试**：`TestUnifiedDiff_InsertsNotEqualDeletes` 解析 header 的 count，
-与 body 实际 `" " / "+" / "-"` 行数交叉校验。
-
-### 9.4 自动测试 `auto_test_runner.go`
-
-```
-AfterEdit(ctx, ws, editedFiles):
-  srcFiles  := filter(isTestableCodeFile)           # 非 _test.go / 非 .test.ts
-  testFiles := findRelatedTests(srcFiles)           # 约定匹配 test_*.py / *_test.go / *.test.ts
-  lang      := detectLanguage(editedFiles[0])
-  cmd, args := buildTestCommand(lang, srcFiles, testFiles)
-  result    := runTest(ctx, workDir, cmd)           # 通过 sandbox 执行
-  return TestResult{Passed, Output, Duration, FailedCases}
-
-TestResult.FormatForLLM():
-  if Passed: "✅ All tests passed (3 tests, 0.8s)"
-  else:      "❌ 2/5 tests failed:\n<FAIL output snippets>"
-```
-
-**为什么不直接让 LLM 自己调 `run_tests`**？因为 LLM 经常忘。Orchestrator 在**每轮末**无脑跑一次测试，结果塞成 **system message** 而非 tool result —— 不给 LLM 留"我没跑过"的余地。
-
-### 9.5 Git 工具 `git_tools.go`
-
-五个工具：`git_status / git_diff / git_log / git_branch / git_commit`。
-
-`AutoCommitAfterEdit(ws, editedFiles, desc)`：
+### 3.6 并发控制 map
 
 ```go
-1. ensureGitInit(ws)              # 首次操作前 git init
-2. git add editedFiles
-3. git commit -m "<agent> " + desc
+approvalCh    map[string]chan models.ApprovalResponse  // HITL，按 taskID
+interruptCh   map[string]chan InterruptSignal          // 中断，按 sessionID
+txMap         map[string]*ToolTransaction              // 写工具回滚，按 sessionID
+intentCache   map[string]intentCacheEntry              // 意图分类 LRU
+approvalMu/interruptMu/txMu/intentCacheMu              // 各自的 RWMutex
 ```
 
-可通过 `config.Workspace.AutoCommit = false` 关闭。
+每个 map 独立锁。整个 Orchestrator 不持有"全局锁"，每条 hot path 锁不同的 map，互不阻塞。
 
----
-
-## 10. 消息裁剪 `pruneMessages` (L33 in message_pruner.go)
-
-```
-pruneMessages(msgs, maxTokens):
-  保留 msgs[0] (system) 不动
-  从 msgs[1:] 最老那端开始剔除，直到 Σtokens < maxTokens
-  最少保留最后 6 条（避免断了 tool_call/tool_result 配对）
-  如果 system 自己就 > maxTokens / 2：截断 system.Content[:half]
-```
-
-**为什么不在循环外每次都 prune**？因为每次都调 `EstimateTokens` 成本不低，只在真的超标时才动。
-
----
-
-## 11. 项目规则 `project_rules.go`
-
-```
-RuleLoader.Load(rootDir) *ProjectRules:
-  if cache hit: return cached
-  discover:
-    - .cursorrules, CLAUDE.md, CLINE.md (原文 <2KB)
-    - discoverLanguageRules():
-        - .golangci.yml   → extractGolangciSummary
-        - pyproject.toml  → extractPythonToolSummary
-        - tsconfig.json   → extractTSConfigSummary
-        - .eslintrc*      → 原文
-  cache[rootDir] = rules
-  return rules
-
-Invalidate(rootDir):  # watcher 检测到文件变更时调
-  delete(cache, rootDir)
-```
-
-摘要而非全文的原因：tsconfig 上千行但只有十几个 flag 影响 coding 风格；golangci 更夸张。LLM 只需要知道"这个项目 strict=true、disabled: varcheck"就够了。
-
----
-
-## 12. Planner 桥接 `planner_bridge.go`
-
-```
-MaybeUsePlanner(ctx, task) (resp, used, err):
-  if planner == nil: return nil, false, nil            # 没挂 planner
-  if task.Intent not in {coding, debugging}: false     # 只在复杂任务用
-  if tokenCount(task.UserInput) < 200: false           # 太短的任务 ReAct 更直接
-
-  plan, _ := planner.MakePlan(ctx, task.UserInput, workspace, tools)
-  if len(plan.Steps) < 3: return nil, false, nil       # 不值得用 plan
-
-  result := planner.Execute(ctx, plan, executePlanStep)
-  return &ChatResponse{
-      Content: formatPlanResult(result),
-      State:   plannedChatState(result.Success),
-  }, true, nil
-```
-
-何时走 Planner？**静态 + 长计划 + 多工具** 的任务（迁移/重构/批量 rename）；何时走 ReAct？**探索 + 高不确定性**（debugging）。分界的艺术见 `10_planner`。
-
----
-
-## 13. 持久化与审计
-
-### 13.1 `persistTaskCreate / persistTaskState` (L226, L245)
+### 3.7 桥接组件（按需注入，nil 默认禁用）
 
 ```go
-persistTaskCreate(ctx, task):
-  if store == nil: return       # 测试/无 PG 模式直接跳过
-  if err := store.Tasks.Insert(ctx, task); err:
-      logger.Warn("persist task failed", zap.Error(err))   # 故意不阻塞主流程
+planner         *plannerComponents       // planner_bridge.go
+supervisor      *multiagent.Supervisor   // multiagent_bridge.go
+temporalClient  TemporalClient           // temporal_bridge.go
+memoryStore     MemoryRetriever          // memory_bridge.go
+memoryExtractor *memory.Extractor
 ```
-
-**关键设计**：DB 落不下 → warn 但继续。如果 PG 临时挂了，Agent 功能**不应**挂。后续补偿靠 `store.Tasks.Reconcile` 或直接读 session replay。
-
-### 13.2 `persistAudit` (L255)
-
-每次敏感操作（HITL suspend / approve / deny / high-risk tool）都写一条 audit。字段：
-
-```
-ts, user_id, session_id, task_id, action, risk_level, detail
-```
-
-查询接口在 `18_auth_security` 里讲。
 
 ---
 
-## 14. 设计权衡
+## 4. 核心入口对比：`ProcessMessage` vs `ProcessMessageStreamFull`
 
-| 抉择 | 动机 |
-|---|---|
-| **maxSteps 硬编码而非配置** | 防止运营调到 1000 造成一次请求烧掉数十刀 LLM 成本 |
-| LLM 失败**重试 3 次指数退避** | 外部 API 偶发 500/timeout 很常见，retry 能救 90% |
-| 中间状态**落盘 .progress.json** 而非 Redis | 用户可以用 git 看到自己"跑到哪了"；Redis 丢了就没了 |
-| 工具结果 head+tail 智能截断 | stack trace 关键内容在尾部 |
-| **连续同工具失败 → step-back 注入** 而非直接中止 | LLM 有能力换路线；直接终止对用户不友好 |
-| 编辑必须 OldContent 唯一匹配 | 杜绝 LLM 改错位置 —— 代价是 LLM 要提供更多上下文，值得 |
-| 自动测试结果作 system 消息 | 比 tool 消息优先级高，LLM 不容易忽略 |
-| intent 用廉价小模型单独分类 | 减少主模型 prompt 长度 + 成本；结果可缓存 |
-| skill 用 interface 而非 import | 避免 orchestrator → skill → ? 的循环依赖 |
-| HITL 用 channel 而非轮询 DB | 授权延迟从秒降到毫秒 |
-| reactLoop 单 goroutine 串行执行 tools | 工具间可能有依赖（如 edit→test）；并行收益不大反而增加状态管理难度 |
-| RAG 只在 CodeQuery/Diagnose 意图触发 | 闲聊/写代码时 RAG 注入反而是噪声 |
-| Reflection 每 10 步注入 | 让 LLM 有机会 meta-level 审视自己是否跑偏 |
-| autoDepManagement 白名单触发 | 保守；避免 `go mod tidy` 把 proxy 跑挂引起用户投诉 |
+两个入口共享 `reactLoopCore`，差异在外层装配 + 事件发射：
+
+| 维度          | ProcessMessage（同步）      | ProcessMessageStreamFull（流式）        |
+| ------------- | --------------------------- | -------------------------------------- |
+| 调用方        | `/api/v1/chat`              | `/api/v1/chat/react-stream` (SSE)       |
+| 返回          | `*models.ChatResponse`      | `<-chan models.ReactStreamEvent`        |
+| sink          | `noopSink{}`                | `&channelSink{ch: outCh}`               |
+| 适用场景      | 工具脚本、CI、HTTP 客户端   | 浏览器 UI、终端交互                     |
+| HITL 处理     | 同上                        | 同上（同样的 suspendForApproval）       |
+| 中断响应      | 同上                        | 同上                                    |
+
+`channelSink.Emit` 把每个内部事件（step_start / thinking / tool_call / tool_progress / tool_result / message / error）按 SSE 格式写入响应流。前端按 event type 分类渲染。
+
+**关键**：`noopSink` 让同步路径**无开销**地复用流式逻辑——`sink.Emit` 调用变成空函数。
 
 ---
 
-## 15. 后续演进
+## 5. dispatchTool 三级 fallback（再次精讲）
 
-- [ ] **switch → tools.Registry**：`executeTool` 当前仍是 if/else 大杂烩，下一步完全委托给 `internal/tools.Registry`（见 `07_tools.md`）；
-- [ ] **并行工具调用**：LLM 一次返回多 tool_call 时串行执行；对无依赖工具（两个 `search_code`）可并行；
-- [ ] **Plan-Execute-Reflect 三段式**：当前是 ReAct 或 Plan 二选一；将来 `Plan → Execute → Reflect → 修订 Plan` 迭代；
-- [ ] **Cost-based stop**：累计 LLM 花费超阈值（$X）主动暂停求确认；
-- [ ] **Checkpoint 在 workflow 层而非 .progress.json**：迁到 Temporal Workflow（见 `11_temporal.md`）让 crash 恢复更健壮；
-- [ ] **自适应 maxSteps**：根据近 N 次相似意图的历史均值动态调；
-- [ ] **Multi-agent**：主 orchestrator 可以 spawn "reviewer / planner / debugger" 子 agent，每个维护自己 messages；
-- [ ] **Token budget 预估从 Estimate 切到真实 tokenizer**（tiktoken/claude-tokenizer），目前是字符近似；
-- [ ] **RAG 异步并行**：当前 RAG 串在 LLM 前，总延迟 = RAG + LLM；可让 RAG 与 first-token 并行，落后注入；
-- [ ] **工具 ACL**：同一 task 里限制某些工具只能调 N 次（防止滥刷 `search_code`）。
-
----
-
-## 15. 实现剖析与改进方向
-
-### ReactLoop 每次迭代的核心 40 行
+`orchestrator.go:1426-1452`：
 
 ```go
-for step := 0; step < maxSteps; step++ {
-    // (1) 构建 prompt：拼 system + repomap + rag + history
-    messages := o.buildMessages(sess, userMessage, intent)
-
-    // (2) 预算裁剪（见 13_context）
-    messages = o.pruneMessages(messages, maxContextTokens)
-
-    // (3) 每 10 步注入反思 prompt
-    if step > 0 && step % reflectionInterval == 0 {
-        messages = append(messages, reflectionCheckpoint(step, maxSteps))
-    }
-
-    // (4) 调 LLM，拿到 tool_calls 或 final answer
-    resp, err := o.llmClient.ChatCompletion(ctx, &llm.ChatRequest{
-        Messages: messages,
-        Tools:    o.getAvailableTools(intent),
-        MaxTokens: 4096,
-    })
-    if err != nil { return "", err }
-
-    // (5) 如果没 tool_calls，说明 LLM 认为任务完成
-    if len(resp.ToolCalls) == 0 {
-        sess.AddMessage(assistant, resp.Content)
-        return resp.Content, nil
-    }
-
-    // (6) 串行执行 tool_calls
-    for _, tc := range resp.ToolCalls {
-        // 6a. 敏感拦截
-        if o.containsSensitiveContent(tc.Arguments) {
-            o.suspendForApproval(ctx, taskID, tc)
-            // 此处可能等待 30min HITL，返回后继续
+func (o *Orchestrator) dispatchTool(ctx, tc, start) (*ToolResult, error) {
+    // Tier 1: MCP（最优先，因为 MCP 工具可能 shadow 内置名）
+    if o.mcpGateway != nil {
+        if serverName, ok := o.mcpGateway.FindServerForTool(tc.Name); ok {
+            result, err := o.mcpGateway.CallTool(ctx, serverName, tc.Name, tc.Args)
+            metrics.MCPCallTotal.WithLabelValues(serverName, tc.Name, statusLabel(err)).Inc()
+            metrics.MCPCallDuration.WithLabelValues(serverName).Observe(time.Since(start).Seconds())
+            return result, err
         }
-
-        // 6b. 幂等缓存
-        if result, ok := o.specCache.Get(ws.ID, tc.Name, tc.Arguments); ok {
-            sess.AddMessage(tool, result)
-            continue
-        }
-
-        // 6c. 执行
-        result, err := o.executeTool(ctx, tc, ws)
-        if err != nil {
-            o.failureTracker.Track(tc.Name, err)
-            if o.failureTracker.ShouldStepBack(tc.Name) {
-                messages = injectStepBackPrompt(messages)
-            }
-        }
-
-        // 6d. 写缓存 or 失效
-        if IsIdempotentTool(tc.Name) {
-            o.specCache.Put(ws.ID, tc.Name, tc.Arguments, result)
-        } else if ShouldInvalidateAfter(tc.Name) {
-            o.specCache.Invalidate(ws.ID)  // 写操作失效整个 scope
-        }
-
-        // 6e. 追加 tool_result 到 session
-        sess.AddMessage(tool, result.Content)
     }
-
-    // (7) 超时 / cancel 检查
-    if ctx.Err() != nil { return "", ctx.Err() }
+    // Tier 2: 内置 + file + git + lsp + pty
+    if o.toolRegistry != nil {
+        if _, ok := o.toolRegistry.Get(tc.Name); ok {
+            return o.toolRegistry.Execute(ctx, tc.Name, tc.Args)
+        }
+    }
+    // Tier 3: 动态 skill
+    if o.skillRegistry != nil {
+        if _, ok := o.skillRegistry.FindSkill(tc.Name); ok {
+            return o.skillRegistry.Execute(ctx, tc.Name, tc.Args)
+        }
+    }
+    return &ToolResult{Content: fmt.Sprintf("Unknown tool: %s", tc.Name), IsError: true}, nil
 }
-
-// 超过 maxSteps：保存进度供 "continue" 命令续跑
-o.saveProgressForContinuation(taskID, sess)
-return "Reached step limit", nil
 ```
 
-### 性能剖析：一次 5 步 ReAct 会话的时间构成
+**设计决策**：
 
-```
-step 1:  [150ms embed]  [200ms LLM]   [20ms read_file]  [5ms cache put]    = 375ms
-step 2:  [200ms LLM]    [80ms grep]   [5ms]                                 = 285ms
-step 3:  [200ms LLM]    [1.2s edit_file + lint]                             = 1400ms
-step 4:  [200ms LLM]    [8s go test]                                        = 8200ms
-step 5:  [200ms LLM]    [final answer]                                      = 200ms
-─────────────────────────────────────────────────────────────────────────────────────
-总计:                                                                         10.5s
-其中 LLM 调用: 1.0s (10%)
-其中工具执行: 9.5s (90%)
-```
+1. **MCP 最优先** —— 允许通过 MCP 名"覆盖"内置工具（如某 MCP 提供 `read_file` 时优先用）。当前没有这种冲突，但保留了语义。
+2. **internal/tools 第二** —— 占绝大多数实际调用，因为内置工具集最完整。
+3. **skill 最后** —— webhook skill 是运维端注册，优先级最低，避免误覆盖核心工具。
+4. **Unknown tool 不报错（Go-level）** —— 返回 `ToolResult{IsError: true}`，让 LLM 看到"工具不存在"作为 observation，自主换工具。如果返回 Go-level error 会中断 ReAct loop，失去恢复机会。
 
-观察：**工具执行（尤其 sandbox run_tests）占大头**。优化 ReAct 延迟不是优化
-LLM 调用本身，而是：
-- 让 LLM 少调工具（更准的意图分类 / 更好的 prompt）
-- 让工具本身更快（warm pool / 增量测试）
-- 并行工具（当前串行）
+**未做的事**：
 
-### 利弊评估
-
-**优势（Pros）**
-- ✅ 10 个生产级要素齐全（见 §1.5 表格）
-- ✅ 失败追踪避免 LLM 死循环
-- ✅ 意图分类 + 缓存降低 50%+ 分类调用
-- ✅ 幂等缓存降低 45%+ 重复读
-- ✅ 流式事件让前端有丝滑可视化
-- ✅ EditEngine 带 lint + rollback，安全写入
-
-**代价（Cons）**
-- ⚠️ Orchestrator 持有 10+ 依赖——god object 嫌疑
-- ⚠️ 工具串行执行（一个 step 里 3 个 tool_calls 依次跑，不并发）
-- ⚠️ saveProgress 的 continue 功能没真跑通（API 端未接）
-- ⚠️ reflectionInterval 硬编码 10；不同任务应该不同
-- ⚠️ `skillRegistry` 用 `interface{}` 规避循环依赖，代价是失去类型检查
-- ⚠️ message_pruner 的 O(N²) token 估算在 200+ 消息时变慢
-
-### 可改进点
-
-**P0**
-1. 并行执行 tool_calls（同一 step 里相互独立的工具）—— 大多数 ReAct 场景
-   step 有 2-3 个并行 tool，延迟可降 40%
-2. 定义 SkillRegistry interface 替代 `interface{}`
-
-**P1**
-3. 意图感知的 maxSteps / reflectionInterval（deploy 短、migrate 长）
-4. saveProgress 真接入 `/chat` 的 `continue=true` 参数
-5. message_pruner 改用 O(N) token 累加器（而非每次全量估算）
-6. failureTracker 的 "step back" prompt 模板按 intent 定制
-
-**P2**
-7. 多 turn 的 speculative execution：LLM 还在想时，推测性跑 read_file
-8. tool schema 动态裁剪：intent=deploy 时不暴露 run_cmd
-9. 按 failure pattern 训练小模型做"我该 step back 还是重试"的决策
+- 没有"按 source 路由"（如果 LLM 给出 `tool_call{name: "skill:foo"}` 这种带前缀的名字，本系统**不**特殊处理，按字面查 map）；
+- 没有"工具名冲突告警"——如果同时有 MCP 和内置同名工具，静默走 MCP，不打 warn 日志。
 
 ---
 
-下一篇：`10_planner.md` —— Planner 静态多步规划：从自然语言 → Step[]，Executor 按步执行 + 失败回退。
+## 6. HITL 子系统深入
+
+### 6.1 触发条件（`orchestrator.go:335`）
+
+```go
+if !skipHITL(ctx) && (o.containsSensitiveContent(userMessage) || intent == models.IntentDeploy) {
+    o.persistTaskState(ctx, task.ID, models.TaskStateSuspended)
+    return o.suspendForApproval(ctx, task)
+}
+```
+
+两个条件：
+
+1. **正则匹配敏感模式**（`containsSensitiveContent`）—— 用 `securityCfg.SensitivePatterns` 编译的 regexp 数组匹配 userMessage。默认配置（`configs/config.example.yaml`）包含 `rm -rf`, `DROP TABLE`, `kubectl delete`, `git push --force` 等；
+2. **Intent 是 Deploy** —— 部署类任务一律审批，无条件。
+
+`skipHITL(ctx)` 从 context 取标志位 —— 由 `suspendForApprovalInProcess` 在审批通过后给重入的 `reactLoop` ctx 注入，避免无限循环审批。
+
+### 6.2 In-process Approval（`orchestrator.go:651-711`）
+
+```
+approvalCh[taskID] = make(chan, 1)
+go func() {
+    select {
+    case resp := <-ch:
+        if resp.Approved:
+            reactLoop(ctx_with_skipHITL, task)
+            session.AddMessage(assistant, result)
+        else:
+            log("rejected")
+    case <-time.After(30 * time.Minute):
+        HITLApprovalTotal{"timeout"}++
+    }
+}()
+
+return ChatResponse{State: Suspended, Approval: ...}
+```
+
+**关键点**：
+
+- 立即返回 `Suspended` 状态给客户端，不阻塞 HTTP；
+- 后台 goroutine 等审批，跨 HTTP 请求边界 —— 用户点 Approve 由**另一个**HTTP 请求触发，但执行后续 reactLoop 是在原后台 goroutine 完成的；
+- 结果通过 `session.AddMessage` 写回 session，下次客户端轮询/SSE 能看到；
+- **30 分钟超时**写死，不可配置。审批超时不写回 session，下次客户端轮询会看到任务卡在 Suspended。
+
+### 6.3 Temporal Approval（`temporal_bridge.go`）
+
+```
+suspendForApprovalTemporal:
+    1. 启动 workflow.SignalWithStart(workflowID = taskID)
+    2. workflow.Await(approval signal, timeout=24h)
+    3. signal 收到 → activity.ExecuteTaskActivity(skipHITL ctx)
+    4. activity 内调用 orch.ProcessMessage（重入，但跳过 HITL）
+```
+
+**接线状态**：
+
+- `temporal_bridge.go` 代码完整；
+- `cmd/agent/main.go:initTemporalWorker` **被注释掉**（SDK 调用 placeholder）；
+- **结果**：当前 `temporalClient` 始终是 nil，永远走 in-process 路径。
+
+文档若描述 Temporal HITL 在生产生效，是与现实不符。修复方式：要么 wire worker，要么删除 `temporal_bridge.go` + 把 RFC 标记为 "未实现"。
+
+### 6.4 Tool-level HITL（`orchestrator.go:1363-1374`）
+
+```go
+if !skipHITL(ctx) {
+    if def, ok := o.getToolRiskLevel(tc.Name); ok && def.RiskLevel >= 2 {
+        return &ToolResult{
+            Content: fmt.Sprintf("⚠️ Tool '%s' requires approval (risk_level=%d)..."),
+            IsError: true,
+        }, nil
+    }
+}
+```
+
+**这不是审批**，是**硬阻断**。LLM 看到 `IsError=true` 后自己决定不再调用。当前没有"工具级"的 approval channel —— 比 message-level 审批弱。
+
+`RiskLevel` 字段在 `ToolDefinition` 上，由各 builtin 工具自行声明（参见 `file_tools.go` / `git_tools.go`）。当前生产配置：
+
+| 工具                     | RiskLevel |
+| ------------------------ | --------- |
+| `run_tests`              | 2         |
+| `shell_exec`             | 2         |
+| `git_push`（如启用）     | 2         |
+| 其他 read / write 工具   | 0 或 1    |
+
+---
+
+## 7. Speculative Cache 集成详细
+
+### 7.1 生命周期
+
+```
+NewOrchestrator
+    └─ toolCache := NewSpeculativeToolCache(0, logger)   # TTL 默认 30s
+
+    └─ toolCache.SetMetadataLookup(o.toolMetadata)
+       # 让 cache 通过 toolRegistry 查 ToolDefinition.IsIdempotentRead
+
+executeTool 入口:
+    ├─ scope := cacheScope()                # workspace ID 优先
+    ├─ if cached := toolCache.Get(scope, name, args); hit:
+    │       return cached, nil              # 命中直接返回
+    │
+    ├─ result, err := dispatchTool(...)
+    │
+    ├─ if err == nil && !result.IsError:
+    │       toolCache.Put(scope, name, args, result)
+    │
+    └─ if toolCache.shouldInvalidate(name):  # 写工具
+            toolCache.Invalidate(scope)
+```
+
+### 7.2 metadata 联动
+
+`SetMetadataLookup` 让 cache 不依赖硬编码白名单 —— 直接查 `tools.Registry` 里的 `ToolDefinition.IsIdempotentRead` / `IsFileWrite` / `InvalidatesCache` 三个 metadata bit。新增内置工具时只需在 `tool_metadata.go` 声明，cache 自动正确分类。
+
+如果工具不在 Registry（如 MCP 工具或 webhook skill），fallback 到包级 `idempotentTools` 硬编码白名单。这两类工具基本都是"未知是否幂等" → 保守地视为写工具 → 不缓存。
+
+### 7.3 失效语义
+
+写工具执行后 `toolCache.Invalidate(scope)` **清空整个 workspace 的所有缓存**，不是只清相关键。代价：粒度粗；收益：实现简单，不会出现"应清未清"的脏数据。
+
+实测：单次 `edit_file` 会让 workspace 下后续所有 `read_file/list_dir/grep` 都重新跑。这是想要的语义。
+
+---
+
+## 8. 失败追踪 + 元认知
+
+### 8.1 consecutiveFailureTracker（`failure_tracker.go`）
+
+委托给 `agentloop.ConsecutiveFailureTracker`。逻辑：
+
+- 当 LLM **连续** 3 次调用**同名工具失败**时，自动注入一条 system message：「停一停，让我重新审视方法」；
+- 这条 message 让 LLM 跳出"用同一锤子敲同一钉子"循环；
+- 计数器在工具名变化时清零，不会无限累加。
+
+### 8.2 MetacognitiveState（`metacognition.go` + `metacognition_test.go`）
+
+跟踪三个指标：
+
+- `successRate` —— 工具成功率（滑动窗口）；
+- `repeatRate` —— 同工具重复调用频率；
+- `uncertaintyTags` —— 累积的不确定性来源（"recent tool failure: X"）；
+
+当 `successRate < 0.5` 或 `repeatRate > 0.7` 时，`NeedsReflection()` 返回 true，触发：
+
+1. 注入 `AdaptiveReflectionMessage`；
+2. LLM 给出 final answer 时，如果 `NeedsReflection`，额外加一轮「确认信心」验证（`react_core.go:200-211`）。
+
+### 8.3 三个交叉
+
+```
+失败 → failTracker.failCount++
+       meta.AddUncertainty(...)
+       meta.RecordOutcome(name, success=false, repeat=true)
+
+每 10 步 → reflectionCheckpoint
+每 N 步（自适应）→ meta.NeedsReflection → 注入反思
+final answer 但 meta.NeedsReflection → 强制验证一轮
+```
+
+这三层是**串联**的：单点失败 → 短期建议（step back）；长期低质量 → meta 反思；最终回答低信心 → 强制验证。
+
+---
+
+## 9. 自动测试 + 验证
+
+### 9.1 RunAutoTestAfterEdit（`auto_test_runner.go`）
+
+触发条件：`o.triggersAutoTest(toolName)` 为 true 且工具成功。`triggersAutoTest` 检查 `ToolDefinition.TriggersAutoTest` metadata bit（设在 file_tools 注册时）。
+
+执行流程：
+
+1. 从所有写工具的 args 提取 `path` 字段（`edit_file` / `write_file` / `apply_diff` 等都用 `path`）；
+2. 路径过滤：仅对源代码文件触发（.go/.py/.ts/.js 等）；
+3. 调用 `findRelevantTests(path)` —— 同包/同模块的测试文件；
+4. 调用 `runTests(testPaths)` —— 通过 `tools.run_tests` 工具执行；
+5. 把结果格式化成 system message 注入下一轮 LLM。
+
+**消耗**：增加 LLM 上下文 + 一次 shell 命令耗时（通常几秒至几十秒）。生产实测 ReAct 步数从平均 8 → 6，因为 LLM 不需要主动跑测试。
+
+### 9.2 verifyOutput（`verification.go`）
+
+仅当 `shouldVerifyOutput(intent, stepsUsed)` 为 true 时触发（Intent 是 CodeQuery/Diagnose + 步数 >= 3）。逻辑：
+
+1. 用一个独立 LLM 调用让模型自评 "答案是否充分回答用户问题"；
+2. 返回 `{passed: bool, feedback: string}`；
+3. `passed=false` 时把 feedback 拼到 content 后面返回给用户。
+
+**不**重新走 ReAct loop —— 只是给用户"自评分"。生产价值有限，因为 LLM 自评通常 passed=true。是 P2 待评估保留。
+
+---
+
+## 10. 中断 + 工具事务
+
+### 10.1 ToolTransaction（`tool_transaction.go`）
+
+写工具执行前 `captureForTransaction(tc)` 给当前 session 的 `ToolTransaction` 加一条 baseline：
+
+```
+ToolTransaction{
+    sessionID,
+    actions: [
+        {tool: "edit_file", path: "x.go", before: "<原内容>"},
+        {tool: "git_add",   path: "x.go", before: "<unstaged>"},
+        ...
+    ]
+}
+```
+
+中断信号 = "cancel" 时，理论上可以**反序回滚**所有 action（还原文件、git reset）。**当前实现**：`tool_transaction.go` 提供了 `Rollback` 方法，但 `checkInterrupt` 收到 cancel 时**没有**调用 `Rollback` —— 只是返回 "Task cancelled" 字符串，文件改动保留。
+
+这是 P1 待完善：完整 Rollback 需要先实现 file_tools 端的 before/after 捕获（当前部分捕获），再让 cancel 路径调用 Rollback。
+
+### 10.2 三种中断的语义
+
+| 类型     | 当前行为                                | 设计意图                                  |
+| -------- | --------------------------------------- | ----------------------------------------- |
+| cancel   | 返回 "Task cancelled by user"，loop 退出 | 完整放弃，应回滚（未接线）                |
+| redirect | 返回空，**未真正接入主流程**             | 替换 userMsg 重新跑 reactLoop（未实现）   |
+| pause    | 返回 "Task paused"，loop 退出            | 暂停 + 等用户 "continue"（continue 已实现） |
+
+`pause` 实际等价于 `cancel`，但用户收到的字符串提示不同。`redirect` 完全未接入。
+
+---
+
+## 11. 后续演进（P0 / P1 / P2）
+
+### P0（已知风险，必须修复）
+
+1. **Temporal HITL 未接线但代码存在**
+   - `temporal_bridge.go` 假装能用；
+   - main.go 的 `initTemporalWorker` 是 placeholder（commented out）；
+   - 修复：要么真接线（启动 worker、注册 workflow/activity），要么删 bridge + 文档标记 not implemented。
+
+2. **Tool transaction Rollback 未在 cancel 路径调用**
+   - `captureForTransaction` 已经写了 before-state；
+   - `checkInterrupt(cancel)` 只返回字符串，不 Rollback；
+   - 修复：cancel 路径调用 `tx.Rollback(ctx)`。
+
+3. **interrupt 信号不响应正在执行的工具**
+   - `parallelExecuteTools` 内 `wg.Wait` 不 select ctx；
+   - 长跑工具（shell_exec、run_tests）会无视 cancel；
+   - 修复：parallelExecuteTools 增加 ctx 监听 + 让正在跑的工具 ctx-cancel。
+
+4. **LLM 重试不区分错误类型**
+   - 401/400 等不该重试的错误也走 3 次退避；
+   - 浪费时间，且如果是 prompt injection / 配额错误会延迟暴露；
+   - 修复：`react_core.go:170-183` 加错误类型判断（IsRetryable）。
+
+### P1（功能完善）
+
+5. **意图分类 LRU 没有大小上限**
+   - `intentCache` 用 map 实现，无淘汰；
+   - 长时间运行 + 大量唯一输入会撑大内存；
+   - 修复：换成有 size 上限的 LRU（如 `hashicorp/golang-lru`）。
+
+6. **30 分钟审批超时不可配置**
+   - 写死；
+   - 修复：从 `config.SecurityConfig.ApprovalTimeout` 读取。
+
+7. **redirect 中断未实现**
+   - 当前 case "redirect" 只返回空字符串，不真正切换 userMsg；
+   - 修复：要么接入（在 reactLoop 外层捕获 redirect，重启 reactLoop with newMessage），要么从 InterruptType 移除。
+
+### P2（优化）
+
+8. **GetAvailableTools 每次都重新合并三个 Registry，未缓存**
+   - 一次 ReAct 50 步，调用 50 次（每个 LLM call 前）；
+   - tools.Registry 内部 Definitions() 也每次 sort；
+   - 修复：在 Orchestrator 加一个 generation-aware cache，三个 Registry 任一变化时失效。
+
+9. **自动测试是顺序追加，不并发**
+   - 大型项目跑全测试套件很慢；
+   - 修复：autoTestRunner 内部并发执行多个测试目录。
+
+10. **元认知反思阈值硬编码**
+    - `NeedsReflection` 的 successRate < 0.5 等阈值不可配置；
+    - 修复：暴露到 config。
+
+---
+
+## 12. 设计教训
+
+1. **不要在 ReAct loop 里直接做副作用** —— 所有"改变世界"的操作（持久化、metrics、外部 API）都包成 best-effort：`if store != nil { ... }` + 错误只记日志不返回。这让 ReAct loop 在外部依赖部分不可用时仍能跑。
+
+2. **interface 解耦 > 具体类型** —— `skillRegistry`、`temporalClient`、`PTYManager`、`LSPClient`、`MemoryRetriever` 全部用匿名 interface，避免 import cycle。代价：编译期类型检查弱化（interface satisfy 是隐式的），需测试覆盖每个 setter。
+
+3. **失败应回喂给 LLM，不回喂给上层** —— `dispatchTool` 找不到工具返回 `IsError=true` 不返回 Go-error；webhook 失败同样。这是 LLM-agent 工程的"软失败"哲学：让模型自己决定怎么应对，比代码硬中断更鲁棒。
+
+4. **scope 选错就全错** —— Speculative cache 用 workspaceID 不用 sessionID，是反复在生产踩坑后的修正。注释里写得非常清楚（`speculative_cache.go:124-136`）。这种"看似细节实际致命"的设计决策必须在代码 + 文档双重显式记录。
+
+5. **三层反思（fail tracker / meta / verification）有冗余但有必要** —— 表面上做的事相似（让 LLM "停一停想想"），实际作用域不同：fail tracker 是单点 fix loop，meta 是长期质量，verification 是最终一致性。强行合并会丢分辨率。
+
+6. **"暂停 vs 取消"在 UX 上是同一件事** —— 当前代码把 pause 和 cancel 实现成几乎相同的 loop 退出。是有意的简化：用户对"暂停"的期待是"我等会回来"，对应的是 continuation 流程而不是中断本身。pause 字符串提示让用户知道可以 "continue"，但底层退出和 cancel 没区别。
+
+---
+
+## 13. 相关章节
+
+- **03_llm.md**：Orchestrator 的 `llmClient` 调用细节 + 重试。
+- **04_rag.md**：`ragEngine.Retrieve` 在 reactLoop 入口的注入。
+- **05_sandbox.md**：`sandboxMgr.Execute` 给 `execute_code` / `shell_exec` 工具。
+- **06_mcp.md**：MCP gateway 是 dispatch Tier 1。
+- **07_tools.md**：toolRegistry 是 Tier 2，列出所有内置工具。
+- **08_skill.md**：skillRegistry 是 Tier 3，动态 webhook 工具。
+- **10_planner.md**（待重写）：可选 DAG planner，与 ReAct 互斥。
+- **11_temporal.md**（待重写）：HITL 持久化路径（当前未接线）。
+- **12_hitl.md**（待重写）：完整 HITL UX 闭环。
+
+---
+
+下一篇：[`10_planner.md`](10_planner.md) —— Planner DAG 编排：可选的"先规划后执行"路径，与 ReAct loop 通过 `MaybeUsePlanner` 切换。

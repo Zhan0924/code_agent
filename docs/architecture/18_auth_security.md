@@ -1,887 +1,762 @@
-# 18 · 安全与审计 `internal/auth` + `internal/security` + `internal/audit`
+# 18. Auth & Security 安全栈
 
-> 代码：
-> - `internal/auth/jwt.go` (284) — JWT / Claims / Roles / APIKeyStore / AuthMiddleware / RequireRole
-> - `internal/auth/ratelimit.go` (105) — `PerUserRateLimiter`：按用户/角色细粒度限流
-> - `internal/auth/redis_revocation.go` (66) — Redis 黑名单（已在 16_store 详述）
-> - `internal/security/hmac.go` (198) — `HMACVerifier` + `SigningTransport`（Webhook / MCP 通信）
-> - `internal/security/egress.go` (223) — `EgressPolicy` + `EgressValidator`（容器出网策略）
-> - `internal/audit/logger.go` (132) — 结构化审计日志（9 种事件类型）
-> - 测试：jwt_test / hmac_test / egress_test / logger_test
+> **范围**：`internal/auth/` (JWT + APIKey + RBAC + 限流 + Redis 吊销) + `internal/security/` (HMAC webhook + Egress SSRF 防御)
+> **物理路径**：
+> - `internal/auth/jwt.go` (400 行) — JWTManager / APIKeyStore / AuthMiddleware / RequireRole
+> - `internal/auth/ratelimit.go` (150 行) — 进程内 token-bucket
+> - `internal/auth/redis_ratelimit.go` (161 行) — Redis 固定窗口（Lua 原子）
+> - `internal/auth/redis_revocation.go` (97 行) — JWT 吊销黑名单
+> - `internal/security/hmac.go` (220 行) — HMAC-SHA256 webhook 验签 + SigningTransport
+> - `internal/security/egress.go` (398 行) — EgressPolicy / EgressValidator / 两层 SSRF
+> - 装配点：`cmd/agent/main.go` L149-162 (egress) + L381-413 (auth)
+> - 测试：`jwt_test.go` (274) / `redis_ratelimit_test.go` (141) / `hmac_test.go` (172) / `egress_test.go` (342)
+
+> **注**：审计模块 `internal/audit/logger.go` 已并入 `19_observability.md`（Metrics + Tracing + Audit 一起讨论），本篇专注鉴权与南北向边界安全。
 
 ---
 
 ## 1. 模块定位
 
-**"让 Agent 在可信任的边界内工作"** —— 本章合订四个安全支柱：
+Auth & Security 是 Agent 的 **南北向边界守卫**。北向是 HTTP/WS 入口（17_api），南向是出向 HTTP/MCP/沙箱外联。两个包合起来回答四个问题：
 
-| 维度 | 组件 | 解决什么 |
+| 问题 | 答案 | 实现 |
 |---|---|---|
-| **身份识别** | `auth/jwt` + `APIKeyStore` | "谁在请求？" |
-| **权限控制** | `auth/RequireRole` + `PerUserRateLimiter` | "他能做什么？做多少？" |
-| **数据可信** | `security/hmac` | "机器之间的请求是真的吗？" |
-| **网络边界** | `security/egress` | "容器想访问的地方被允许吗？" |
-| **行为取证** | `audit/Logger` | "发生了什么？谁做的？" |
+| 你是谁？ | JWT Bearer / X-API-Key | `auth.AuthMiddleware` |
+| 你能做什么？ | RBAC 角色（admin/dev/readonly/service） | `auth.RequireRole` |
+| 你能调多快？ | per-user/per-IP token bucket（双轨：进程内 + Redis 共享） | `auth.PerUserRateLimiter` / `RedisRateLimiter` |
+| 沙箱/Agent 能访问哪些外部地址？ | CIDR 白/黑名单 + 强制元数据端点拦截 | `security.EgressValidator` |
 
-这些模块**互相独立**，但在 API 入口（middleware chain）和关键业务（orchestrator / sandbox / mcp）上被**组合使用**。
+加上两个补丁：
+- **JWT 吊销** —— `redis_revocation.go` 解决 JWT 一旦签发无法主动失效的痛点。
+- **HMAC Webhook** —— `security.HMACVerifier` 防止 MCP server / 外部回调被中间人篡改。
+
+> **重要：本模块不负责秘密泄露过滤**。content scrub（密码/密钥脱敏）由 orchestrator 的 `containsSensitiveContent` + audit 模块负责，不在 auth/security 包内。
 
 ---
 
-## 1.5 设计哲学：安全栈的"7 层防御"
+## 2. 设计哲学
 
-Agent 的攻击面比普通 Web 服务大得多——LLM 生成的代码要执行、外部 MCP
-工具要联网、管理员要能审批重写数据库的操作。任何一道防线都不能假设
-"肯定拦住"，必须多层。
+### 2.1 无状态优先（JWT > Session）
 
-### 攻击-防御矩阵
+Agent 是水平扩容架构，任意请求落到任意 Pod。如果用 Session，每个请求都要打一次 Redis；JWT 把身份签进 Token 里，Pod 本地验签即可，零外部依赖。代价是吊销机制要单独建（见 §5.9）。
 
-| 攻击类型 | 典型载荷 | 防御层（由外到内） |
+### 2.2 双层防御（Defense in Depth）
+
+每个边界至少两层验证：
+
+| 层 | 作用 | 例子 |
 |---|---|---|
-| 未授权调 API | 匿名 POST /chat | 1. Rate Limit → 2. Auth JWT/APIKey → 3. RBAC |
-| 窃听 / 中间人 | 抓 HTTP 流量 | TLS 终止（网关层，在 Agent 之外） |
-| 重放攻击 | 重发抓到的合法签名 | HMAC + **timestamp 必填**（P0 #5） |
-| 时序侧信道 | 通过毫秒差推测 key | constant-time compare（P0 #4） |
-| Prompt injection | 诱导 LLM 做危险操作 | sensitive patterns + intent classifier + HITL |
-| 敏感命令执行 | `DROP DATABASE`、`kubectl delete` | HITL 人工审批 |
-| SSRF | 诱导 Agent 访问 169.254 | Egress L1（URL）+ L2（IP）+ L3（容器 net none） |
-| 代码容器逃逸 | 提权 + 挂 docker.sock | CapDrop + no-new-priv + Readonly + PidsLimit |
-| 数据外泄 | Agent 读密钥 + 写外网 | 环境变量白名单 + Egress ACL |
-| 跨租户访问 | session A 读 B 文件 | workspace 硬隔离 + 绝无 fallback |
+| L1 应用层 | 快速、廉价的初筛 | `EgressTransport` 看 URL.Host |
+| L2 系统层 | DNS 解析后/连接前的真正拦截 | `Dialer.Control` 看解析出的 IP |
 
-### 7 层防御的映射
+L1 单层会被 DNS Rebinding 击穿；L2 单层会浪费 DNS RTT。两层一起才完备。
+HMAC 同理：`signature` 单签不防重放，必须 `signature(timestamp + body)`。
 
-```
-┌─── L0 网络边界（反代 / WAF / TLS） ──────── 不在代码库 ────┐
-│                                                          │
-├─── L1 Rate Limit（api/middleware + redis_ratelimit） ────┤
-│       │  阻挡匿名 / NAT DDoS                              │
-│       ▼                                                   │
-├─── L2 Auth（jwt/APIKey） ────────────────────────────────┤
-│       │  识别"你是谁"                                     │
-│       │  P0 #4: SHA-256 存储 + constant time             │
-│       ▼                                                   │
-├─── L3 RBAC（RequireRole） ───────────────────────────────┤
-│       │  判断"你能做什么"                                 │
-│       ▼                                                   │
-├─── L4 Input Validation（handler） ───────────────────────┤
-│       │  Body size / Content-Type / JSON schema          │
-│       ▼                                                   │
-├─── L5 Semantic Guard（orchestrator.containsSensitive） ──┤
-│       │  匹配敏感 pattern → HITL                         │
-│       │  防 prompt injection 漂移到危险命令               │
-│       ▼                                                   │
-├─── L6 HITL（人工审批） ──────────────────────────────────┤
-│       │  signal + temporal workflow                      │
-│       │  部署、生产数据操作必须人工点批准                  │
-│       ▼                                                   │
-├─── L7 Execution Sandbox（sandbox/manager） ─────────────┤
-│       │  即便指令放行，也在隔离容器里跑                   │
-│       │  CapDrop + Readonly + no-new-priv                │
-│       ▼                                                   │
-│    Egress（HTTP 出站 + Docker network） ───── 外部 ──→   │
-│       │  URL 层 + DNS 层两级拦截                          │
-└──────────────────────────────────────────────────────────┘
+### 2.3 Fail-Open vs Fail-Close 的明确取舍
 
-审计横切：每层都写 audit log → 事后取证
-```
-
-### "最小权限" 在每层的体现
-
-| 层 | 最小权限举例 |
-|---|---|
-| Auth | 默认无 role → 401；要求 role 才能进业务组 |
-| RBAC | admin / dev / readonly 递减；readonly 不能 execute_code |
-| Env | sandboxed 命令只看到白名单 env var（P0 #10） |
-| Capability | 容器默认 CAP_DROP ALL，用啥加啥（至今不需要加） |
-| Network | NetworkMode=none 默认；用到网络再开白名单 |
-| Egress | DefaultAction=deny；不在 AllowList 一律拒 |
-
-### 失败优先策略：Fail-Close vs Fail-Open
-
-不同组件的失败处理必须刻意选择：
-
-| 组件 | 默认 | 原因 |
+| 组件 | 策略 | 理由 |
 |---|---|---|
-| HMAC verifier | **Fail-Close** | 签名校验挂了宁错勿漏 |
-| JWT 撤销检查 | Fail-Close | 无法查 Redis → 拒绝请求（安全 > 可用） |
-| Rate Limiter（Redis） | **Fail-Open** | Redis 挂 → 放行（可用性 > 严格限速） |
-| Egress ACL | Fail-Close（policy.Enabled=true 时） | 不能"policy 挂了就让所有出向通过" |
-| Circuit Breaker | Fail-Open | 熔断挂了 → 让调用过，由下游自己处理 |
-| Audit Log | Fail-Open | 日志挂了业务不该中断 |
+| `RedisRateLimiter.Allow` | **fail-open** | Redis 抖动时宁可放过流量也不要 502 整个 Agent |
+| `JWTManagerWithRedis.IsRevoked` | **fail-open**（Redis 错误时不拦） | 同上 |
+| `EgressValidator.IsAllowed` | **fail-close** | 误放等于 SSRF，比误拦严重得多 |
+| `HMACVerifier.GinMiddleware` 缺 timestamp | **fail-close**（最近修复） | 之前的"缺则跳过"是 P0 漏洞 |
 
-规则：**安全决策组件 fail-close，可用性组件 fail-open**。
+这个取舍是 Agent 安全模型的核心：**可用性优于一致性，但安全优于可用性**。
+
+### 2.4 时间敏感的常量时间（Timing-Safe）
+
+- `APIKeyStore.Validate`：遍历**全部**条目，**永不 break**，`subtle.ConstantTimeCompare` 比对——攻击者无法通过响应时间推断 key 是否存在或在哪。
+- `HMACVerifier.VerifySignature`：`hmac.Equal` 而非 `bytes.Equal`。
+
+代价：N 个 API key 时验证耗时 O(N)。N 大到性能问题前先看 §7 演进。
+
+### 2.5 边界依赖最小化
+
+Auth 包**不引入 Gin 之外的 HTTP 框架依赖**；Security 包**只依赖标准库 net + net/http**。这两个包要能被未来切到 echo/fiber 时极小代价迁移。
 
 ---
 
-## 2. 依赖架构
+## 3. 依赖架构
 
 ```
-请求进入
+                ┌────────── cmd/agent/main.go ──────────┐
+                │  L149-162  egress validator + HTTPClient│
+                │  L381-413  jwtMgr + apiKeyStore        │
+                └──────┬─────────────────────┬───────────┘
+                       │                     │
+              ┌────────▼──────────┐  ┌───────▼────────┐
+              │ internal/security │  │ internal/auth  │
+              │ ─────────────     │  │ ─────────────  │
+              │ EgressPolicy      │  │ JWTConfig      │
+              │ EgressValidator   │  │ JWTManager     │
+              │ EgressTransport ──┼──┤ APIKeyStore    │
+              │ SigningTransport  │  │ AuthMiddleware │
+              │ HMACVerifier      │  │ RequireRole    │
+              └─────┬─────────────┘  │ PerUserRL      │
+                    │                │ RedisRL        │
+                    │                │ RedisRevocation│
+                    │                └─────┬──────────┘
+                    │                      │
+                    ▼                      ▼
+       Egress HTTP Client     Gin Middleware Chain (17_api)
+         (LLM / MCP)              ↓ AuthMiddleware
+                                  ↓ RequireRole
+                                  ↓ RedisRateLimiter (fallback PerUserRL)
+                                  → Handler
+```
+
+**外部依赖（最小集合）**：
+- `github.com/golang-jwt/jwt/v5` — RFC 7519 JWT
+- `github.com/redis/go-redis/v9` — 限流 + 吊销
+- `github.com/gin-gonic/gin` — Middleware glue
+- 标准库 `crypto/hmac` / `crypto/sha256` / `crypto/rand` / `crypto/subtle`
+
+**反向依赖**（谁用 auth/security）：
+- `internal/api/router.go` — 所有 Middleware 装配
+- `cmd/agent/main.go` — 顶层 DI
+- `internal/llm/client.go` — 注入 egressHTTPClient
+- `internal/mcp/gateway.go` — 注入 egressHTTPClient
+
+> **不依赖 orchestrator/rag/store**。包是叶子节点，便于单测。
+
+---
+
+## 4. 数据流总览
+
+### 4.1 入向请求鉴权流（Northbound）
+
+```
+HTTP Request
     │
     ▼
-┌────────────────────────┐
-│ auth.AuthMiddleware    │ ← 从 Authorization header 解析 JWT / X-API-Key
-│   ├─ JWTManager.Validate│   解析签名 → 黑名单 check → 填 Claims 到 ctx
-│   └─ APIKeyStore.Validate│   长 token 别名（脚本 / 服务账号）
-└──────────┬─────────────┘
-           │
-           ▼  (分组路由)
-┌────────────────────────┐
-│ auth.RequireRole(admin)│ ← RBAC 门禁
-└──────────┬─────────────┘
-           │
-           ▼
-┌────────────────────────┐
-│ PerUserRateLimiter     │ ← 按 user_id（而非 IP）限流
-└──────────┬─────────────┘
-           │
-           ▼
-        业务 handler ──┐
-                      │ 敏感操作发生
-                      ▼
-               ┌──────────────┐
-               │ audit.Logger │ ← 结构化落盘（可走 SIEM）
-               └──────────────┘
-
-Webhook 独立路径:
-    外部请求 → hmac.GinMiddleware → 验签通过 → handler
-
-容器出网独立路径:
-    sandbox 启动前 → EgressValidator.IsAllowed → 生成 iptables 规则
+1. rateLimit (Redis or in-mem)         ← router.go:187-189
+    │   bucket = user_id > apikey hash > client_ip
+    │   over limit → 429 + Retry-After
+    ▼
+2. recovery / requestID / tracing / metrics / logging / CORS
+    │
+    ▼  (only if route in authGroup)
+3. AuthMiddleware                       ← jwt.go:312
+    │   X-API-Key first → APIKeyStore.Validate (constant-time)
+    │   else Authorization: Bearer <jwt> → JWTManager.ValidateToken
+    │   缺失/失败 → 401
+    │   成功 → c.Set("auth_claims", *Claims)
+    ▼
+4. RequireRole(roles...)                ← jwt.go:355
+    │   claims.Role == Admin → 自动通过
+    │   else claims.Role 必须在 roles 集合中
+    │   不通过 → 403 + 返回 required_roles
+    ▼
+5. Handler (17_api)
 ```
 
----
-
-## 2.5 数据流总览
-
-```text
-═══════════════ 请求认证主链路 ═══════════════
-
-┌───────────────┐
-│ HTTP Request  │
-│ Authorization:│
-│  Bearer <jwt> │
-│  或 X-API-Key │
-└───────┬───────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ auth.AuthMiddleware                                          │
-│  ┌────────────────────────────────────────────────────┐     │
-│  │ 路径1: Bearer Token (JWT)                          │     │
-│  │  parse → verify signature → check exp             │     │
-│  │  → IsRevoked(jti)? 【Redis EXISTS】               │     │
-│  │  → 注入 Claims 到 gin.Context                     │     │
-│  ├────────────────────────────────────────────────────┤     │
-│  │ 路径2: X-API-Key (长 token)                       │     │
-│  │  SHA-256(key) → constant-time compare             │     │
-│  │  遍历所有 hash (不早退 → 防时序攻击)               │     │
-│  │  → 注入 Claims 到 gin.Context                     │     │
-│  └────────────────────────────────────────────────────┘     │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ (认证通过)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ RequireRole(admin / user)                                    │
-│  Claims.Role ∈ allowed? → pass : → 403 Forbidden           │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ PerUserRateLimiter                                           │
-│  key = user_id (非 IP → 防 NAT 误杀)                        │
-│  token bucket → 放行 / 429 Too Many Requests                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-                      业务 Handler
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ audit.Logger.Log(Event{UserID, Action, Resource, Detail})    │
-│  → zap structured log + optional PG insert                  │
-└─────────────────────────────────────────────────────────────┘
-
-
-═══════════════ 出网控制 (Egress) ═══════════════
-
-┌───────────────────────┐
-│ sandbox / MCP 出网请求 │
-└───────────┬───────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│ L1: EgressTransport (http.RoundTripper)                      │
-│  URL 级别: 检查 host + path 是否在白名单                     │
-│  拒绝 → 返回 ErrEgressBlocked                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ (URL 通过)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ L2: Dialer.Control (net.Dialer)                              │
-│  DNS 解析后得到 IP → 检查是否为私有地址 / 禁止段              │
-│  防止 DNS rebinding 绕过 L1                                  │
-│  拒绝 → syscall.EACCES                                      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ (IP 通过)
-                           ▼
-                    正常建立 TCP 连接
-
-
-═══════════════ Webhook HMAC 验签 ═══════════════
-
-┌────────────────────┐
-│ 外部系统 Webhook   │
-│ X-Signature: hmac  │
-│ X-Timestamp: unix  │
-└─────────┬──────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────┐
-│ hmac.GinMiddleware                                           │
-│  ① 提取 X-Timestamp → 检查 |now-ts| < 5min (防重放)        │
-│  ② LimitReader(body, 10MB) → 读取 body                     │
-│  ③ HMAC-SHA256(secret, timestamp+body) → expected           │
-│  ④ hmac.Equal(signature, expected) → constant-time          │
-│  通过 → 放行; 失败 → 401                                    │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. ★ JWT + API Key 双轨认证
-
-### 3.1 `Claims` 结构（jwt.go:40）
-
-```go
-type Role string
-const (
-    RoleAdmin    Role = "admin"    // 可授权部署、管理用户
-    RoleDev      Role = "dev"      // 标准开发：chat / exec / search
-    RoleReadOnly Role = "readonly" // 只读：search / chat（不可 exec）
-    RoleService  Role = "service"  // 服务账号：webhook 回调
-)
-
-type Claims struct {
-    jwt.RegisteredClaims        // 标准：iss/sub/iat/exp/jti
-    UserID string
-    Role   Role
-    Email  string
-}
-```
-
-### 3.2 `JWTManager` (jwt.go:74)
+### 4.2 JWT 验签内部步骤
 
 ```
-GenerateToken(userID, role, email):
-    claims := Claims{ RegisteredClaims{
-        Issuer: cfg.Issuer,           // "code-agent"
-        Subject: userID,
-        IssuedAt: now,
-        ExpiresAt: now + 24h,
-        ID: uuid()                    // JTI → 撤销黑名单 key
-    }, userID, role, email }
-    token := jwt.NewWithClaims(HS256, claims)
-    return token.SignedString(cfg.SecretKey)
-
-ValidateToken(tokenString):
-    parsed := jwt.ParseWithClaims(tokenString, &Claims{}, keyFunc)
-    if !parsed.Valid: return ErrTokenInvalid
-    if revoked[claims.ID]: return ErrTokenInvalid   // 黑名单命中
-    return claims
-
-RevokeToken(jti):
-    revokedMu.Lock()
-    revoked[jti] = now
-```
-
-**关键决策**：
-
-| 点 | 选择 | 原因 |
-|---|---|---|
-| 签名算法 | **HS256**（对称） | 单服务部署够用；多服务可升 RS256/ES256 |
-| Token 有效期 | **24h** | 平衡 UX 和风险 |
-| Refresh token | 独立 7d 过期 | 标准做法 |
-| **JTI 必填** | 每 token 唯一 ID | 撤销名单的 key |
-| 黑名单位置 | 内存 map + Redis（见 16_store） | 双写降级 |
-| Secret 默认值 | **mustGenerateSecret()** → 32 字节随机 hex | 忘配也不会用弱 key |
-
-### 3.3 `APIKeyStore` (jwt.go:189) —— 长 token 旁路
-
-> ⚠️ **2026-05 更新（P0 #4 修复）**：此前 Store 内部是 `map[plaintext]*Entry`，
-> 既泄漏 key 又是非常量时间查找。修复后的实现如下：
-
-```go
-type APIKeyEntry struct {
-    Key     string  // 仅 Register 输入，不存储
-    UserID, Role, Label string
-    Created time.Time
-}
-
-type apiKeyRecord struct {
-    hash  [32]byte     // SHA-256，持久存储
-    entry APIKeyEntry  // entry.Key 在这里被强制清空
-}
-
-func (s *APIKeyStore) Register(entry *APIKeyEntry) {
-    stored := *entry
-    stored.Key = ""                    // ← 绝不保留 plaintext
-    rec := apiKeyRecord{
-        hash:  sha256.Sum256([]byte(entry.Key)),
-        entry: stored,
-    }
-    s.entries = append(s.entries, rec)
-}
-
-func (s *APIKeyStore) Validate(key string) (*APIKeyEntry, bool) {
-    want := sha256.Sum256([]byte(key))
-    var matched *APIKeyEntry
-    for i := range s.entries {
-        if subtle.ConstantTimeCompare(s.entries[i].hash[:], want[:]) == 1 {
-            e := s.entries[i].entry
-            matched = &e
-            // ← 不 break，保持总运算量恒定 → 时序侧信道不可观测
-        }
-    }
-    return matched, matched != nil
-}
-```
-
-**两个关键设计点**：
-
-1. **永不存 plaintext** — `Register` 拷贝 `*entry` 后把 `Key` 置空再入 store。
-   即使攻击者能 dump 内存或 `%+v` 打 log，也拿不到原始 API Key。
-2. **常量时间比较** — `subtle.ConstantTimeCompare`；遍历到匹配也**不提前
-   return**。时间无论 key 存在与否、匹配在第几位都一样。
-   （说明：Go map lookup 不是常量时间，所以不能用 hash 做 map key 直接查
-   —— 一旦攻击者能控制查询方式，可以通过时间测信息。虽然现实噪声大，但
-   defense-in-depth 本就是消除理论漏洞。）
-
-API Key 通过 `X-API-Key` header 传入。**验证用例**：
-`TestAPIKeyStore_NoPlaintextStorage`（断言 `rec.entry.Key == ""`）。
-
-### 3.4 `AuthMiddleware` 双轨处理（jwt.go:196）
-
-```
-AuthMiddleware(c):
-    // 优先 API Key
-    if apiKey := c.GetHeader("X-API-Key"); apiKey != "":
-        entry, ok := apiKeys.Validate(apiKey)
-        if ok:
-            c.Set("auth_claims", fakeClaims(entry))
-            c.Next(); return
-
-    // 再 JWT
-    auth := c.GetHeader("Authorization")
-    tokenString := strings.TrimPrefix(auth, "Bearer ")
-    claims, err := jwtMgr.ValidateToken(tokenString)
-    if err: return 401
-
-    c.Set("auth_claims", claims)
-    c.Next()
-```
-
-业务 handler 通过 `auth.GetClaims(c)` 拿用户身份。
-
-### 3.5 `RequireRole(...)` RBAC 门禁（jwt.go:239）
-
-```
-RequireRole(allowed ...Role):
-    return func(c):
-        claims := GetClaims(c)
-        for _, r := range allowed:
-            if claims.Role == r: c.Next(); return
-        c.AbortWithStatusJSON(403, ...)
-```
-
-在路由里声明式使用：`approvalGroup.Use(auth.RequireRole(RoleAdmin, RoleDev))`。
-
----
-
-## 4. `PerUserRateLimiter` —— 更细的限流
-
-和 17_api 中的 "Per-IP" 限流互补：
-
-| 对比 | middleware.rateLimiter | auth.PerUserRateLimiter |
-|---|---|---|
-| 粒度 | 按 Client IP | 按 `claims.UserID` |
-| 位置 | 全局中间件 | 路由组 opt-in |
-| 配额 | 10 rps / 20 burst | 由 role 决定（Admin 无限、Dev 宽松、ReadOnly 严） |
-
-数据结构和算法同 17_api 的 tokenBucket，**差在 key 是 user_id** —— NAT 后面 100 个人共用一个 IP 时，per-user 才能公平。
-
----
-
-## 5. ★ HMAC：机器到机器的可信通道
-
-### 5.1 场景
-
-- **入站**：`/webhooks/*` 接收外部 MCP / CI 回调；
-- **出站**：Agent 调用 MCP server 时自动签名（`SigningTransport`）。
-
-### 5.2 `HMACVerifier.GinMiddleware` 四步走（hmac.go:100）
-
-```text
-Step 1  取签名 header（X-Signature-256）
-        缺失 → 401
-
-Step 2  时间戳防重放（P0 #5 修复后为"必填"）
-        X-Timestamp 缺失      → 401 "missing timestamp header"   ⚠ 修复前：跳过
-        X-Timestamp 格式错    → 400 "invalid timestamp format"
-        |age| > MaxTimestampAge → 401 "timestamp expired or skewed"
-           （同时拒绝过去 / 未来两端，防时钟欺骗）
-
-Step 3  读请求体（LimitReader 防 OOM）
-        读完后 reset c.Request.Body = io.NopCloser(...)   ← 关键！后续 handler 还要读
-
-Step 4  VerifySignature(body, signature)
-        hmac.Equal(computed, provided)   ← 常量时间比对（防 timing attack）
-        失败 → 403
-```
-
-> ⚠️ **2026-05 更新（P0 #5 修复）**：Step 2 以前写的是 `if tsHeader != ""
-> { check } else { pass }`——这等于宣告"攻击者只要省略时间戳就可以重放
-> 签名"。修复后，当 `TimestampHeader` 和 `MaxTimestampAge` 同时配置非
-> 默认值，timestamp 是**强制字段**，缺失直接 401。
-
-**4 个易错点**：
-
-1. **body 必须重置**：middleware 读完 body 后 handler 再读就是空的，必须 `NopCloser`；
-2. **常量时间比对**：用 `hmac.Equal` 而非 `==`，防 timing oracle；
-3. **LimitReader**：大 body 攻击防护；
-4. **timestamp 防重放必须真拒绝**：仅签名不够，必须 pin 时间窗口；**缺 header 不能跳过校验**。
-
-**完整测试矩阵**（见 [API_TEST_GUIDE § 11](../API_TEST_GUIDE.md#11-hmac-webhook)）：
-
-| 用例 | Signature | Timestamp | 期望 |
-|---|---|---|---|
-| A 完全无头 | ❌ | ❌ | 401 missing signature |
-| B 有签名无 ts | ✅ | ❌ | 401 missing timestamp  ← P0 #5 关键回归 |
-| C 过期 ts | ✅ | 过去 1h | 401 expired or skewed |
-| D 未来 ts | ✅ | 未来 1h | 401 expired or skewed（新加） |
-| E 格式错 | ✅ | 非 RFC3339 | 400 invalid format |
-| F 错签名 | 错 | ✅ | 403 invalid signature |
-| G 全对 | ✅ | ✅ | 200 业务响应 |
-
-### 5.3 `SigningTransport`（hmac.go:174）
-
-`http.RoundTripper` 包装器，出站自动签：
-
-```go
-type SigningTransport struct {
-    Base    http.RoundTripper
-    Secret  []byte
-    Header  string
-}
-
-RoundTrip(req):
-    body := readAndReplace(req.Body)
-    sig := hmac-sha256(body, secret)
-    req.Header.Set(Header, "sha256="+hex(sig))
-    return Base.RoundTrip(req)
-```
-
-给 MCP client 的 `http.Client.Transport` 注入后，所有出站自动带签名。
-
----
-
-## 6. ★ Egress Policy —— 容器出网黑/白名单
-
-### 6.1 `EgressPolicy` (egress.go:18)
-
-```go
-type EgressPolicy struct {
-    Enabled       bool
-    DefaultAction string   // "deny" | "allow"  (生产 MUST "deny")
-    AllowedHosts  []string // "api.openai.com:443"
-    AllowedCIDRs  []string // "10.0.0.0/8"
-    BlockedCIDRs  []string // 生效优先级 > allowed
-    DNSAllowed    bool
-}
-```
-
-### 6.2 两个预置策略
-
-#### `DefaultEgressPolicy()` —— **最严**（给不可信代码）
-
-```
-Enabled: true, DefaultAction: deny
-BlockedCIDRs:
-  - 169.254.169.254/32  ← AWS/GCP 元数据端点
-  - 100.100.100.200/32  ← 阿里云元数据
-  - 10.0.0.0/8          ← 私有网 A
-  - 172.16.0.0/12       ← 私有网 B
-  - 192.168.0.0/16      ← 私有网 C
-DNSAllowed: false
-```
-
-**防范的威胁**：
-
-- **SSRF 攻 metadata endpoint**：AWS/GCP/阿里云的 `169.254.169.254` 能读到 instance role credentials —— 一旦代码 curl 它，整个账号可能沦陷；
-- **内网穿透**：即使沙箱逃逸，也打不到业务内网的 DB / Redis / k8s API；
-- **DNS tunnel exfil**：禁 DNS 防止用 DNS 查询偷数据。
-
-#### `InternalServiceEgressPolicy()` —— 可信 Agent 容器
-
-```
-AllowedCIDRs: ["10.0.0.0/8"]     ← 允许访问内网
-BlockedCIDRs: ["169.254.169.254/32"]   ← 仍禁 metadata
-DNSAllowed: true
-```
-
-用于 Agent 自己的服务容器（需要访问 Qdrant / Redis / MCP）。
-
-### 6.3 `EgressValidator` (egress.go:76)
-
-```go
-IsAllowed(host, port):
-    1. 先检查 BlockedCIDRs（否决优先）
-    2. 精确 host:port 白名单
-    3. CIDR 白名单 (allowedNets)
-    4. fallthrough: return DefaultAction == "allow"
-```
-
-**整合到 Docker 沙箱**：
-
-```go
-DockerNetworkMode() string:
-    if !policy.Enabled: return "bridge"
-    if len(AllowedHosts) == 0 && len(AllowedCIDRs) == 0: return "none"   // 完全断网
-    return "bridge"    // + 后续 iptables 过滤
-
-GenerateIptablesRules() []string:
-    // 可选：输出能直接 `iptables -A DOCKER-USER` 的规则串
-```
-
-Sandbox Manager（见 05_sandbox）在 ContainerCreate 时根据 `DockerNetworkMode()` 决定 network；对于 bridge 模式，额外用 iptables 规则精确控制。
-
-### 6.4 Go 层的 Egress 强制执行（新增 P0 #6）
-
-> ⚠️ **2026-05 更新**：此前 `EgressValidator.IsAllowed` **定义了但没有任何
-> 调用方**——它只出现在 `GenerateIptablesRules` 和 `_test.go` 里，本质是
-> "纸面文档"。现在新增了两个适配器，让策略在 Go HTTP client 层**真正生效**。
-
-**两层防御**：
-
-```text
-应用代码 http.Client.Do(req)
-            │
-            ▼
-┌───────────────────────────────┐
-│ L1: EgressTransport.RoundTrip │  ← URL 层
-│   if !IsAllowed(req.URL.Host) │
-│       return ErrEgressDenied  │    拒绝 allow-list 外的主机名
-└───────────────────────────────┘
-            │
-            ▼  （允许则委托给 http.Transport）
-┌───────────────────────────────┐
-│ L2: Dialer.Control            │  ← DNS 解析后，connect(2) 前
-│   解析出 IP xxx.xxx.xxx.xxx    │
-│   if !IsAllowed(ip)           │    挡住 DNS rebinding 到内网
-│       return ErrEgressDenied  │
-└───────────────────────────────┘
-            │
-            ▼
-        connect(2) 真正发起
-```
-
-**为什么需要两层**：
-- L1 快但粗：不消耗网络资源，但攻击者可以把 `allow.example.com` 的 DNS
-  指向内网 IP（DNS rebinding），然后用合法主机名绕过。
-- L2 精但晚：已经 DNS 解析完，此时看到的就是 kernel 即将 connect 的 IP。
-  所以不管 DNS 怎么玩，L2 总能拦住。
-
-**API**：
-```go
-// 仅 URL 层
-http.Client{Transport: &security.EgressTransport{Validator: v, Base: ...}}
-
-// 两层一次装配（推荐）
-client := security.NewEgressHTTPClient(v, 30*time.Second)
-```
-
-**Fail-open 策略**：`policy.Enabled=false` 时完全放行（开发环境友好）。
-`Enabled=true` 但 validator 构造失败时报 error 上抛——不静默 fallback。
-
-**集成状态**：类库已实现并通过单测（`TestNewEgressHTTPClient_BlocksLoopbackUnderDenyPolicy`
-模拟 `allow localhost` + `block 127/8` 场景，验证 L2 在 L1 放行后依然拦下）。
-**LLM / MCP / rerank 客户端的注入仍是 P1 待办**。
-
----
-
-## 7. 审计日志 `audit.Logger` (132 行)
-
-### 7.1 事件类型（10 种）
-
-```go
-const (
-    EventApprovalRequested
-    EventApprovalGranted
-    EventApprovalDenied
-    EventApprovalTimeout
-    EventSandboxExecution
-    EventMCPToolCall
-    EventSensitiveBlocked
-    EventSessionCreated
-    EventSessionDeleted
-    EventIndexingStarted
-)
-```
-
-### 7.2 `Event` 结构（audit/logger.go:31）
-
-```go
-type Event struct {
-    Timestamp time.Time
-    Type      EventType
-    SessionID, TaskID, UserID string
-    Action    string
-    Details   map[string]string   // flat KV，适合日志系统
-    IP        string
-    Success   bool
-    Error     string
-}
-```
-
-`Details` **是 flat map**（而非 `any`）—— 理由：zap 结构化日志、ES / Loki / Splunk 等 SIEM 系统最友好的是 `k:v` 扁平结构。不存嵌套。
-
-### 7.3 `Logger.Log` (logger.go:59)
-
-```
-Log(ctx, event):
-    if event.Timestamp.IsZero(): event.Timestamp = now
-    fields := [event_time, event_type, action, success]
-    if SessionID/TaskID/UserID/IP/Error: append
-    for k,v := range Details: append("detail_"+k, v)
-    zap.Info("audit", fields...)   // Level 故意是 INFO，不是 WARN
-```
-
-**设计点**：
-
-- **Named logger**：`baseLogger.Named("audit").With("log_type", "audit")`  
-  → 输出里都有 `"logger":"audit"` 字段 → 下游 SIEM 可用 `log_type=audit` 精确过滤，独立归档；
-- **不失败**：审计写入永远成功（zap 内部失败会丢，不 return error）—— 审计不能阻塞业务；
-- **无 DB 写**：审计走 zap，可通过 zap 的 sink（log shipper / Kafka / PostgreSQL store）灵活配置。实际也会写到 `audit_logs` 表（见 16_store）。
-
-### 7.4 便捷方法（专类事件）
-
-```go
-LogApproval(ctx, type, taskID, sessionID, action, success)
-LogSandboxExec(ctx, sessionID, language, exitCode, duration)
-LogMCPCall(ctx, serverName, toolName, success, errMsg)
-```
-
-帮调用者省去手写 Event 结构的样板代码。
-
----
-
-## 8. 合力：典型请求的安全链路
-
-```
-POST /api/v1/tasks/123/approve
+ValidateToken(tokenString)              ← jwt.go:186
     │
     ▼
-[recovery] → [requestID] → [tracing] → [metrics] → [IP rate limit]
-    │
+jwt.ParseWithClaims
+    │   sign method 必须 HMAC（防 alg=none 攻击）
+    │   exp 过期 → ErrTokenExpired
+    │   签名不匹配 → ErrTokenInvalid
     ▼
-[auth.AuthMiddleware]
-    └─ JWT.Validate(Bearer xxx) → claims{UserID=alice, Role=admin}
-    │
+检查内存吊销 map[jti]→time.Time         ← jwt.go:206
+    │   命中 → ErrTokenInvalid
     ▼
-[auth.RequireRole(admin,dev)]   ← ✅ alice 是 admin
-    │
+（仅 JWTManagerWithRedis）
+检查 Redis SISMEMBER jwt:revoked:<jti>  ← redis_revocation.go:79
+    │   命中 → ErrTokenInvalid
     ▼
-[PerUserRateLimiter]            ← ✅ 配额充足
-    │
-    ▼
-handleApproval:
-    orchestrator.HandleApproval(taskID, true, "alice")
-        └─ store.ResolveApproval(taskID, "approved", "alice")
-        └─ audit.LogApproval(EventApprovalGranted, taskID, sessionID, action, true)
-
-outbound → external MCP server
-    └─ http.Client{Transport: SigningTransport{secret}}
-        └─ 自动添加 X-Signature: sha256=<hex>
+return *Claims
 ```
 
-sandbox 执行时：
+### 4.3 Webhook 入站验签（MCP callback / 外部触发）
 
 ```
-sandbox.Execute
-    └─ EgressValidator.IsAllowed("api.openai.com", 443) → true  (白名单)
-    └─ EgressValidator.IsAllowed("169.254.169.254", 80) → false (BlockedCIDRs)
-    └─ ContainerCreate(NetworkMode=none)
-    └─ audit.LogSandboxExec(sessionID, "python", 0, 2.3s)
-```
-
----
-
-## 9. 设计权衡
-
-| 抉择 | 动机 |
-|---|---|
-| **JWT + API Key 双轨** | JWT 给人用（有 UI）；API Key 给机器用（脚本无 UI 无法交互登录） |
-| HS256 vs RS256 | HS256 简单 + 对称；单服务够用，多服务再升级 |
-| JWT **24h 有效期** | UX 和风险的平衡；撤销靠黑名单而非短 TTL |
-| **JTI 必填** + 黑名单 | 唯一方案能撤销 JWT |
-| **4 种 Role 而非 ACL** | RBAC 够用 + 简单；未来业务复杂时可过渡到 Casbin |
-| `RequireRole` **分组声明** | 路由声明式；handler 不写权限判定 |
-| **Per-IP + Per-User 双层限流** | IP 防 bot；User 防单人滥用；NAT 场景下仅 IP 不公平 |
-| HMAC **常量时间比对** | 防 timing oracle 攻击 |
-| HMAC **timestamp 防重放** | 仅签名不够，拦截 24h 前的 replay |
-| HMAC **body 重置** | 必须 `io.NopCloser`，否则 handler 读不到 body |
-| `SigningTransport` 透明化出站签名 | 业务代码无感；不用每个 mcp client 手动签 |
-| Egress 默认**全拒绝** | 安全需要"默认禁止，显式允许"；漏洞暴露面小 |
-| 明确屏蔽 **169.254.169.254** 等 metadata | SSRF + 云元数据窃取是真实攻击向量 |
-| Egress 默认**禁 DNS** | 防 DNS tunnel 数据泄露 |
-| 黑名单 CIDR **优先级高**于白名单 | 避免"白名单写大了，黑名单被无视"的配置失误 |
-| 审计事件 **zap.Named("audit")** | 下游 SIEM 独立提取；不与应用日志混 |
-| 审计 Details = **flat map** | ES/Loki 等系统最友好；避免嵌套难查询 |
-| 审计**不返回 error** | 审计失败不阻塞业务；loss 走 zap sink 监控 |
-| 审计**双写 zap + pg** | zap 快、pg 可查 |
-
----
-
-## 10. 后续演进
-
-- [ ] **JWT 升 RS256/ES256**：多服务部署时公钥验签；
-- [ ] **OIDC / OAuth2 接入**：对接 Okta / Azure AD / Keycloak；
-- [ ] **SPIFFE/SPIRE**：工作负载身份 + mTLS；
-- [ ] **Casbin ACL**：RBAC 遇到 "某用户可以 approve 自己创建的 task 但不能 approve 别人" 等复杂规则时切换；
-- [ ] **HMAC 密钥轮换**：`KID` header + 多 secret 同时生效 → 无停机轮换；
-- [ ] **Nonce 缓存**：HMAC 防重放加 nonce 去重（timestamp 粒度有限）；
-- [ ] **Egress 运行时拦截**（eBPF / CNI plugin）：不靠 iptables，按进程 + SNI 更精细；
-- [ ] **审计→Kafka→ES**：高写入量下 zap file sink 顶不住；
-- [ ] **审计区块链化（WORM）**：合规场景要求不可篡改；
-- [ ] **Rate limit 分布式**：当前内存实现在多 pod 下每个 pod 独立；Redis-based 全局限流；
-- [ ] **User bans**：黑名单 by UserID；
-- [ ] **IP reputation**：接入 AbuseIPDB 等；
-- [ ] **2FA / WebAuthn**：敏感操作二次验证；
-- [ ] **同态加密敏感字段**：审计日志里的 prompt / result 如含 PII 需加密；
-- [ ] **Policy-as-Code**（OPA / Rego）：egress / rbac 全部策略化；
-- [ ] **Metrics**：`auth_success_total / auth_failed_total{reason} / hmac_verify_failed_total / egress_denied_total{host} / audit_events_total{type}`。
-
----
-
-## 13. 实现剖析与改进方向
-
-### JWT 验证的完整时序
-
-```text
-client → Authorization: Bearer <token>
-           │
-           ▼
-AuthMiddleware
-    1. extract "Bearer <token>"
-    2. jwt.ParseWithClaims(token, claims, keyFunc)
-       ├── keyFunc: 校验 alg == HS256 (拒绝 alg=none)  ← 防 algorithm confusion
-       │           返回 []byte(secret)
-       └── 验签 + 解析
-    3. 如果 err contains "expired" → 401 ErrTokenExpired
-    4. 否则 err → 401 ErrTokenInvalid
-    5. 检查 revoked map（内存） → revoked: 401
-    6. c.Set("auth_claims", claims)
-           │
-           ▼
-RequireRole("admin")（可选的 RBAC 组）
-    - claims.Role == "admin"? 通过 / 否则 403
-           │
-           ▼
+POST /webhooks/...
+    │
+    ▼
+HMACVerifier.GinMiddleware              ← hmac.go:104
+    │
+    ▼ Step 1: X-Signature-256 header present?
+    │   missing → 401
+    │
+    ▼ Step 2: X-Timestamp present?      ← hmac.go:124 (REQUIRED — 最近修复)
+    │   missing → 401（缺 timestamp 是协议违规）
+    │   parse RFC3339 失败 → 400
+    │   |age| > 5min → 401（防重放 + 防时钟伪造）
+    │
+    ▼ Step 3: 读 body（限 1MB，防 DoS）
+    │
+    ▼ Step 4: VerifySignature(body, sig, timestamp)
+    │   computeHMAC = HMAC-SHA256(secret, timestamp + "\n" + body)
+    │   hmac.Equal (constant-time)
+    │   不匹配 → 403
+    │
+    ▼
 Handler
-    - 从 c.Get("auth_claims") 拿 claims
-    - 业务逻辑
 ```
 
-### HMAC 验证的 7 步（Webhook 场景）
+### 4.4 出向 HTTP 请求 SSRF 防御（Southbound）
 
-```text
-incoming POST /webhooks/mcp-callback
-  │
-  │ Step 1. extract X-Signature-256       → 缺失 401
-  │
-  │ Step 2. timestamp check (P0 #5 修复)
-  │   - X-Timestamp 缺失 → 401 missing   ← 以前会跳过
-  │   - parse RFC3339 失败 → 400
-  │   - |age| > MaxTimestampAge → 401 expired/skewed
-  │
-  │ Step 3. read body under LimitReader (1 MiB)
-  │   - 读失败 → 400
-  │   - 重置 c.Request.Body = NopCloser(body)   ← 关键，handler 还要读
-  │
-  │ Step 4. compute HMAC-SHA256(body, secret)
-  │
-  │ Step 5. hmac.Equal(computed, provided)     ← 常量时间比较
-  │   - 不等 → 403 invalid signature
-  │
-  │ Step 6. c.Next() → handler
-  │
-  │ Step 7. handler 从 body 读取 payload 处理
+```
+LLM/MCP HTTP client.Do(req)
+    │
+    ▼ EgressTransport.RoundTrip          ← egress.go:309 (L1 URL 层)
+    │   解析 req.URL.Host + port
+    │   IsAllowed(host, port)？
+    │   ├─ host 是主机名（非 IP）+ deny-default → 拒绝
+    │   └─ host 是 IP → 检查黑/白 CIDR
+    │   不允许 → ErrEgressDenied
+    │
+    ▼ Base transport.RoundTrip
+    │
+    ▼ Dialer.DialContext
+    │
+    ▼ DNS resolver → IP
+    │
+    ▼ Dialer.Control(network, "<IP>:port")  ← egress.go:363 (L2 IP 层)
+    │   net.SplitHostPort + strconv.Atoi
+    │   IsAllowed(IP, port)？
+    │   ├─ 命中 BlockedCIDRs（169.254.169.254 等） → 拒绝
+    │   └─ deny-default 且不在 AllowedCIDRs → 拒绝
+    │   不允许 → ErrEgressDenied
+    │
+    ▼ syscall.connect(2)
 ```
 
-### API Key 查找的常量时间性质
+L1 拦截 90% 攻击，但对手控制 DNS 时仍能让 `safe.com → 169.254.169.254`。L2 在 connect(2) 之前看实际 IP，是真正的 SSRF 防线。
+
+### 4.5 出向 HMAC 签名（Agent → MCP server）
+
+```
+SigningTransport.RoundTrip               ← hmac.go:201
+    │
+    ▼ 读取 req.Body 全量到内存
+    │
+    ▼ timestamp = time.Now().UTC().Format(RFC3339)
+    │
+    ▼ signature = "sha256=" + HMAC(secret, ts + "\n" + body)
+    │
+    ▼ Header.Set("X-Signature-256", signature)
+    ▼ Header.Set("X-Timestamp", timestamp)
+    │
+    ▼ Base.RoundTrip
+```
+
+注意 `SigningTransport` 不强制要求外层叠 EgressTransport——但生产环境装配时**应当**叠加。
+
+---
+
+## 5. 实现细节
+
+### 5.1 Claims 结构 vs `_principles.go` 文档的偏离
+
+`_principles.go:18` 注释写：
+
+```
+· roles : []string (admin / dev / readonly / service)
+```
+
+但 `jwt.go:79-85` 的实际定义：
 
 ```go
-// ❌ 反例（如果我们用 map）
-entry, ok := s.keys[plaintextKey]  // Go map 是 probabilistic，
-                                   // 不命中时时间比命中短（没遍历 bucket）
-if !ok { return nil, false }
-return entry, true
+type Claims struct {
+    jwt.RegisteredClaims
+    UserID   string `json:"user_id"`
+    TenantID string `json:"tenant_id,omitempty"`
+    Role     Role   `json:"role"`     // ← 单字段，非切片
+    Email    string `json:"email,omitempty"`
+}
+```
 
-// ✅ 现在的实现
-want := sha256(plaintextKey)
-var matched *APIKeyEntry
+**结论**：代码是 `Role` 单字段，文档是 `roles[]`。`GenerateToken(userID, tenantID, role Role, email)` 签名也是单角色。
+**修复方向**（任选其一）：
+- A) 改代码：`Role []Role` + JSON `roles`，迁移老 token。
+- B) 改文档：把 `_principles.go` 注释改成 `role: string`。
+
+**当前建议**：保持代码现状（B 方案），多角色用"组合角色"模式（如 `admin-dev`）或上线时再迁移。**不要**为了对齐文档强行改 Claims，会破坏所有已签发 token。
+
+### 5.2 JWT Secret 默认值的 P0 风险
+
+`jwt.go:96-103` + `cmd/agent/main.go:407-409`:
+
+```go
+if jwtCfg.SecretKey == "" {
+    jwtCfg = auth.DefaultJWTConfig()           // ← 调用 mustGenerateSecret()
+    logger.Warn("using auto-generated JWT secret ...")
+}
+```
+
+`mustGenerateSecret()` 每次启动随机生成 32 字节 hex。
+
+**后果**：
+- 多 Pod 部署时每个 Pod 各自有不同 secret → Pod A 签发的 token 在 Pod B 无效。
+- Pod 重启 → 所有现存 token 立刻失效。
+- 仅 Warn 日志提示，未走 Fatal。
+
+**修复建议**：生产部署必须设 `CODE_AGENT_AUTH_JWT_SECRET` 环境变量。可选改进：当 `cfg.Auth.Enabled=true && jwtCfg.SecretKey==""` 时 fatal 而非 warn。
+
+### 5.3 Refresh Token 是声明而未实现
+
+`JWTConfig.RefreshExpiry: 7 * 24 * time.Hour` 字段存在，main.go L393-399 也解析了 `cfg.Auth.RefreshExpiry`，但：
+
+```
+$ rg -n "refresh|Refresh" internal/api/*.go | rg -v test
+（无任何路由或 handler 匹配）
+```
+
+**结论**：没有 `POST /auth/refresh` endpoint。Token 15 分钟过期后必须重新登录，没法续签。
+**影响**：UI 长会话需要每 15min 弹一次登录。
+**修复方向**：
+- 实现 `POST /auth/refresh`：验旧 token（即使过期但仍在 RefreshExpiry 内）→ 签新 token。
+- 或者把 `TokenExpiry` 调到 1 小时（仍短于 RefreshExpiry）。
+
+### 5.4 APIKeyStore 的常量时间遍历
+
+`jwt.go:281-301`：
+
+```go
 for i := range s.entries {
-    if subtle.ConstantTimeCompare(s.entries[i].hash[:], want[:]) == 1 {
-        e := s.entries[i].entry
+    rec := &s.entries[i]
+    if subtle.ConstantTimeCompare(rec.hash[:], want[:]) == 1 {
+        e := rec.entry
         matched = &e
-        // 注意：不 break，继续遍历保持运算量恒定
+        // 注意：不 break
     }
 }
 return matched, matched != nil
 ```
 
-**关键点**：
-1. `subtle.ConstantTimeCompare` 遍历比较每个字节（没有短路）
-2. 匹配成功后不 break，继续遍历其他条目
-3. 总遍历次数 = len(entries)，不受密钥存在与否影响
-4. 现实中 HTTP 栈噪声远大于这点差异，但 defense-in-depth 原则
+**关键细节**：
+- 计算量 O(N)，N 是 API key 总数。
+- 不论命中位置，每次调用耗时恒定（取决于 N）。
+- 即使重复命中（理论上不可能，hash collision 才会），后命中覆盖前面。
 
-### 利弊评估
+**性能考量**：N < 1000 时单次验证 < 100μs，可接受。N 大到 5000+ 应改用预排序 + Bloom filter 加常量时间分支模板，但目前没必要。
 
-**优势（Pros）**
-- ✅ 7 层防御纵深，单点失效不等于全面失守
-- ✅ JWT + API Key 双轨，交互用户 vs 服务账号都覆盖
-- ✅ HMAC timestamp 必填 + 两端约束（旧 & 未来）
-- ✅ APIKey 常量时间比对 + 哈希存储（零 plaintext）
-- ✅ Egress 两层（URL + IP）防 SSRF + DNS rebinding
+### 5.5 RequireRole 的 Admin 自动绕过
 
-**代价（Cons）**
-- ⚠️ JWT 撤销仅内存 map（重启即重置；Redis 撤销 store 已写但未接入）
-- ⚠️ JWT Secret 无 rotation 机制
-- ⚠️ API Key 无 expiration / rotation
-- ⚠️ Egress 类库已写但 LLM/MCP client 未接（类库在等）
-- ⚠️ HMAC 无 **nonce 缓存**——两次同样的 signed 请求都会被接受（依赖
-  timestamp 窗口，但 5min 窗口内 replay 可行）
-- ⚠️ Audit log 仅本地，重启可能丢
+`jwt.go:368-372`:
 
-### 可改进点
+```go
+if claims.Role == RoleAdmin {
+    c.Next()
+    return
+}
+```
 
-**P0**
-1. Egress validator 接入 LLM / MCP / rerank 的 HTTPClient
-2. Redis rate limiter 接入 middleware（见 17 § 13）
-3. JWT 撤销查 Redis（当前仅内存 map）
+**含义**：`RequireRole(RoleDev)` 让 `admin` 和 `dev` 都通过，而**不是**只让 `dev`。
+这是符合预期的（admin 应当能做 dev 能做的），但下游 handler 如果按 `Role == RoleDev` 做分支判断，会和这里的语义不一致。
 
-**P1**
-4. HMAC nonce 缓存（5min TTL Redis SET），防 timestamp 窗口内重放
-5. JWT Secret rotation：两个 key 并存，新签名用 new，验证接受 both，old 过期后淘汰
-6. API Key 加 `expires_at` 字段，Validate 时检查
+**修复方向**：handler 内部判定权限时不要直接比对 `claims.Role`，而是用 `claims.HasRole(...)` 辅助方法（当前未实现，可加）。
 
-**P2**
-7. Audit log 写 Kafka → S3/OSS 归档
-8. Egress 规则热加载（改配置不重启）
-9. eBPF 层真正 drop 包（iptables 规则外再一层）
-10. API Key 哈希加 salt（防 rainbow table）—— 当前是纯 SHA-256
+### 5.6 X-API-Key 优先于 JWT 的设计
+
+`jwt.go:315-326`：
+
+```go
+if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
+    entry, ok := apiKeys.Validate(apiKey)
+    if !ok {
+        c.AbortWithStatusJSON(http.StatusUnauthorized, ...)
+        return        // ← X-API-Key 存在但无效 → 直接拒绝，不 fallback 到 JWT
+    }
+    ...
+    c.Next()
+    return            // ← 命中 API Key 后不再检查 JWT
+}
+```
+
+**关键约束**：客户端**不能**同时发 X-API-Key 和 Authorization。如果 X-API-Key 存在但错误，请求被拒绝，即使 Authorization 是合法 JWT。
+**这是有意为之**：避免靠"碰运气"试出有效凭证。
+
+### 5.7 限流双轨：进程内 vs Redis
+
+`router.go:187-189` 的逻辑（参考 17_api §5.1）：
+
+```go
+if rdb != nil {
+    rateLimiter = auth.NewRedisRateLimiter(rdb, ...)
+} else {
+    rateLimiter = auth.NewPerUserRateLimiter(...)
+}
+```
+
+| 维度 | 进程内 `PerUserRateLimiter` | Redis `RedisRateLimiter` |
+|---|---|---|
+| 算法 | Token bucket（突发友好） | Fixed window（INCR + EXPIRE） |
+| 跨副本共享 | 否（N 副本 = N × rate） | 是（Lua 原子） |
+| Redis 故障 | 不可用（Redis 故障 = 整个 Agent 故障） | fail-open（继续放行） |
+| 突发处理 | burst 字段控制 | 跨窗口边界可达 2× 配置速率 |
+| CPU 开销 | 极低 | 每请求一次 EVAL RTT |
+| 内存 | 每 key 一个 bucket，5min cleanup | Redis 内 TTL 自动清理 |
+
+**为什么 Redis 路径不 fallback 到进程内**：fallback 意味着 Redis 抖动时所有副本的限流被重置成各自计数，反而放过更多流量。fail-open 是经过权衡的选择。
+
+### 5.8 Redis 限流 Lua 脚本的原子性
+
+`redis_ratelimit.go:63-72`：
+
+```lua
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+if count > tonumber(ARGV[2]) then
+  return 0
+end
+return 1
+```
+
+**为什么必须 Lua**：单独 `INCR` + `EXPIRE` 两步在两个 Pod 同时打到 `count=0` 的 key 时，可能两个 Pod 都 INCR 到 1，但只有一个执行 EXPIRE，另一个没 EXPIRE → 这个 key 永远不过期 → 此 bucket 用户永久被拒。Lua 把 INCR 和 EXPIRE 包进单线程原子段。
+
+### 5.9 JWTManagerWithRedis 装饰器模式
+
+`redis_revocation.go:65-91`：
+
+```go
+type JWTManagerWithRedis struct {
+    *JWTManager      // 内嵌
+    redisRevoke *RedisRevocationStore
+}
+
+func (m *JWTManagerWithRedis) ValidateToken(tokenString string) (*Claims, error) {
+    claims, err := m.JWTManager.ValidateToken(tokenString)  // 先走内存
+    if err != nil {
+        return nil, err
+    }
+    if m.redisRevoke.IsRevoked(context.Background(), claims.ID) {  // 再查 Redis
+        return nil, ErrTokenInvalid
+    }
+    return claims, nil
+}
+```
+
+**特点**：
+- 通过**结构体嵌入** + **方法重写**实现装饰。`*JWTManager` 上的其他方法（GenerateToken 等）自动继承。
+- `IsRevoked` 用 `context.Background()`——**请求 context 未透传**，超时和 trace span 都丢了。
+
+**风险**：Redis 慢响应 → 整个 HTTP 请求挂起 30s（go-redis 默认超时）而非按 gin request ctx 取消。
+**修复方向**：把 `ValidateToken(ctx, tokenString)` 改成接受 context 的签名，AuthMiddleware 传 `c.Request.Context()`。需要修改接口契约，是 P2 重构。
+
+### 5.10 HMAC：timestamp 必填（最近 P0 修复）
+
+`hmac.go:124-136`：
+
+```go
+if v.cfg.TimestampHeader != "" && v.cfg.MaxTimestampAge > 0 {
+    tsHeader := c.GetHeader(v.cfg.TimestampHeader)
+    if tsHeader == "" {
+        // 拒绝（之前是 silently skip — 重放保护被绕过）
+        c.AbortWithStatusJSON(http.StatusUnauthorized, ...)
+        return
+    }
+    ...
+}
+```
+
+**修复前的漏洞**：攻击者抓一个合法签名的请求，删除 X-Timestamp 头然后重放——middleware 直接跳过时间检查，签名仍有效（因为旧实现的 HMAC 没把 timestamp 计入），整个重放保护失效。
+**修复后**：缺 timestamp 直接 401；signature 计算把 timestamp 拼到 body 前缀，篡改 timestamp 即破坏签名。
+
+### 5.11 HMAC：computeHMAC 的 "timestamp + \n + body"
+
+`hmac.go:86-92`：
+
+```go
+mac.Write([]byte(timestamp))
+mac.Write([]byte("\n"))
+mac.Write(payload)
+```
+
+**为什么用 `\n` 分隔**：避免 length-extension 风格的歧义。例如 `ts="123" body="456"` vs `ts="12" body="3456"` 如果不加分隔符，两者 HMAC 输入相同——攻击者可以伪造任意 timestamp/body 拼接。`\n` 是简单且 RFC-safe 的分隔符。
+
+### 5.12 Egress：DefaultEgressPolicy 的黑名单清单
+
+`egress.go:103-110`:
+
+```
+169.254.169.254/32   ← AWS / GCP 元数据
+100.100.100.200/32   ← Alibaba Cloud 元数据
+10.0.0.0/8           ← 私网 A
+172.16.0.0/12        ← 私网 B
+192.168.0.0/16       ← 私网 C
+```
+
+**遗漏**（建议补充）：
+- `fd00::/8` — IPv6 ULA
+- `fc00::/7` — IPv6 私网
+- `::1/128` 和 `127.0.0.0/8`（loopback）—— 当前依赖 deny-default 拦下
+- OCI / 华为云的元数据端点（与 AWS 不同 IP，需调研）
+
+### 5.13 Egress：DockerNetworkMode 与沙箱集成
+
+`egress.go:232-244`：
+
+```go
+if v.policy.DefaultAction == "deny" && len(AllowedHosts)==0 && len(AllowedCIDRs)==0 {
+    return "none"             // ← 沙箱完全隔离网络
+}
+return "code-agent-sandbox"   // ← 自定义网络名（外部 iptables 应用规则）
+```
+
+**当前状态**：沙箱 (05_sandbox) 默认 `NetworkMode: "none"`，与此返回值一致。**但 `code-agent-sandbox` 网络在 docker 中并未自动创建**——`GenerateIptablesRules()` 只生成字符串，**没有自动注入** iptables 规则的代码路径。
+
+### 5.14 Egress 只接 LLM/MCP，未接沙箱
+
+`cmd/agent/main.go:148-165` 的装配：
+
+```go
+if cfg.Security.EgressEnabled {
+    ...
+    egressHTTPClient = security.NewEgressHTTPClient(...)
+}
+llmClient, _ := llm.NewClientWithOptions(&cfg.LLM, nil, egressHTTPClient, logger)   // ← LLM
+...
+mcpGateway, _ := mcp.NewGateway(&cfg.MCP, egressHTTPClient, logger)                  // ← MCP
+```
+
+**重要**：沙箱 (sandbox.Manager) 不使用 egressHTTPClient。沙箱的网络隔离靠 Docker `NetworkMode: "none"`，**不**靠 Go 层 SSRF 防御。
+**如果沙箱将来允许网络访问**（比如允许 LLM 工具调用外部 API），必须给沙箱也装配 egressHTTPClient。
 
 ---
 
-下一篇：`19_observability.md` —— Metrics (Prometheus) + Tracing (OTel) + Error 规范 + 对象池。
+## 6. 设计权衡
+
+### 6.1 JWT 黑名单 vs 短 TTL
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| **短 TTL（15min）** | 无中心化吊销表 | 撤销窗口最长 15min |
+| **黑名单（Redis）** | 即时撤销 | 每请求一次 Redis RTT |
+| **当前实现：两者都用** | 即时撤销 + 自动清理 | Redis 慢响应影响所有 API |
+
+理由：15min 已够短，但管理员强制下线场景仍需要"立刻"生效，所以叠加 Redis 黑名单。代价是单点依赖。
+
+### 6.2 限流策略：Token bucket vs Fixed window
+
+为什么进程内用 token bucket、Redis 用 fixed window？
+
+- Token bucket 在内存里维护 `lastReset` 时间戳，每次请求 lock-free 计算补充——CPU 廉价。
+- Fixed window Lua 脚本只用一次 INCR + 一次 EXPIRE，网络往返一次。如果改用 token bucket 需要 GET + SET + EXPIRE 多步原子，或者用 Redis sorted set 模拟 sliding window——两个都更贵。
+- Fixed window 的缺陷"边界突发可达 2×"对 HTTP 限流来说**完全可以接受**。
+
+### 6.3 API Key vs JWT 的并存
+
+**为什么不统一**：
+- JWT：交互式用户登录，有过期、续签需求。
+- API Key：CI/服务账号，长寿命、不能续签、不能交互式登录。
+
+强行用 JWT 给 CI 意味着要给 CI 写续签逻辑或者用 100 年 TTL（等于没 TTL）。两套机制并存是 industry 标准（GitHub / Stripe 都这么干）。
+
+### 6.4 HMAC 而不是 mTLS
+
+HMAC 优点：
+- 无需 CA / 证书轮换。
+- 配置一个 secret 即可，秘钥分发用现有秘密管理（Vault / env）。
+
+mTLS 优点：
+- TLS 握手层就拒绝，对端连握手都过不了，更早。
+- 不用每请求验签 CPU。
+
+**当前选 HMAC 的理由**：MCP server 是异构生态（Python / Node / Go），mTLS 配置在每个 server 都要做一遍；HMAC 一个 secret 全搞定。生产规模上去后可以叠加 mTLS。
+
+### 6.5 Egress 两层 vs 容器网络隔离
+
+**理论上**：Docker `NetworkMode: "none"` + iptables 已经能挡 SSRF。
+**为什么还要 Go 层两层**：
+- 沙箱外的代码（如 LLM 客户端、MCP gateway）跑在 Agent 主进程里，**不受沙箱网络隔离影响**。
+- 主进程的 LLM 调用经过 LLM 提供商（OpenAI / Anthropic）的 API 域名，理论上是安全的，但万一 LLM 提供商被劫持或 DNS 中毒，Egress 层是最后防线。
+
+### 6.6 Fail-Open 的明确成本
+
+**Redis 失效时**：
+- 限流：放行所有流量。如果 Redis 失效持续 10min，Agent 在被 DDoS 时无法保护。
+- JWT 吊销：被吊销的 token 在 Redis 故障期间仍能用。
+
+**为什么仍选 fail-open**：Redis 失效本身是 SEV1 事件（session 全失效），相比之下限流和吊销退化是次要影响。如果改成 fail-close，Redis 抖动时 100% 请求 503，对用户体验是灾难性的。
+
+监控告警可以填补这个空隙：Redis 失效 → 立即触发告警 → 人工介入。
+
+---
+
+## 7. 后续演进
+
+### 7.1 短期（1-2 sprint）
+
+| 项 | 优先级 | 描述 |
+|---|---|---|
+| JWT secret 启动 fatal | P0 | `auth.Enabled=true && JWTSecret==""` 时 fatal 而非 warn |
+| POST /auth/refresh | P1 | 实现 refresh token endpoint |
+| Egress 黑名单补 IPv6 | P1 | 补 `fd00::/8` `fc00::/7` `::1/128` `127.0.0.0/8` |
+| `ValidateToken(ctx, token)` | P2 | 把 context 透传，让 Redis 调用可以被请求超时取消 |
+| HMAC body size 校验前置 | P3 | 当前 1MB 限是边界，应该做 Content-Length 预检 |
+
+### 7.2 中期
+
+| 项 | 描述 |
+|---|---|
+| OIDC 集成 | 支持企业 SSO（Okta / Azure AD），用户态从外部 IdP 来 |
+| Token Introspection | 替代 Redis 黑名单，用 RFC 7662 active 检查 |
+| 多 secret 轮换 | 同时持有 2 个 secret，新签用 v2，旧 token 仍能 v1 验签 |
+| 沙箱接 egressHTTPClient | 如果沙箱允许网络访问，必须先把 egress 接上 |
+| Cilium NetworkPolicy 注入 | `GenerateIptablesRules` 转成 Cilium policy yaml |
+
+### 7.3 长期
+
+| 项 | 描述 |
+|---|---|
+| Zero Trust 网格 | mTLS + SPIFFE Workload Identity |
+| 行为画像限流 | 不只是固定窗口，按用户 LLM tool 调用模式建模异常 |
+| HSM / KMS 集成 | JWT signing key 放 KMS，每次签名走 KMS API |
+
+---
+
+## 8. 设计教训
+
+### 8.1 缺失 timestamp 的 HMAC 是装饰品
+
+之前实现中，若 `TimestampHeader` 配了但请求没带，代码 silently skip。攻击者抓一个合法签名包，扔掉 timestamp 头重放——签名仍 valid（旧实现 HMAC 输入也没含 timestamp），整个重放保护失效。
+
+**教训**：**安全配置项一旦启用，就必须 fail-close**。"配置存在但缺值" 不能等同于 "未配置"。这是 hmac.go 最近修复的核心思想。
+
+### 8.2 `Role` 单字段 vs `roles[]`：文档先行的风险
+
+`_principles.go` 提前写了"roles 是数组"，但实际实现因为简单和 backward-compat 用了单字段。结果是：
+- 新读者看文档以为支持多角色。
+- 代码评审走不到这层细节。
+- 任何"对齐文档"的修改会破坏现存 token。
+
+**教训**：**`_principles.go` 这种文档源头必须和代码强一致**。审计时要发现并修正，而不是让两者长期漂移。
+
+### 8.3 `mustGenerateSecret()` 是开发便利的反模式
+
+设计目标：开发者本地启动 Agent 不用配 secret。
+副作用：生产部署忘了配 secret 也不会失败，只在日志里 warn 一行，多 Pod 部署立刻数据面崩溃。
+
+**教训**：开发便利的 fallback **必须在生产配置 explicit 时失败**。`cfg.Auth.Enabled=true` 已经是生产意图的信号，此时 secret 缺失应当 fatal。
+
+### 8.4 装饰器模式 + 内嵌结构体的隐式契约
+
+`JWTManagerWithRedis` 内嵌 `*JWTManager`，重写 `ValidateToken`。但**仍保留** `JWTManager.RevokeToken(jti)` 方法可被外部调用——这个方法只更新内存 map，**不写 Redis**。Decorator 提供的 `RevokeToken(ctx, jti, ttl)` 才同时写两边。
+
+如果 handler 写 `m.RevokeToken("...")` 而 `m` 类型是 `*JWTManagerWithRedis`，Go 方法分发选最具体的——但**如果方法签名不同（一个有 ctx 一个没有），编译器允许两者共存**。这种重载二义性容易写错。
+
+**教训**：装饰器模式必须**强制**重写方法签名一致或者 hide 老方法。当前实现两者签名故意不同（一个有 ctx），但这反而让调用方易错。应当：
+- 方案 A：`JWTManagerWithRedis` 实现 `interface` 而不内嵌。
+- 方案 B：内嵌但额外提供 `RevokeTokenSync(jti)` panic-on-call 警告。
+
+### 8.5 SSRF 单层防御 = 没防
+
+DNS Rebinding 是真实存在的攻击。L1 URL 层只看 `req.URL.Host`，攻击者用 allow-listed `safe.com` 但配置 DNS 返回 169.254.169.254，请求直接到元数据端点。Go 标准库的 `Dialer.Control` 是 L2 拦截的唯一干净 hook 点——connect(2) 之前能看到实际 IP。
+
+**教训**：边界防御**默认是单层不够**。设计时先问"这一层被绕过会怎样"，再确定第二层在哪。
+
+### 8.6 限流 fail-open 是有意识的选择，不是疏漏
+
+Redis 故障时 fail-open 在审计时常被批评为安全漏洞。实际上是**可用性优先于安全**的明确取舍：限流的核心目的是防 DoS，但限流系统本身故障变成 DoS 自身是更严重的问题。
+
+**教训**：每条 fail-open 路径都要在代码注释 + 文档明确说明"这是有意的，因为 X"。否则下次审计来人会把它"修复成" fail-close，业务可用性直接掉。
+
+---
+
+## 9. 已知缺陷一览（含来源行号）
+
+| 编号 | 级别 | 文件 | 行 | 现象 | 修复建议 |
+|---|---|---|---|---|---|
+| AS-1 | P0 | `cmd/agent/main.go` | 407-409 | JWT secret 空时只 warn，多 Pod 直接崩 | 改 fatal |
+| AS-2 | P1 | `auth/redis_revocation.go` | 79-91 | `ValidateToken` 内部用 `context.Background()` | 改成接受 ctx 参数 |
+| AS-3 | P1 | 全包 | — | RefreshExpiry 配了但无 `/auth/refresh` 路由 | 实现 refresh endpoint |
+| AS-4 | P1 | `internal/auth/_principles.go` | 18 | 注释 `roles[]` 与代码 `Role` 单字段冲突 | 改注释 |
+| AS-5 | P2 | `security/egress.go` | 103-110 | DefaultEgressPolicy 缺 IPv6 私网 | 补 `fd00::/8` `fc00::/7` |
+| AS-6 | P2 | `security/egress.go` | 249-278 | `GenerateIptablesRules` 仅返回字符串，无自动应用 | 接入 Cilium 或 docker network plugin |
+| AS-7 | P2 | `auth/redis_ratelimit.go` | 79-95 | fail-open 缺少 metrics 暴露 | 加 `ratelimit_redis_fail_open_total` 计数 |
+| AS-8 | P3 | `auth/jwt.go` | 368-372 | Admin 自动绕过 RequireRole 未在文档凸显 | 在 `_principles.go` 补一段 |
+
+---
+
+## 10. 测试矩阵
+
+| 测试文件 | 覆盖范围 | 关键用例 |
+|---|---|---|
+| `jwt_test.go` (274 行) | JWT 签发 / 验签 / 吊销 / APIKeyStore / RequireRole | `TestJWTLifecycle` / `TestRequireRoleAdminBypass` / `TestAPIKeyConstantTime` |
+| `redis_ratelimit_test.go` (141 行) | Redis 固定窗口 + Lua 原子性 | `TestConcurrentIncrement` / `TestFailOpenOnRedisError` |
+| `egress_test.go` (342 行) | EgressPolicy / EgressValidator / 两层 SSRF | `TestDNSRebindingBlocked` / `TestMetadataEndpointAlwaysBlocked` |
+| `hmac_test.go` (172 行) | HMAC 验签 + timestamp + body limit | `TestMissingTimestampRejected` / `TestSignatureMismatchReturns403` |
+
+**未覆盖**：
+- `JWTManagerWithRedis` 在 Redis 网络抖动时的行为（需要 chaos 测试）。
+- `SigningTransport` 与 `EgressTransport` 叠加时的双层签名（手动验证过，无自动化测试）。
+
+---
+
+## 11. 配置示例
+
+`configs/config.yaml` 中相关段落：
+
+```yaml
+auth:
+  enabled: true
+  jwt_secret: ${CODE_AGENT_AUTH_JWT_SECRET}    # 32 字节 hex，必填生产
+  jwt_issuer: "code-agent"
+  token_expiry: 15m
+  refresh_expiry: 168h                          # 7 天（refresh 未实现，但已解析）
+
+  ratelimit:
+    requests_per_second: 10
+    burst_size: 20
+
+security:
+  hmac_enabled: true
+  hmac_secret: ${CODE_AGENT_SECURITY_HMAC_SECRET}
+  hmac_header: "X-Signature-256"
+  hmac_timestamp_header: "X-Timestamp"
+  hmac_max_age: 5m
+
+  egress_enabled: true                          # 生产强烈建议 true
+  egress_policy:
+    default_action: "deny"
+    allowed_hosts:
+      - "api.openai.com:443"
+      - "api.anthropic.com:443"
+    blocked_cidrs:
+      - "169.254.169.254/32"
+      - "100.100.100.200/32"
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+```
+
+环境变量覆盖：
+
+```bash
+export CODE_AGENT_AUTH_JWT_SECRET=$(openssl rand -hex 32)
+export CODE_AGENT_SECURITY_HMAC_SECRET=$(openssl rand -hex 32)
+```
+
+---
+
+## 12. 与 17_api 的交互点
+
+| API 路由组 | 中间件链 |
+|---|---|
+| `/healthz` `/readyz` `/metrics` | （仅基础链，无 auth） |
+| `/api/v1/chat*` | `AuthMiddleware` |
+| `/api/v1/mcp/servers` `/skills` `/index` `/projects` `/tasks` `/approve` `/tools` `/dynamic` | `AuthMiddleware` + `RequireRole(admin, dev)` |
+| `/api/v1/debug/p0/*` | `AuthMiddleware`（**未**叠加 RequireRole — 17_api 已记 P0） |
+| `/webhooks/*`（未实现，预留） | `HMACVerifier.GinMiddleware` |
+
+---
+
+## 13. 跨文档引用
+
+- `17_api.md` §5 中间件链 — `AuthMiddleware` / `RequireRole` 的具体装配
+- `05_sandbox.md` §4 网络隔离 — 与 `DockerNetworkMode()` 的关系
+- `03_llm.md` §3 HTTP 客户端 — `egressHTTPClient` 注入点
+- `06_mcp.md` §6 安全 — `SigningTransport` 装配
+- `19_observability.md`（下一篇） — 限流 fail-open 的 metrics 暴露 + audit logger
+
+---
+
+下一篇：[`19_observability.md`](19_observability.md) —— Metrics / Tracing / Audit / Logging 全栈可观测性。

@@ -108,27 +108,41 @@ resolveRuntime → ensureImage → 解析内存/CPU限制 → ContainerCreate
 
 ### Gateway
 
-`Gateway` (`internal/mcp/client.go`)：多服务器聚合器。
+`Gateway` (`internal/mcp/client.go`)：多服务器聚合器。**每个服务器背后是一个 ConnPool**，不再是裸 `*ServerConnection`。
 
-- `servers map[string]*ServerConnection`
-- 初始化流程：`initialize` → `notifications/initialized` → `tools/list`
-- `FindServerForTool()` 线性扫描所有服务器（N 通常很小）
-- 运行时动态管理：`AddServer`, `RemoveServer`, `ListServers`
+- `servers map[string]*ConnPool`
+- 初始化：`NewGateway` → `pool := NewConnPool(serverCfg) → pool.Start(ctx, gw.initializeServer)`，handshake 闭包封装 `initialize` → `notifications/initialized` → `tools/list` 三步
+- `toolIndex map[string]string` O(1) 查询 toolName → serverName
+- `CallTool` 委托 `pool.CallTool`（least-pending + atomic CAS 选择 slot）
+- 运行时动态管理：`AddServer`, `RemoveServer`, `ListServers` 均以 pool 为单位
 
 ### 连接池
 
 `ConnPool` (`internal/mcp/pool.go`)：多子进程连接池。
 
+- 由 `MCPServerConfig.PoolSize` 控制；`PoolSize<=1` 等价单连接（向后兼容，无需配置迁移）
 - 最少挂起负载均衡（O(N) 扫描，N≤8）
-- `Start()` 并行 fork N 个进程，要求 minAlive（默认 size/2）
-- `CallTool` 选择连接发送阻塞请求
+- `Start()` 并行 fork N 个进程并完成 handshake；要求 minAlive（默认 size/2）
+- `CallTool` 选择连接发送阻塞请求；内部 `parseToolResult` 合并 text content（O(n) 一次性 buf）
 - `CallToolStream` 注入 `_meta.progressToken`，订阅进度通道，合并进度块与最终结果
-
-**注意**：`ConnPool` 与 `Gateway` 是并行抽象——Gateway 仍使用单 `*ServerConnection`/服务器，ConnPool 尚未完全集成到 Gateway 主路径。
+- 测试辅助：`newSingletonPool(cfg, conn, logger)` 把已构造的 ServerConnection 包成 1-slot pool
 
 ### 健康检查
 
-`healthChecker` (`internal/mcp/reconnect.go`)：定期进程存活检查，指数退避重连（Initial=1s, Max=30s, MaxRetries=5）。
+`healthChecker` (`internal/mcp/reconnect.go`)：
+
+- `isProcessAlive(conn)` 两层判定：
+  1. `conn.exited` 原子位——由 reaper goroutine 在 `cmd.Wait()` 返回时置 true；Wait 同时**回收僵尸**，这是检出"已 exit 但 PID 仍占着进程表"的唯一可靠手段
+  2. `Process.Signal(syscall.Signal(0))`——处理 exit 与 reaper 回归之间的短暂竞态：`ESRCH` 视为死，其他错误（罕见 EPERM）假定活，避免瞬时 syscall 抖动误杀健康池
+- 单独看 `Signal(0)` 不够：僵尸进程的 PID 仍可接收信号（`kill(pid, 0) == 0`），探针会误报存活；必须组合 `exited` 位
+- **reaper goroutine 的生命周期约束**：`os/exec` 文档要求 `cmd.Wait()` 不得在 StdoutPipe 还在被读取时调用——Wait 会关闭 pipe 把 reader 抽空。因此 reaper 不是 `Start` 后立刻 Wait，而是先 `readerWg.Wait()`：等 `readResponses` 因 stdout EOF（子进程退出或 `close()` 关读端）自然结束，再调 Wait
+  - 路径 (a) 子进程已退出：Wait 快速返回 reap 僵尸
+  - 路径 (b) `close()` 触发：`stdout.Close()` 让 reader 提前 EOF，子进程此刻可能还活着；reaper 的 Wait 会阻塞，**直到 `close()` 后续的 `Process.Kill()` 把子进程干掉**才返回。reaper 无其他工作，阻塞无害
+- `processAlive(pool)` 逐 slot 调 `isProcessAlive`；遇到死进程 CAS 清空 slot（避免 Pick 派发到死连接）。pool 实现尚无自动 replaceLoop，所以这步必须显式做
+- `ConnPool.Alive()` 只查 slot 指针非空；**健康检查必须用 `processAlive`，不能只看 `Alive()`**
+- 整池零活进程时触发 `reconnectServer`：关闭旧池 → 新建并 Start
+- 指数退避：Initial=1s, Max=30s, MaxRetries=5
+- `healthChecker.Start` 仍未在 `main.go` 调用，自愈循环并未运转——`reconnectServer` 当前只在外部主动调用时执行
 
 ### 传输限制
 

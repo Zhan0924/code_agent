@@ -57,7 +57,7 @@ code_agent 是一个生产级 ReAct 代码智能体平台，核心能力是通�
 | `internal/skill` | 6 | 统一工具注册（builtin/MCP/user-webhook），schema 快照（原子指针 + 代际计数） |
 | `internal/planner` | 8 | DAG 多步规划器 + 质量评估器（4 维度评分+自动改进）+ 进度追踪 |
 | `internal/multiagent` | 9 | 多Agent协作：Supervisor（DAG拓扑并行）+ SubAgent + AgentPool + MessageBus + ConflictResolver + RoleSelector |
-| `internal/toollearn` | 9 | 持续学习：Collector（反馈采集）→ Distiller（策略蒸馏）→ Advisor（会话注入推荐）；PG 持久化已实现但 main.go 未接线 |
+| `internal/toollearn` | 9 | 持续学习：Collector（反馈采集）→ Distiller（策略蒸馏）→ Advisor（会话注入推荐）；`PGStore` 已在 `cmd/agent/main.go` 接线（pgStore 可用时自动 `Migrate` 并 `orch.SetToolLearnStore`），反馈跨重启保留在 `tool_feedback` 表 |
 | `internal/pool` | 2 | `sync.Pool` 泛型封装（byte slice / buffer / JSON encoder） |
 | `internal/models` | 1 | 共享数据类型（ToolDefinition, ToolResult, Message 等） |
 | `internal/errors` | 2 | 错误类型定义 |

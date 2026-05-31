@@ -13,7 +13,7 @@
 | 组件 | 位置 | 状态 | 包级文档 |
 |------|------|------|----------|
 | MCP SSE 传输 | `internal/mcp/client.go` | `doc.go` 提及 SSE 支持，`NewGateway` 仍仅处理 stdio 传输 | `docs/architecture/06_mcp.md` |
-| `chatApi.stream()` | `code_agent_ui/src/api/client.ts:66-68` | 前端定义 `/chat/stream` 调用但 ChatPage:102 直接 fetch `/chat/react-stream` | （前端，无包级文档） |
+| `chatApi.stream()` | 前端 `code_agent_ui/src/api/client.ts`（兄弟仓库，行号略） | 前端定义 `/chat/stream` 调用但 `ChatPage.tsx` 直接 fetch `/chat/react-stream` | （前端，无包级文档） |
 | `internal/audit` / `internal/errors` | 整包孤儿 | 零生产 importer（构建可过但无调用点） | `docs/architecture/19_observability.md` |
 | `internal/pool` | 单一 importer | 仅 `session/manager.go` 使用 | `docs/architecture/19_observability.md` |
 

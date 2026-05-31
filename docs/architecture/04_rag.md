@@ -758,7 +758,7 @@ rag:
 ## 12. 后续演进
 
 - [ ] 真正迁移到 **Qdrant 原生 sparse vector** —— 现在的 MatchText 是过渡方案；
-- [ ] AST 引入 **tree-sitter-go** 作为可选后端，Python/Rust/TS 等语言可直接复用；
+- [x] AST 引入 **tree-sitter** 作为可选后端 — 已实现，配置项 `tree_sitter.enabled`；支持 8 种语言（go/python/typescript/javascript/rust/java/c/cpp）。Docker 内 `CGO_ENABLED=0` 时自动 fallback 到 regex 解析，日志：`tree-sitter CGO not available, using regex fallback`；
 - [ ] 对 `CodeChunk.Dependencies` 建 **call graph**，支持 "给我 X 的所有调用者" 这类检索；
 - [ ] 引入 **embedding 缓存** (Redis)：同一 chunk SHA-1 命中缓存就跳过 embedding；
 - [ ] 在 Retrieve 之后挂一层 **上下文打包器**：把相关度高的 K 个 chunk 拼成一段不超过 N tokens 的 prompt（避免 orchestrator 每次都重复这段逻辑）；

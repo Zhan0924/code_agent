@@ -41,38 +41,55 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 
 **不变量**：核心 ReAct 循环不走 `tools.Registry.Execute()`，而是走 orchestrator 自己的 switch。修改工具分发时需同时考虑两套机制。
 
-### 分布式工具白名单（新增工具时必查）
+### 工具元数据中心化（2026-06 重构）
 
-内置工具名称分散在 9 个注册点。新增工具时必须逐一检查并更新：
+新增内置工具时，**在工具定义上声明行为 metadata bit 即可**，无需手动同步多处白名单。`models.ToolDefinition` 携带四个行为位：
 
-| # | 位置 | 用途 |
-|---|------|------|
-| 1 | `internal/orchestrator/builtin_tools.go` (`fileHandlers` map) | handler 分发 |
-| 2 | `internal/orchestrator/file_tools.go` (`fileToolDefinitions`) | LLM 可见的工具定义 |
-| 3 | `internal/orchestrator/orchestrator.go` (`captureForTransaction`) | 事务回滚捕获 |
-| 4 | `internal/orchestrator/react_core.go` (auto-test tracking) | 文件修改后自动跑测试 |
-| 5 | `internal/planner/planner.go` (`defaultActions` + system prompt) | Planner 动作白名单 |
-| 6 | `internal/multiagent/sub_agent.go` (`allowedTools`) | 子 Agent 允许工具列表 |
-| 7 | `internal/multiagent/supervisor.go` (`isFileWriteAction`) | 冲突检测（文件写入判定） |
-| 8 | `internal/api/dynamic_tool_handlers.go` (builtin conflict list) | 动态工具名称碰撞检查 |
-| 9 | `internal/api/mcp_skill_handlers.go` (`handleListTools` builtin list) | 工具列表枚举 |
+| Bit | 含义 | 消费点 |
+|---|---|---|
+| `IsFileWrite` | 写文件类工具 | `Orchestrator.captureForTransaction` / `multiagent.Supervisor.fileWriteClassifier` |
+| `IsIdempotentRead` | 幂等纯读 | `SpeculativeToolCache.isIdempotent`（推测缓存白名单） |
+| `TriggersAutoTest` | 写完触发 auto-test | `react_core.go` 编辑追踪 |
+| `InvalidatesCache` | 写后清缓存 | `SpeculativeToolCache.shouldInvalidate` |
 
-**验证命令**：`rg -l 'apply_diff\|write_file\|edit_file' internal/ | sort` — 确认新工具名出现在所有预期位置。
+**源头**：
+- `internal/orchestrator/file_tools.go::fileToolDefinitions()` — read/write/patch/edit/apply_diff
+- `internal/orchestrator/git_tools.go::gitToolDefinitions()` — git_status/diff/commit/log/branch
+- `internal/orchestrator/lsp_tools.go::RegisterLSPTools` — goto_definition/find_references/hover_info/rename_symbol
 
-**教训**：`apply_diff` 工具初次添加时仅注册了 #1/#2，审计后发现遗漏其余 7 处，导致额外返工提交。
+**消费点**（不再硬编码工具名）：
+- `Orchestrator.toolMetadata/IsFileWriteTool/IsBuiltinTool/triggersAutoTest` (`tool_metadata.go`)
+- `SpeculativeToolCache.SetMetadataLookup`（运行时由 orchestrator 注入注册表查询）
+- `multiagent.WithFileWriteClassifier`（main.go 注入 `orch.IsFileWriteTool`）
+- `api/dynamic_tool_handlers.go` 用 `s.orchestrator.IsBuiltinTool(name)`
+- `api/mcp_skill_handlers.go::handleListTools` 直接遍历 `orchestrator.GetAvailableTools()`
 
-## 死代码清单
+**CI 守卫**：`internal/orchestrator/tool_metadata_test.go::TestBuiltinToolsHaveMetadata` 遍历所有 builtin 定义，要求每个工具至少声明一个 metadata bit（少数纯执行工具如 `run_tests/execute_code` 在 exempt 白名单中）。`TestFileWriteToolsTriggerAutoTest` 校验 `IsFileWrite=true → TriggersAutoTest && InvalidatesCache`。
 
-以下功能已完整实现但未接线——它们编译但从不被调用：
+**遗留**：
+- `planner.defaultActions`（`internal/planner/planner.go`）和 `multiagent/sub_agent.allowedTools`、`role_selector.actionScore`——这些是**策略/ACL**，不是工具行为，保持为常量数组。
+- `agentloop/runner.go`、`agentloop/adaptive_feedback.go` 内尚有少量硬编码工具名（独立包内的轻量启发式），与本次改动正交。
 
+## 死代码清单（2026-06 大幅更新）
+
+之前文档列出的"死代码"经核实，**大部分已接线**：
+
+| 组件 | 状态 | 接线位置 |
+|------|------|---------|
+| `llm.Router` | ✅ 已接 | `cmd/agent/main.go::SetRouter`（`cfg.LLM.Router.Enabled()` 触发；默认 nil 跳过） |
+| `mcp.ConnPool` | ✅ 已接 | `Gateway.servers` 改为 `map[string]*ConnPool`，`PoolSize<=1` 等价单连接 |
+| `toollearn.PGStore` | ✅ 已接 | `main.go::orch.SetToolLearnStore(toollearn.NewPGStore(pgStore.DB()))`，自动 Migrate `tool_feedback` 表 |
+| Git 工具 | ✅ 已接 | 通过 `tools.Registry` 走通用分发，LLM 可调用 |
+| `LLMSummarizer` | ✅ 已接 | `main.go::sessionMgr.Summarizer = session.NewLLMSummarizer(...)` |
+| `SpeculativeToolCache` | ✅ 已接 | Orchestrator 在 `NewOrchestrator` 构造并 `SetMetadataLookup` 给注册表 |
+| `RedisRateLimiter` | ✅ 已接 | `api/router.go:190-191` |
+
+**仍然死的**：
 | 组件 | 文件 | 说明 |
 |------|------|------|
-| `llm.Router` | `internal/llm/router.go` | 按 intent/复杂度/消息数路由到 Heavy/Medium/Light 模型层级。未在 main.go 或 Orchestrator 中使用 |
-| `SpeculativeToolCache` | `internal/orchestrator/speculative_cache.go` | 幂等只读工具结果的 TTL 缓存。Orchestrator 无此字段，无调用 |
-| Git 工具 | `internal/orchestrator/git_tools.go` | 5 个 git 工具已定义（`gitToolDefinitions()`），但未纳入 `getAvailableTools()` — LLM 无法调用 |
-| `LLMSummarizer` | `internal/session/summarizer.go` | 定义了 Summarizer 接口和 LLM 实现，但 `Manager.buildSummary()` 使用内联截断逻辑 |
+| MCP SSE 传输 | `internal/mcp/client.go::NewGateway` | 仅处理 `Transport=="stdio"`，SSE 配置被 skip |
 
-**影响**：修改这些文件的代码不会影响运行时行为。若要启用它们，需要在 main.go 或 Orchestrator 中补充接线。
+修改 SSE 相关代码不会影响运行时行为。
 
 ## 双重 Token 估算器
 
@@ -82,6 +99,54 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 - `internal/session/manager.go` (`estimateTokens`) — 朴素 `len(text)/4 + 1`，CJK 低估约 3 倍
 
 Session 层使用精度较低的估算器，可能导致 token 预算计算偏差。
+
+## Docker 部署陷阱
+
+### `docker build` ≠ `docker compose build`
+
+镜像标签不同，两者**不会复用**对方的产物：
+
+| 命令 | 镜像名 | 被 compose 使用？ |
+|------|--------|-------------------|
+| `docker build -t code-agent:latest .` | `code-agent:latest` | ❌ 否（compose 找不到） |
+| `docker compose build agent` | `code_agent-agent:latest`（项目名_服务名） | ✅ 是 |
+
+`docker-compose.yml` 中 `build: .` 字段不会复用任意标签的镜像。要让 `docker build` 的产物被 compose 使用，需在 compose 中显式：
+
+```yaml
+services:
+  agent:
+    image: code-agent:latest  # 显式标签
+    build: .
+```
+
+否则 `make docker-build` 的产物会被 `make docker-up` 完全忽略，导致看似"重新构建"但实际跑的是旧镜像。
+
+### 镜像新鲜度三招验证
+
+排查"代码改了但行为没变"时，按顺序验证：
+
+1. `docker compose images agent` — 看镜像 ID 和 CREATED 时间，是否真是新的
+2. 日志 caller 行号 — 在源码新加几行后，编译产物的 `caller: "agent/main.go:NNN"` 必然变化；如果跑的还是旧行号，说明镜像没换
+3. `docker exec <ctr> strings /usr/local/bin/code-agent | rg <known_string>` — 二进制必须含新加的日志字符串
+
+### 配置文件部署
+
+镜像构建采用**双保险**：
+
+1. `.dockerignore` 显式排除 `configs/config.yaml` 与 `configs/config.allinone.yaml`——即使 Dockerfile 写错也挡住；
+2. `Dockerfile` / `Dockerfile.local` 只 `COPY configs/config.example.yaml`，不复制整个 `configs/` 目录。
+
+运行时通过 docker-compose volume bind mount 注入真实配置：
+
+```yaml
+volumes:
+  - ./configs/config.yaml:/etc/code-agent/configs/config.yaml:ro
+```
+
+bind mount 的作用：(1) 运行时挂载真实配置（镜像内不含此文件）；(2) 让本地修改立即生效，`docker compose restart agent` 无需 rebuild。
+
+**`Dockerfile.allinone` 是例外**：单文件 `COPY config.allinone.yaml`，设计上就是内嵌配置的镜像。allinone 镜像不可公开发布。
 
 ## 测试惯例
 

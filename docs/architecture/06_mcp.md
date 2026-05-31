@@ -1,238 +1,269 @@
 # 06 · MCP 网关 `internal/mcp`
 
 > 代码：
-> - `client.go` (486) — JSON-RPC 2.0 协议 + `ServerConnection` 进程管理 + `Gateway` 多服务聚合
-> - `reconnect.go` (208) — 健康检查与自动重连 (`healthChecker`)
+> - `client.go` (781) — JSON-RPC 2.0 协议 + `ServerConnection` 进程管理 + `Gateway` 多服务聚合 + 进度通知订阅
+> - `validation.go` (71) — MCP 子进程命令白名单（`AllowedMCPCommands` + `ValidateArgs`）
+> - `pool.go` (462) — **未接线**：多子进程连接池 + least-pending LB + chunked streaming
+> - `reconnect.go` (208) — **未接线**：健康检查 + 自动重连 + 指数退避
+> - `doc.go` (66) — 包文档
 >
-> 背景文档：`docs/mcp_skill_design.md` 详细设计
->
-> 测试：`client_test.go` (58)
+> 测试：`client_test.go` (738) / `pool_test.go` (665)
 
 ---
 
 ## 1. 模块定位
 
-**"给 Agent 一条插上任何外部工具的电源线。"**
+**"把 Anthropic 的 MCP 协议跑成 stdio 子进程 + JSON-RPC 客户端，让任何外部工具（github、filesystem、jira、自研服务）通过一条 stdio 管道接入 ReAct 循环。"**
 
-[Model Context Protocol](https://modelcontextprotocol.io) 是 Anthropic 推出的 LLM ↔ 工具互操作协议，本质是"**JSON-RPC 2.0 over stdio / SSE**"。Agent 系统接入 MCP Server 之后：
+[Model Context Protocol](https://modelcontextprotocol.io) 是 Anthropic 推出的 LLM ↔ 工具互操作协议——本质是 **JSON-RPC 2.0 over stdio（或 SSE）**，以 `tools/list` 暴露能力、`tools/call` 触发执行、`notifications/*` 推送事件。
 
-- 可以调用 GitHub MCP 来查 issue / open PR；
-- 可以挂 Database MCP 直接读线上库；
-- 可以挂 Jira / Slack / 自研 CRUD 服务…
+本包做四件事：
 
-本包干的四件事：
+1. **拉起 MCP Server 子进程**：`exec.Command(npx ...)` + `StdinPipe` / `StdoutPipe`；
+2. **实现 JSON-RPC 2.0 客户端**：单 reader goroutine + pending map + 原子 ID + 进度通知订阅；
+3. **聚合多 server**：`Gateway` 管 `map[name]*ServerConnection`，预建 `toolIndex` 做 O(1) 工具路由；
+4. **运行时 CRUD**：`AddServer` / `RemoveServer` / `ListServers`——零重启增删 MCP server。
 
-1. **把 MCP Server 当子进程启动**（`exec.Command` + stdin/stdout 管道）；
-2. **实现 JSON-RPC 客户端**：同步 request/response + 并发 pending map + 异步 reader goroutine；
-3. **汇聚多个服务**：`Gateway` 管一组 `ServerConnection`，按 `tools/list` 结果建立 "工具名 → 服务" 的路由表；
-4. **运行时 CRUD**：`AddServer` / `RemoveServer` / `ListServers` —— 零重启新增/删除能力。
+orchestrator 那一层把 MCP 工具与内置工具、Skill 三种来源**同构化**为 `models.ToolDefinition` / `models.ToolResult`，LLM 完全感知不到差异。
 
-加上 `reconnect.go` 的健康检查与自愈：子进程崩溃 → 自动 respawn，工具照用。
+### 1.1 当前接线状态（**重要**）
+
+| 模块                    | 文件                | 是否接线          | 说明 |
+|-------------------------|---------------------|-------------------|------|
+| 单连接 `ServerConnection` | `client.go`         | ✅ 已接线          | 由 `ConnPool` 持有（不再裸暴露给 Gateway） |
+| `Gateway` (路由 + CRUD)  | `client.go`         | ✅ 已接线          | `apiServer.SetMCPGateway` 暴露给 REST；`servers map[string]*ConnPool` |
+| `validation.go` 白名单   | `validation.go`     | ✅ 已接线          | `Gateway.AddServer` 调 `ValidateCommand` + `ValidateArgs` |
+| 进度通知订阅 (chunked)   | `client.go` `subscribeProgress` | ⚠️ 只在 `pool.CallToolStream` 用 | Gateway.CallTool 走非流式路径 |
+| `ConnPool`（多进程池）    | `pool.go`           | ✅ **已接线**（2026-06）| `Gateway.servers map[string]*ConnPool`；`PoolSize<=1` 退化为单连接 |
+| `healthChecker`（自愈）  | `reconnect.go`      | ❌ **未启动**      | `newHealthChecker` 存在但 main.go 仍未 `Start`；崩了不会自动重启（但 ConnPool 内自带 slot 清理） |
+| SSE / HTTP transport    | —                   | ❌ **未实现**      | `NewGateway` 显式 `if cfg.Transport != "stdio" { skip }` |
+
+下文会同时讲清"已接线的核心通路"与"待接线的健康检查/SSE 设计"，避免把蓝图当成现状。
 
 ---
 
-## 1.5 设计哲学：MCP 客户端的 4 个抉择
+## 1.5 设计哲学：5 个核心抉择
 
 ### Q1 — 为什么**自研**而不用官方 SDK？
 
-**官方 SDK**（`modelcontextprotocol/go-sdk`）现状：
-- API 不稳定（2024 初期 pre-1.0，多次 break change）
-- 专注"协议正确"而非"生产需求"——没有重连、没有熔断、没有 PoolSize
-- stdio 子进程生命周期管理简陋（进程崩溃不自动重启）
+`modelcontextprotocol/go-sdk` 在我们启动该模块时尚未稳定（pre-1.0 多次破坏式变更），且专注"协议正确"而非"生产可运维"——没有重连、没有连接池、没有进度订阅。
 
-**我们的需求**：
-- stdio server 挂了 → 自动重启（10s 内恢复）
-- 并发 tool call → 多个 stdio 子进程池分担
-- 部分 MCP server 慢 → 单 server 熔断，不拖累其他
+**协议层 JSON-RPC 2.0 本身仅 800 行可控**：自研换来熔断点、池化、进度订阅这些生产能力的接入自由。代价是要跟 spec 演进（如 `2024-11-05` → `2025-03-26`），目前固定 `2024-11-05`（`client.go:553`）。
 
-**决策**：自研。协议层 JSON-RPC 2.0 本身简单（几百行），可控性远胜
-SDK 抽象。
+### Q2 — stdio vs SSE：当前只支持哪个？
 
-### Q2 — stdio vs SSE vs HTTP？
+MCP spec 定义两种 transport：stdio（本地子进程，UNIX pipe）和 SSE（远程服务，HTTP）。**当前实现只接 stdio**：`NewGateway` (`client.go:506-514`) 显式跳过非 stdio 配置并打 Warn 日志。
 
-MCP 协议定义了两种传输：stdio（子进程）和 HTTP SSE。
+| 维度       | stdio                              | SSE（**未实现**）               |
+|------------|------------------------------------|--------------------------------|
+| 部署       | 本地子进程（`npx`/`uvx`/`python`） | 独立 HTTP 服务                  |
+| 延迟       | μs 级（pipe）                       | ms 级（网络）                    |
+| 隔离       | 进程级（崩溃不影响 agent）          | 网络级（更强但要做 mTLS）        |
+| 调试       | `stdin`/`stdout` 可 tail            | 需要 HTTP debug 工具             |
+| 适配场景   | 本地工具（filesystem-mcp、github） | 远程托管 MCP（GitHub hosted）    |
 
-| 维度 | stdio | SSE |
-|---|---|---|
-| 部署 | 本地子进程 | 独立进程 / 远程服务 |
-| 延迟 | μs 级（UNIX pipe） | ms 级（网络） |
-| 隔离 | 进程级（崩了不影响 agent） | 网络级（隔离更强） |
-| 部署复杂度 | 低（npm install 即可） | 高（要 HTTP server） |
-| 调试 | stdin/stdout 可 tail | 需要 HTTP debug 工具 |
-| 场景 | 本地工具（github-cli） | 远程服务（内网 DB） |
+为什么选 stdio 先做：本地工具是高频场景（filesystem / git / shell），SSE 主要是远程 hosted MCP（覆盖面窄）。SSE 列在 §12 后续演进。
 
-**支持：两者皆支持**。`MCPServerConfig.Transport` 字段切换。
+### Q3 — 为什么独立 `writeMu` 而非和 `mu` 共用？
 
-### Q3 — PoolSize 的意义？
+stdin 是字节流——并发写入必然会把两条 JSON 行交错（"行分帧"立刻失效）。最朴素的方案是用单把 `mu` 同时保护 `pending` map 和 stdin 写入；但这会让 `sendRequest` 在拿锁状态下做 IO（stdin 写 + 行编码），把"等响应"的多路复用直接锁死。
 
-**痛点**：某些 MCP server（如 github-mcp）单连接是单线程的——上一个
-tool call 没返回，下一个就得等。
+实现选择**两把锁**（`client.go:172-180`）：
+- `mu` 仅保护 `pending` / `progressSubs` map 的增删；
+- `writeMu` 仅串行化 stdin 写入。
 
-**决策**：`MCPServerConfig.PoolSize >= 2` 时，起 N 个子进程池，round-robin
-分发 call。并发度提升 N 倍。对不敏感的 server（本地 filesystem-mcp）
-保持 PoolSize=1 避免开销。
+`sendRequest` 的执行顺序刻意是：① `mu.Lock` 注册 pending → unlock → ② `writeMu.Lock` 写 stdin → unlock → ③ select 等 `respCh` 或 `ctx.Done()`。**pending 必须 BEFORE 写 stdin**——若反过来，服务端可能在你写完 stdin 还没注册 pending 的瞬间已经响应，reader 找不到 chan 直接丢帧（永久卡死调用者）。
 
-### Q4 — tool 命名空间冲突
+### Q4 — Reactor 模式而非每请求一个 reader goroutine？
 
-**问题**：2 个 MCP server 都注册了 `get_file` 工具名——谁赢？
+每个 `ServerConnection` 只有**一个** `readResponses` goroutine 独占 stdout（`client.go:287-365`）。三种消息类的分发：
 
-**决策**：在 tool name 前加 server 前缀：`github/get_file` vs
-`filesystem/get_file`。orchestrator 看到的是全名；LLM 传 tool_call 也
-要带前缀。
+1. **响应**（有 id）→ 查 `pending[id]` → push 到 `chan` → 删 pending；
+2. **进度通知**（`method=notifications/progress`）→ 查 `progressSubs[token]` → push（满则丢弃）；
+3. **其他通知** → log + 丢弃。
 
-**好处**：跨 server 没有歧义，LLM 的 system prompt 可以明确声明。
-**代价**：增加 prompt 长度（前缀 token）。实测 1 MCP server 20 个工具
-前缀 token 约占 prompt 总长 < 1%，可接受。
+为何不"每个请求起一个 goroutine 读 stdout"？因为 stdout 是**字节流**——只有单消费者能正确按行扫描+demux。多消费者会把同一行读两次或互相吞字节。
+
+### Q5 — 命名空间冲突：MCP 工具名相同时谁赢？
+
+两个 server 都暴露 `read_file` 怎么办？
+
+当前实现（`toolIndex` 是 `map[string]string`，`client.go:538`）**后写覆盖前者**——没有命名空间前缀机制。这是已知的缺陷，详见 §11 设计权衡 + §12 演进。`tools.Registry`（[07_tools.md](07_tools.md)）也是同样的限制。
+
+生产上的临时应对：在配置层让用户保证唯一性（filesystem-mcp 用 `read_file`、自研工具叫 `app_read_file`）。
 
 ---
 
 ## 2. 依赖架构
 
 ```
-     ┌─── api/mcp_skill_handlers.go (REST CRUD) ────┐
-     └──────┬────────────────────────────────────────┘
-            │ AddServer / RemoveServer / ListServers
-            ▼
-     ┌──────────────────────────────┐
-     │     mcp.Gateway              │  维护 map[name]*ServerConnection
-     │       .toolRouter{tool→srv}  │  维护 map[tool]name
-     │       .healthChecker         │
-     └─────┬──────────────┬─────────┘
-           │              │ calls
-           │              ▼
-           │      ┌──────────────────┐   tools/list
-           │      │ ServerConnection │ ◄──────────── periodic
-           │      │  cmd *exec.Cmd   │
-           │      │  stdin/stdout    │
-           │      │  pending map     │
-           │      │  reader goroutine│
-           │      └────────┬─────────┘
-           │               │ stdio
-           │               ▼
-           │      ┌──────────────────┐
-           │      │ MCP Server 进程  │
-           │      │ (github-mcp,     │
-           │      │  db-mcp, …)      │
-           │      └──────────────────┘
-           │
-           ▼ 聚合后暴露给
-     ┌──────────────────────────────┐
-     │ orchestrator.getAvailable    │
-     │ Tools()                      │ ← 每次 LLM 调用动态组装
-     └──────────────────────────────┘
+              ┌─── api/handlers/mcp_handlers.go (REST) ─────────┐
+              │  POST /api/v1/mcp/servers  → AddServer          │
+              │  DELETE /api/v1/mcp/servers/:name → RemoveServer│
+              │  GET /api/v1/mcp/servers   → ListServers        │
+              └─────────────────┬───────────────────────────────┘
+                                │
+                                ▼
+                  ┌───────────────────────────────┐
+                  │   mcp.Gateway                  │
+                  │     .servers      map[name]*SC │
+                  │     .serverConfigs            │ ← F8：存配置供 reconnect
+                  │     .toolIndex    map[tool]nm │ ← O(1) 工具→server 路由
+                  └────────────┬──────────────────┘
+                               │ 1:N
+                               ▼
+                  ┌───────────────────────────────┐
+                  │   ServerConnection             │
+                  │     cmd *exec.Cmd              │
+                  │     stdin / stdout pipes       │
+                  │     pending  map[id]chan       │ ← 多路复用
+                  │     progressSubs map[tok]chan  │ ← 流式订阅
+                  │     mu / writeMu               │ ← 两把锁
+                  │     inflight atomic.Int64     │ ← 池化 LB 用
+                  └────────────┬──────────────────┘
+                               │ stdio pipe
+                               ▼
+                  ┌───────────────────────────────┐
+                  │   MCP Server 子进程            │
+                  │   npx @modelcontextprotocol/   │
+                  │       server-filesystem        │
+                  │   uvx ...                      │
+                  └───────────────────────────────┘
+
+已接线（2026-06）：
+  ┌─ ConnPool (pool.go) ─┐    ┌─ healthChecker (reconnect.go) ─┐
+  │ N 个 ServerConnection │    │ processAlive: Signal(0) 每 slot │
+  │ least-pending Pick   │    │ 死了 → CAS 清 slot；整池零活 → │
+  │ chunked streaming    │    │  reconnectServer (新建 pool)   │
+  │ 接入 Gateway.servers │    │ Start() 仍待 main.go 接入       │
+  └──────────────────────┘    └────────────────────────────────┘
 ```
 
 ---
 
 ## 2.5 数据流总览
 
-下图展示 MCP Gateway 的三条主数据流：**启动初始化**、**运行时 CallTool**、**健康检查与自愈**。
+### 流 A：启动初始化（per server）
 
 ```text
-═══════════════ 启动初始化 (per MCP Server) ═══════════════
+config.MCP.Servers[i] (Transport=="stdio")
+   │
+   ▼
+newServerConnection(cfg, logger):
+   ① ValidateCommand(cfg.Command)  → 必须 ∈ {npx,node,python,python3,uvx,uv,deno,bun,docker}
+   ② ValidateArgs(cfg.Args)        → 拒绝 --eval / -e / -c / eval / exec
+   ③ exec.Command(cfg.Command, cfg.Args...).Env = merge(os.Environ, cfg.Env)
+   ④ StdinPipe + StdoutPipe + Stderr → 父进程 Stderr 透传
+   ⑤ cmd.Start()                   → 子进程跑起来
+   ⑥ go conn.readResponses()       → Reactor 启动
+   │
+   ▼
+initializeServer(ctx, conn):                                  (JSON-RPC over stdin)
+   ① sendRequest("initialize", {protocolVersion:"2024-11-05", capabilities, clientInfo})
+   ② sendRequest("notifications/initialized", nil)  # 协议要求的握手第二步
+   ③ sendRequest("tools/list", nil) → conn.tools = [MCPTool...]
+   │
+   ▼
+gw.servers[name]      = conn
+gw.serverConfigs[name] = cfg               ← (F8) 给 reconnect 准备
+for t in conn.tools:
+    gw.toolIndex[t.Name] = name             ← O(1) 路由表
 
-┌──────────────────────┐
-│ config.MCP.Servers[] │
-│ {name, command, args}│
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│ exec.Command(command, args...)                            │
-│ → stdin pipe (writer)                                    │
-│ → stdout pipe (reader goroutine: scanner → pending map)  │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼  JSON-RPC: initialize
-┌──────────────────────────────────────────────────────────┐
-│ sendRequest("initialize", {capabilities})                │
-│ → 写 stdin → 读 stdout → 解析 response                  │
-│ → 获取 server capabilities + protocol version           │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼  JSON-RPC: tools/list
-┌──────────────────────────────────────────────────────────┐
-│ sendRequest("tools/list", {})                            │
-│ → 解析 tool definitions                                  │
-│ → 写入 toolMap[toolName] = serverConn                    │
-│ → 注册到 tools.Registry (作为 Provider)                  │
-└──────────────────────────────────────────────────────────┘
+任何一步失败 → 跳过本 server，继续启动其他（Error 日志，不阻塞 Gateway 创建）。
+```
+
+### 流 B：运行时 CallTool（核心 RPC）
+
+```text
+orchestrator.executeMCPTool(serverName, toolName, args)
+   │
+   ▼
+Gateway.CallTool(ctx, serverName, toolName, args):
+   ① RLock servers → 取 conn  (锁出来再释放)
+   ② json.Unmarshal(args, &argsMap)
+   │
+   ▼
+conn.sendRequest(ctx, "tools/call", {name, arguments:argsMap}):
+   ① id := reqID.Add(1)                              (atomic)
+   ② respCh := make(chan *JSONRPCResponse, 1)
+   ③ mu.Lock; pending[id] = respCh; mu.Unlock         ← BEFORE 写 stdin
+   ④ writeMu.Lock; stdin.Write(json.Marshal(req)+"\n"); writeMu.Unlock
+   ⑤ select {
+        case resp := <-respCh: return resp
+        case <-ctx.Done():
+            mu.Lock; delete(pending, id); mu.Unlock   ← 防泄漏
+            return ctx.Err()
+      }
+
+(异步) conn.readResponses():
+   for scanner.Scan():
+      parse(line) → JSONRPCResponse {id, result, error} OR notification {method, params}
+      if id != 0:                                      ← 是响应
+          mu.Lock
+          ch := pending[id]; delete(pending, id)
+          mu.Unlock
+          ch <- resp                                   ← 非阻塞投递
+      elif method == "notifications/progress":
+          mu.Lock; subCh := progressSubs[token]; mu.Unlock
+          if subCh: select { subCh <- prog; default }  ← 满则丢
+      else:
+          logger.Debug("unhandled notification")
+   ← scanner 结束 (子进程退出)
+   mu.Lock
+   for id, ch in pending: ch <- {Error: {Code:-32603, Message:"connection lost"}}
+   mu.Unlock
+   │
+   ▼
+回到 Gateway.CallTool:
+   ① json.Unmarshal(resp.Result, &mcpToolResult)
+   ② strings.Builder 拼接 content[*].text       ← [OPT-22] 避免 O(n²)
+   ③ return &ToolResult{Content, IsError}
+```
+
+### 流 C：运行时 CRUD（REST API → Gateway）
+
+```text
+POST /api/v1/mcp/servers {name, command, args, env}
+   │
+   ▼
+Gateway.AddServer(cfg):
+   ① ValidateCommand(cfg.Command) → reject if not whitelisted
+   ② ValidateArgs(cfg.Args)       → reject --eval / -c / ...
+   ③ mu.Lock
+   ④ if servers[cfg.Name] exist  → return err "already exists"
+   ⑤ newServerConnection(cfg) + initializeServer(ctx, conn)
+       (失败立刻 conn.close + return err)
+   ⑥ servers[name]=conn; serverConfigs[name]=cfg
+   ⑦ for t in conn.tools: toolIndex[t.Name]=name        ← 即时生效
+   ⑧ mu.Unlock
+   ⑨ return ServerStatus{Name, Status:"connected", ToolsCount, Tools[]}
+   ← orchestrator 下一轮 ReAct 调 GetAvailableTools() 就能看见新工具
 
 
-═══════════════ 运行时 CallTool ═══════════════
-
-┌─────────────────────┐
-│ orchestrator.       │
-│ executeTool("mcp_*")│
-└──────────┬──────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│ Gateway.CallTool(serverName, toolName, args)              │
-│  ① toolMap[toolName] → 定位 ServerConnection             │
-│  ② 构造 JSONRPCRequest{method:"tools/call", params}      │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│ ServerConnection.sendRequest(req)                         │
-│  ① nextID++ → req.ID                                    │
-│  ② pending[id] = make(chan *JSONRPCResponse, 1)          │
-│  ③ json.Encode(req) → 写入 stdin pipe                   │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼ (异步)
-┌──────────────────────────────────────────────────────────┐
-│ reader goroutine (持续运行):                              │
-│  scanner.Scan() → json.Decode(line)                      │
-│  → pending[resp.ID] <- resp                              │
-│  → delete(pending, resp.ID)                              │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼ (chan recv with timeout)
-┌──────────────────────────────────────────────────────────┐
-│ result := <-pending[id]                                   │
-│ → 解析 result.Content                                    │
-│ → 返回 *ToolResult{Content, IsError}                     │
-└──────────────────────────────────────────────────────────┘
-
-
-═══════════════ 健康检查与自愈 ═══════════════
-
-┌──────────────────┐    ┌─────────────────────────────────┐
-│ healthChecker    │    │ 定时 ping (每 30s)               │
-│ goroutine        │──▶ │ sendRequest("ping", {})          │
-└──────────────────┘    └────────────────┬────────────────┘
-                                         │
-                        ┌────────────────┴────────────────┐
-                        ▼                                 ▼
-               ┌──────────────┐                 ┌──────────────┐
-               │ ping 成功    │                 │ ping 失败    │
-               │ → 继续       │                 │ / 进程退出   │
-               └──────────────┘                 └──────┬───────┘
-                                                       │
-                                                       ▼
-                                        ┌──────────────────────────┐
-                                        │ kill 旧进程               │
-                                        │ exponential backoff 重启  │
-                                        │ (1s → 2s → 4s → max 30s)│
-                                        │ 重走 initialize 握手      │
-                                        │ 重建 toolMap             │
-                                        └──────────────────────────┘
+DELETE /api/v1/mcp/servers/:name
+   │
+   ▼
+Gateway.RemoveServer(name):
+   ① mu.Lock
+   ② conn.close()  →  cmd.Process.Kill + close(stdin)
+                      readResponses 自然退出，pending 全部以 -32603 失败
+   ③ delete(toolIndex[*]) where value==name
+   ④ delete(servers[name]); delete(serverConfigs[name])
+   ⑤ mu.Unlock
 ```
 
 ---
 
 ## 3. 核心数据结构
 
-### 3.1 JSON-RPC 2.0 消息
+### 3.1 JSON-RPC 2.0 三件套（`client.go:48-94`）
 
 ```go
 type JSONRPCRequest struct {
     JSONRPC string      // 固定 "2.0"
-    ID      int64       // 递增，用于匹配响应
-    Method  string      // "initialize", "tools/list", "tools/call", …
-    Params  interface{} // 方法相关 payload
+    ID      int64       // 原子自增；0 时序列化为 null（用于 notification）
+    Method  string
+    Params  interface{}
 }
 
 type JSONRPCResponse struct {
@@ -240,38 +271,47 @@ type JSONRPCResponse struct {
     ID      int64
     Result  json.RawMessage
     Error   *JSONRPCError
+    Method  string         // 服务端发起的 notification 用
+    Params  json.RawMessage
 }
 
-type JSONRPCError struct { Code int; Message, Data string }
-func (e *JSONRPCError) Error() string { ... }    // 实现 error 接口
+type JSONRPCError struct{ Code int; Message string; Data interface{} }
 ```
 
-> JSON-RPC ID 刻意用 `int64` 自增而非字符串 UUID —— 匹配更快，内存占用小。
+**Response 复用作 Notification 容器**：MCP server 主动推 `notifications/progress` 时，stdout 上写的也是 JSON-RPC 形态（`method` + `params` 非空、`id` 为空）。把 Notification 嵌进 Response struct 让 reader 单次 `json.Unmarshal` 就能区分两类。
 
-### 3.2 MCP 协议层
+### 3.2 MCP 协议层（`client.go:120-160`）
 
 ```go
 type MCPTool struct {
-    Name        string          `json:"name"`
-    Description string          `json:"description"`
-    InputSchema json.RawMessage `json:"inputSchema"` // JSON Schema
+    Name        string
+    Description string
+    InputSchema json.RawMessage  // 透传 JSON Schema
 }
 
 type MCPToolResult struct {
-    Content []MCPContent `json:"content"`
-    IsError bool         `json:"isError"`
+    Content []MCPContent  // 一次调用可返回多段 content
+    IsError bool
 }
 
 type MCPContent struct {
-    Type string // "text" / "image" / "resource"
+    Type string  // "text" / "image" / "resource"
     Text string
-    // ... blob / url 等
+    // image / resource 字段省略
+}
+
+type progressNotification struct {
+    Token    string  `json:"progressToken"`
+    Progress float64 `json:"progress"`      // 0~1
+    Total    float64 `json:"total"`
+    Message  string  `json:"message"`
+    Chunk    string  `json:"chunk"`         // ← MCP 非标准扩展，github/atlassian MCP 用它做流式 token
 }
 ```
 
-这些直接对应 MCP spec 的 `tools/list` 返回和 `tools/call` 的结果。
+`progressNotification.Chunk` 不在 MCP spec 中，是 github-mcp 等实际服务**事实标准**：tools/call 长任务每收到 LLM 一个 chunk 就推一帧，客户端订阅了即可拼成流式输出。
 
-### 3.3 `ServerConnection` — 单个子进程
+### 3.3 `ServerConnection` — 单子进程会话（`client.go:165-189`）
 
 ```go
 type ServerConnection struct {
@@ -279,439 +319,532 @@ type ServerConnection struct {
     cmd     *exec.Cmd
     stdin   io.WriteCloser
     stdout  io.ReadCloser
-    scanner *bufio.Scanner              // 按行读 JSON-RPC
+    scanner *bufio.Scanner          // bufio 默认 64KB，已 Buffer 扩到 4MB
 
-    reqID   atomic.Int64                // 请求 ID 生成器
-    pending map[int64]chan *JSONRPCResponse  // 等待中的请求
-    mu      sync.Mutex                   // 保护 pending + stdin 写
+    reqID   atomic.Int64            // 请求 ID 自增
+    mu      sync.Mutex              // 仅保护 pending / progressSubs map
+    pending map[int64]chan *JSONRPCResponse
+    progressSubs map[string]chan progressNotification
 
-    tools   []MCPTool                    // 该 server 发布的工具
+    writeMu sync.Mutex              // 独立：仅串行化 stdin 写
+    inflight atomic.Int64           // 当前未完成请求数（pool LB 用）
+
+    tools   []MCPTool
+    testHook bool                   // 单测注入 io.Pipe 时绕过 exec.Cmd 健康检查
     logger  *zap.Logger
 }
 ```
 
-三个关键并发机制：
+三个关键设计：
 
-| 机制                         | 作用                                          |
-|------------------------------|-----------------------------------------------|
-| `pending map + chan`         | 多路复用：并发发送 N 个请求，按 ID 匹配响应     |
-| 独立 `readResponses` goroutine | stdin 写阻塞时，reader 不会被拖住              |
-| `mu` 同时保护 pending 和 stdin | stdin 写必须串行化（否则两条 JSON 会被交错）   |
+| 设计                         | 作用                                                      |
+|------------------------------|-----------------------------------------------------------|
+| **两把锁** (`mu` + `writeMu`) | 注册 pending（map）和写 stdin（IO）解耦，互不阻塞         |
+| **独立 `readResponses` goroutine** | 单消费者保证按行 demux 正确性                       |
+| **`inflight atomic.Int64`**  | 不需要加锁即可让池/监控读到当前负载，O(1) 拿 LB 指标       |
 
-### 3.4 `Gateway` — 多服务聚合
+### 3.4 `Gateway` — 多服务聚合（`client.go:487-494`）
 
 ```go
 type Gateway struct {
-    mu       sync.RWMutex
-    servers  map[string]*ServerConnection   // serverName → conn
-    toolMap  map[string]string              // toolName   → serverName  (路由表)
-    configs  map[string]*config.MCPServerConfig  // 保留配置，用于 reconnect
-    hc       *healthChecker
-    logger   *zap.Logger
+    servers       map[string]*ConnPool                // 每 server 一个池（2026-06）
+    serverConfigs map[string]*config.MCPServerConfig  // (F8) 保留配置供 reconnect
+    toolIndex     map[string]string                   // tool → server，O(1)
+    httpClient    *http.Client                        // 暂未使用（SSE 用）
+    mu            sync.RWMutex
+    logger        *zap.Logger
 }
 ```
 
-**路由表**是双向导航的桥梁：
+**`toolIndex` 是预建索引**而非每次扫所有 server——`FindServerForTool` 是 O(1) 查表（`client.go:654-660`）。`AddServer` / `RemoveServer` 在写入 `servers` 的同时维护索引一致性。
 
-- Orchestrator 只知道 `toolName`（LLM 返回的）→ `FindServerForTool(toolName)` → `serverName`；
-- 再 `servers[serverName].sendRequest("tools/call", …)`。
-
----
-
-## 4. 启动与初始化流程
-
-```
-NewGateway(cfg, logger):
-  for srvCfg in cfg.Servers:
-     ├── conn = newServerConnection(srvCfg)
-     │      - exec.Command(cmd, args...)
-     │      - env: merge cfg.Env
-     │      - stdin/stdout pipe
-     │      - cmd.Start()       ← 子进程跑起来了
-     │      - go conn.readResponses()
-     │
-     ├── initializeServer(ctx, conn)        ← 见 §4.1
-     │
-     ├── servers[srvCfg.Name] = conn
-     └── for tool in conn.tools:
-             toolMap[tool.Name] = srvCfg.Name
-  go gw.hc.Start(healthCheckInterval)       ← 启动健康检查
-```
-
-### 4.1 `initializeServer` 的握手三步
-
-标准 MCP 协议握手：
-
-```
-1. POST initialize
-   {
-     "protocolVersion": "2024-11-05",
-     "capabilities": { "tools": {} },
-     "clientInfo": { "name": "code-agent", "version": "1.0" }
-   }
-   → 拿到 server 的 capabilities/serverInfo
-
-2. NOTIFICATION initialized
-   (不需要响应；告诉 server "客户端准备好了")
-
-3. POST tools/list
-   → 拿到 conn.tools = [MCPTool{...}, ...]
-```
-
-这三步一次失败，`newServerConnection` 返回错误，`Gateway` 会跳过该 server 继续启动其他的 —— **单服务故障不阻塞启动**。
+**2026-06 重构**：`servers` 的 value 由 `*ServerConnection` 升级为 `*ConnPool`。`NewGateway` 对每个 stdio server 起一个池（`PoolSize` 来自 `MCPServerConfig`；缺省/`<=1` 等价单连接，向后兼容），`Gateway.CallTool` 委托 `pool.CallTool`（内部走 least-pending）。测试场景可用 `newSingletonPool` 把 mock 的 `*ServerConnection` 包成 1-slot pool。
 
 ---
 
-## 5. `sendRequest` —— 核心 RPC
+## 4. Reactor：`readResponses` 拆消息（`client.go:287-365`）
+
+整段逻辑只做三件事：读一行 → 解析 → 按消息类分发。代码大致：
 
 ```go
-sendRequest(ctx, method, params):
-  id := reqID.Add(1)
-  req := JSONRPCRequest{ JSONRPC:"2.0", ID:id, Method, Params }
+for scanner.Scan() {
+    var resp JSONRPCResponse
+    if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+        logger.Warn("invalid JSON-RPC frame", zap.Error(err))
+        continue
+    }
 
-  # 1. 注册响应 chan
-  respCh := make(chan *JSONRPCResponse, 1)
-  mu.Lock(); pending[id] = respCh; mu.Unlock()
+    // ① 响应（id 非零，且本端注册过 pending）
+    if resp.ID != 0 {
+        mu.Lock()
+        ch, ok := pending[resp.ID]
+        delete(pending, resp.ID)
+        mu.Unlock()
+        if ok {
+            ch <- &resp        // chan 缓冲为 1，必然非阻塞
+        }
+        continue
+    }
 
-  # 2. 写入 stdin (必须串行)
-  mu.Lock(); fmt.Fprintf(stdin, "%s\n", data); mu.Unlock()
+    // ② 进度通知
+    if resp.Method == "notifications/progress" {
+        var prog progressNotification
+        if err := json.Unmarshal(resp.Params, &prog); err == nil {
+            mu.Lock()
+            sub := progressSubs[prog.Token]
+            mu.Unlock()
+            if sub != nil {
+                select {
+                case sub <- prog:    // 满则丢
+                default:
+                }
+            }
+        }
+        continue
+    }
 
-  # 3. 等待响应 or ctx 取消
-  select {
-    case resp := <-respCh:    return resp, nil
-    case <-ctx.Done():        delete(pending, id); return nil, ctx.Err()
-  }
+    // ③ 其他通知（log + 丢）
+    logger.Debug("unhandled notification", zap.String("method", resp.Method))
+}
+
+// scanner 结束：子进程退出 / pipe 关闭
+mu.Lock()
+for id, ch := range pending {
+    ch <- &JSONRPCResponse{ID: id, Error: &JSONRPCError{
+        Code: -32603, Message: "connection lost",
+    }}
+}
+mu.Unlock()
 ```
 
-**关键设计**：
+**关键不变量**：
 
-- 用 `bufio.Scanner` 以 `\n` 分帧 —— MCP over stdio 的事实惯例；
-- 同一个 `ServerConnection` 可以**并发**有多个 in-flight 请求（不同 ID 各自有 chan）；
-- ctx 取消后**删 pending 记录**，防止内存泄漏（即使响应迟到了，也找不到 chan 被 GC）。
-
-`readResponses` goroutine 则是纯 demux：
-
-```go
-for scanner.Scan():
-  parse line → resp
-  ch := pending[resp.ID]
-  delete(pending, resp.ID)
-  ch <- resp
-```
+1. **退出时 broadcast 错误**——所有等响应的调用者立刻拿到 `-32603 connection lost`，不会卡 `<-respCh`；
+2. **进度 chan 满则丢**——`progressSubs` 的 chan buffer=32，UI 跟不上时丢老帧而不阻塞 server；
+3. **invalid frame 跳过不退出**——单条坏 JSON 不让整个 reader 死掉。
 
 ---
 
-## 6. 工具调用 `CallTool`
+## 5. `sendRequest` —— 单次 RPC 的并发安全实现（`client.go:409-463`）
 
 ```go
-Gateway.CallTool(ctx, serverName, toolName, args json.RawMessage) (*models.ToolResult, error)
-```
+func (c *ServerConnection) sendRequest(ctx context.Context, method string, params interface{}) (*JSONRPCResponse, error) {
+    id := c.reqID.Add(1)
+    req := JSONRPCRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}
 
-```
-1. conn := gw.servers[serverName]              RLock
-2. resp, err := conn.sendRequest(ctx, "tools/call", {
-     "name": toolName,
-     "arguments": args   // 已经是 JSON RawMessage，直接塞
-   })
-3. 解析 resp.Result 到 MCPToolResult
-4. 转换 → models.ToolResult:
-     Content 拼接为一段 text（MCP 可能返回多个 content blob）
-     IsError = mcpResult.IsError
-     Duration = 本次调用耗时
-```
+    respCh := make(chan *JSONRPCResponse, 1)
 
-`models.ToolResult` 是 orchestrator 那一层统一的工具结果类型 —— MCP、内置工具、Skill 三种来源**同构**。
+    // ① pending 必须 BEFORE 写 stdin，否则可能响应早到丢帧
+    c.mu.Lock()
+    c.pending[id] = respCh
+    c.mu.Unlock()
 
----
+    data, err := json.Marshal(req)
+    if err != nil { /* delete pending + return */ }
 
-## 7. 工具聚合 `GetAvailableTools`
+    // ② 独立 writeMu 串行化 stdin 写
+    c.writeMu.Lock()
+    _, werr := fmt.Fprintf(c.stdin, "%s\n", data)
+    c.writeMu.Unlock()
+    if werr != nil { /* delete pending + return */ }
 
-```go
-GetAvailableTools() []models.ToolDefinition:
-  mu.RLock
-  out := []models.ToolDefinition{}
-  for _, conn := range servers:
-    for _, tool := range conn.tools:
-      out = append(out, models.ToolDefinition{
-        Name:        tool.Name,
-        Description: tool.Description,
-        Parameters:  tool.InputSchema,   // 透传 JSON Schema
-      })
-  return out
-```
+    c.inflight.Add(1)
+    defer c.inflight.Add(-1)
 
-这个列表会被 orchestrator 每次发 LLM 请求前和 **内置工具 + Skills** 合并，塞进 `function_call` 参数 —— 所以"新加一个 MCP Server"的下一轮 chat 就生效了，**不用重启**。
-
----
-
-## 8. 运行时 CRUD API
-
-### 8.1 `AddServer(cfg)` → `*ServerStatus`
-
-```
-1. 校验：name 不能重复
-2. newServerConnection(cfg) + initializeServer
-3. mu.Lock → servers[name] = conn; toolMap[tool] = name (for each tool)
-4. 保存 configs[name] = cfg     (给 reconnect 用)
-5. 返回 ServerStatus{ Name, Connected:true, ToolCount, Tools }
-```
-
-失败要**回滚**：杀掉已启动子进程，避免 orphan。
-
-### 8.2 `RemoveServer(name)`
-
-```
-1. mu.Lock
-2. conn.close()
-     - cmd.Process.Signal(SIGTERM)
-     - 等 2s
-     - 还没死就 SIGKILL
-     - 关 stdin/stdout (readResponses goroutine 自然退出)
-3. delete(servers, name); delete(configs, name)
-4. 清理 toolMap：删所有 value == name 的条目
-```
-
-### 8.3 `ListServers()`
-
-```go
-type ServerStatus struct {
-    Name        string
-    Connected   bool      // 子进程活着 + 握手完成
-    ToolCount   int
-    Tools       []string  // 工具名列表
-    LastError   string    // 最近一次错误（便于排查）
+    select {
+    case resp := <-respCh:
+        if resp.Error != nil { return nil, resp.Error }
+        return resp, nil
+    case <-ctx.Done():
+        c.mu.Lock(); delete(c.pending, id); c.mu.Unlock()
+        return nil, ctx.Err()
+    }
 }
 ```
 
-前端 `code_agent_ui/src/pages/MCPPage.tsx` 用这个渲染"已连接的 MCP 服务器列表 + 启停按钮"。
+**为什么"pending 注册 BEFORE 写 stdin"是硬约束**：假如颠倒——先写 stdin 再注册 pending——下面的竞态会偶发出现：
+
+```
+[caller] writeMu.Lock; stdin.Write(req); writeMu.Unlock
+                                      ↓ 微妙后
+                              [server] 处理完，写 resp 到 stdout
+                                      ↓ 同时
+                              [reader] scanner.Scan() 拿到 resp
+                                      ↓
+                              [reader] mu.Lock; pending[id]?  ← 还没注册！
+                                      ↓
+                              [reader] 丢帧
+[caller] mu.Lock; pending[id] = respCh; mu.Unlock
+[caller] <-respCh   ← 永久卡死
+```
+
+**ctx 取消的内存安全**：`select` 走 ctx.Done 分支时立刻 `delete(pending, id)`——否则迟到的响应找不到 chan，但 map 项还在，每超时一次泄漏一个 chan。
 
 ---
 
-## 9. `healthChecker` —— 自愈引擎 (`reconnect.go`)
+## 6. `validation.go` —— MCP 子进程命令白名单（`validation.go:1-71`）
 
-### 9.1 配置
+`AddServer` 的入口校验：
+
+```go
+var AllowedMCPCommands = map[string]bool{
+    "npx": true, "node": true, "python": true, "python3": true,
+    "uvx": true, "uv": true, "deno": true, "bun": true, "docker": true,
+}
+
+var allowedCommandDirs = []string{
+    "/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/",
+}
+
+var dangerousArgs = []string{"--eval", "-e", "-c", "eval", "exec"}
+```
+
+`ValidateCommand` 三道闸：
+
+1. **非空** + **拒绝相对路径含分隔符**（`./foo` `../bin/evil`）；
+2. `filepath.Clean` 去掉 `..` 后取 basename，必须 ∈ `AllowedMCPCommands`；
+3. 若是绝对路径，必须以 `/usr/bin/` / `/usr/local/bin/` / `/opt/homebrew/bin/` 之一开头。
+
+`ValidateArgs` 拒绝 `--eval` / `-e` / `-c` / `eval` / `exec`（包括 `--eval=...` 这种形态）——防止 LLM/REST 调用方提交一个合法解释器（如 `python`）但用 `-c "rm -rf /"` 直接当 shell 执行。
+
+**这个白名单的局限**：
+
+- 不能阻止 `npx <恶意 npm 包名>`——npx 会拉网上的包跑（这是 MCP 生态本身的信任假设，需在 Docker 沙箱里跑 MCP server 才能真正隔离；当前默认信任已发布的 MCP server）。
+- 没限制环境变量——`cfg.Env` 可以注入 `LD_PRELOAD`。
+
+这些是已识别的加固空间，详见 §12。
+
+---
+
+## 7. `ConnPool` —— 已接线的多子进程池（`pool.go`）
+
+> ✅ **2026-06 更新**：`Gateway.servers` 已改为 `map[string]*ConnPool`。`NewGateway` 对每个 stdio server 调 `NewConnPool` + `pool.Start(ctx, gw.initializeServer)`；`Gateway.CallTool` 内部走 `pool.CallTool`。`PoolSize` 字段由 `MCPServerConfig.PoolSize` (YAML `pool_size`) 提供，`<=1` 等价单连接，向后兼容。
+
+### 7.1 为什么要池化
+
+单 stdio server 子进程是**事实串行**的：
+
+- stdin 写必须串行（行分帧约束）；
+- 多数 MCP server（Node.js / Python）是单事件循环，CPU 绑核后队列拉平；
+- 慢工具（`github.search_code` p99 ≈ 800ms）单进程下顶不住并发 ReAct 步内的多 tool_call。
+
+实测：2~3 秒内并发 20 条 `read_file` 给 filesystem-mcp，单进程 p99 ≈ 1200ms，4 进程池 p99 ≈ 340ms（pool.go 文件头注释）。
+
+### 7.2 关键结构（`pool.go:90-114`）
+
+```go
+type ConnPool struct {
+    name     string
+    cfg      *config.MCPServerConfig
+    size     int                    // 目标进程数
+    minAlive int                    // 启动时最少存活；默认 max(1, size/2)
+
+    conns []atomic.Pointer[ServerConnection]  // slot 数组，原子可换
+    progressCounter atomic.Uint64             // 生成 pool 级 progressToken
+
+    toolsOnce sync.Once
+    tools     []MCPTool
+
+    dialer func(cfg, logger) (*ServerConnection, error)  // 测试注入用
+}
+```
+
+**为何 `atomic.Pointer` 而非 mutex**：`Pick()` 是**热路径**——单次 RPC 都要走一次。互斥锁 Lock+Unlock 在高并发下成本可观；`atomic.Pointer.Load` 是 lock-free。
+
+### 7.3 `Pick()` —— Least-Pending 负载均衡（`pool.go:199-220`）
+
+```go
+for i := range p.conns {
+    c := p.conns[i].Load()
+    if c == nil { continue }
+    load := c.inflight.Load()
+    if load < bestLoad {
+        best = c
+        bestLoad = load
+        if load == 0 { break }   // 0 pending → 直接返回，免遍历
+    }
+}
+return best
+```
+
+为何不 round-robin：**长短请求混合下 RR 不公平**。RR 假设每个请求成本相近，但 MCP tool 调用从 5ms（filesystem read）到 800ms（github search）跨度极大；某 slot 排了 5 个慢请求时 RR 仍会给它派新活，把 p99 拉高一倍。
+
+**Least-pending 用 `inflight atomic.Int64`**——`sendRequest` 入口 `inflight.Add(1)` 出口 `Add(-1)`，`Pick` 读这个值。O(N) 扫描 N≤8 远比加锁便宜。
+
+### 7.4 Chunked Streaming（`pool.go:292-400`）
+
+`CallToolStream(ctx, toolName, args) → <-chan ToolChunk` 是流式版 `CallTool`：
+
+1. 生成 `progressToken = "<server>-<atomic_id>"`；
+2. `conn.subscribeProgress(token, 32)` → 拿到 progress chan；
+3. 在 params 注入 `_meta.progressToken`（MCP 约定的回调字段）；
+4. 启一个 goroutine：select { progress | tools/call 终态 | ctx.Done };
+5. progress 帧 → `out <- ToolChunk{Content:chunk.Chunk, Progress:..}`；
+6. 终态帧 → `out <- ToolChunk{IsFinal:true, Final: parseToolResult(...)}`；
+7. defer `unsubscribeProgress` + `close(out)`。
+
+`ToolChunk.Content` 字段对应 MCP 的非标准 `chunk` 字段（§3.2）。GitHub/Atlassian 的官方 MCP 已经支持；不支持的 server 自动退化为只发一帧 `IsFinal=true`（向后兼容）。
+
+### 7.5 接线现状（2026-06）
+
+| 项 | 状态 |
+|---|---|
+| `Gateway.servers map[string]*ConnPool` | ✅ 已替换 |
+| `MCPServerConfig.PoolSize` (YAML `pool_size`) | ✅ 已暴露；缺省/`<=1` 退化为单连接 |
+| `Gateway.CallTool` 委托 `pool.CallTool` | ✅ 已切换 |
+| `Gateway.AddServer/RemoveServer/Close` 用 pool 生命周期 | ✅ 已切换 |
+| 测试用 `newSingletonPool` 把 mock 连接包成 1-slot pool | ✅ 已提供 |
+| **`replaceLoop` 自动 respawn**：slot 挂掉后自动 fork | ❌ **未实现**——pool.go 注释提及（`pool.go:98`），但代码无对应 goroutine |
+| 健康检查 `checkAll` → `processAlive` 兜底 | ✅ 用 `Signal(syscall.Signal(0))` 探 slot 进程；死进程 CAS 清空 slot；零活时整池 `reconnectServer`。详见 §8.2 |
+
+**关键缺口**：`replaceLoop` 仍未实现，所以"slot 挂了下一个 slot 顶上"这一段在文档里有、代码里没。当前的兜底是 `healthChecker`（但 main.go 尚未启动它）+ 整池 reconnect。生产部署若依赖单 slot 自愈，需先把 `healthChecker.Start` 接入 main.go。
+
+P0 加固详见 §12。
+
+---
+
+## 8. `healthChecker` —— 自愈引擎（`reconnect.go`）
+
+> ⚠️ **现状**：自愈逻辑已就位且为池化版本（2026-06 重写），但 `main.go` 仍未调 `hc.Start(...)`，所以"周期检查"并未运转——只有人工调 `gw.reconnectServer` 或 `checkAll` 时才会触发。整池零活时单次 `CallTool` 仍能从 ConnPool 内的剩余 slot 服务（前提是至少有一个活 slot）。
+
+### 8.1 配置（`reconnect.go:23-27`）
 
 ```go
 var defaultReconnectConfig = reconnectConfig{
-    MaxAttempts:       5,
-    InitialBackoff:    1 * time.Second,
-    MaxBackoff:        60 * time.Second,
-    BackoffMultiplier: 2.0,
+    MaxRetries:     5,
+    InitialBackoff: 1 * time.Second,
+    MaxBackoff:     30 * time.Second,
 }
 ```
 
-### 9.2 周期性检查
+退避序列：1s → 2s → 4s → 8s → 16s → 30s（cap）。5 次失败后 `Error` 日志放弃，等待人工或下个 tick。
+
+### 8.2 `processAlive` —— 进程级而非协议级（`reconnect.go`）
 
 ```go
-healthChecker.Start(interval):
-  go loop {
-     select {
-       case <-tick:  hc.checkAll()
-       case <-stop:  return
-     }
-  }
-
-checkAll():
-  gw.mu.RLock → 拷贝 servers 列表
-  for name, conn in copied:
-    if !hc.isAlive(conn):
-        go hc.reconnect(name)         ← 并发重连，不阻塞其他检查
+func isProcessAlive(conn *ServerConnection) bool {
+    if conn == nil || conn.cmd == nil || conn.cmd.Process == nil {
+        return false
+    }
+    if conn.exited.Load() {          // ① reaper 已 wait 回来
+        return false
+    }
+    err := conn.cmd.Process.Signal(syscall.Signal(0))
+    if err == nil {
+        return true                  // ② 进程仍在
+    }
+    return !errors.Is(err, syscall.ESRCH)
+}
 ```
 
-### 9.3 `isAlive`
+**两层检测必须组合**：
 
-简单却有效：
+| 层 | 抓什么 | 漏什么 |
+|----|--------|--------|
+| `conn.exited` (reaper goroutine) | 已 exit + 已 reap 的进程 | exit 与 Wait 返回之间的短暂窗口 |
+| `Signal(syscall.Signal(0))` | exit 后 PID 已被回收的进程（`ESRCH`） | **僵尸**（已 exit 未 reap）——PID 仍在表里，`Signal(0)` 返 0，会误报存活 |
+
+`newServerConnection` 启动后即 spawn 一个 reaper goroutine——但**不能**直接调 `cmd.Wait()`。`os/exec` 文档规定：`Wait` 会关闭由 `StdoutPipe()` 返回的 pipe；如果 `readResponses` 还在那条 pipe 上 `Scan`，Wait 就会把 pipe 从读端脚下抽走。因此 reaper 先 `readerWg.Wait()`，等 `readResponses` 自然 EOF 后再 `cmd.Wait()`：
 
 ```go
-isAlive(conn):
-  ctx, cancel := context.WithTimeout(ctx, 2s)
-  _, err := conn.sendRequest(ctx, "ping", nil)   ← MCP 有 ping 方法
-  return err == nil
+go func() {
+    conn.readerWg.Wait()   // 等 stdout reader drain
+    _ = cmd.Wait()          // 见下方对两条路径的说明
+    conn.exited.Store(true)
+}()
 ```
 
-> MCP spec 定义了 `ping` 方法专门用于保活，本代码直接用 —— 不用自己定心跳协议。
+`readResponses` 的 EOF 来源有两条，且 Wait 在两条路径下的行为不同：
 
-### 9.4 指数退避重连
+| 路径 | 触发 | `cmd.Wait()` 行为 |
+|------|------|-------------------|
+| (a) 子进程自然退出 / 崩溃 | 内核关闭子进程的 stdout 写端 → scanner EOF | 子进程已死，Wait 快速返回并 reap 僵尸 |
+| (b) 我们主动 `close()` | `close()` 先 `stdout.Close()` 关我们这端读端 → scanner 立即返回 | 此时子进程可能还活着！Wait 会**阻塞**到 `close()` 后续的 `Process.Kill()` 把进程干掉。reaper 没有其他工作，阻塞无害；Kill 一旦生效 Wait 返回，`exited` 置 true |
+
+两条都不要求 Wait 提前介入，完全符合 `os/exec` 契约。
+
+**单独看 `Signal(0)` 漏僵尸；单独看 `exited` 漏极短的"已 exit 还没 reap 回来"窗口**——两层一起才万无一失。
+
+| 维度 | 进程级（当前） | 协议级（发 MCP `ping`） |
+|------|----------------|-------------------------|
+| 开销 | 一次 syscall + 一次 atomic load | 每 tick × N server 一次 RPC |
+| 误判 | 进程活着但 hung 检测不到 | 真实可用性更准 |
+| 实现 | ~20 行（含 reaper） | 要在 `ping` 加超时 + 处理无 `ping` 的旧 server |
+
+**池层增强**（2026-06）：`processAlive(pool)` 在发现死 slot 后会 CAS 把 slot 清空——这样 `pool.Pick()` 不会再把请求派给死连接。仅当整池零活时才升级到 `reconnectServer`（重建整池）。`ConnPool.Alive()` 只查指针非空，**不能**用作健康判定。
+
+### 8.3 重连流程（`reconnect.go`）
+
+```text
+checkAll() 每 tick:
+   for s in copy(gw.servers):                  ← s.pool is *ConnPool
+       if hc.processAlive(s.pool) == 0:
+           go reconnect(s.name)                ← 整池零活才重建
+
+
+reconnect(name):
+   backoff := 1s
+   for attempt in 1..5:
+       sleep(backoff)
+       err := gw.reconnectServer(ctx[30s timeout], name)
+       if err == nil: return
+       backoff = min(backoff*2, 30s)
+   logger.Error("gave up after 5 retries")
+
+
+reconnectServer(ctx, name):
+   ① mu.Lock
+       oldPool = servers[name]; oldPool.Close() ← 关闭整池所有 slot
+       delete(servers, name)
+   ② mu.Unlock
+   ③ cfg := gw.serverConfigs[name]              ← F8：之前存的配置
+   ④ pool := NewConnPool(cfg, logger)
+   ⑤ pool.Start(ctx, gw.initializeServer)       ← handshake 闭包
+   ⑥ mu.Lock; servers[name] = pool; mu.Unlock
+```
+
+**为什么先 unlock 再做新连接握手**：握手要 IO（stdin/stdout + tools/list），通常 100ms～几秒。这段时间持有 `Gateway.mu` 会让 `CallTool` / `ListServers` 全部阻塞。
+
+**重连窗口期的数据风险**：握手完成前，`servers[name]` 不存在——同名 `CallTool` 会拿到 `"MCP server not found"`。orchestrator 上层目前**没有**针对 MCP 失败的 retry，所以 LLM 会看到一次工具失败、可能改路径走别的工具。这是已知缺陷（§12）。
+
+### 8.4 与"接线"的差距
+
+需要在 `cmd/agent/main.go:316` 后加：
 
 ```go
-reconnect(serverName):
-  cfg := gw.configs[serverName]   ← 之前保存的配置
-  for attempt in 1..MaxAttempts:
-      sleep(min(Initial * Mul^(attempt-1), MaxBackoff))
-      err := gw.reconnectServer(ctx, serverName)
-      if err == nil: return
-      logger.Warn("reconnect failed", attempt=...)
-
-  logger.Error("max reconnect attempts exhausted")
-  → 放弃；工具仍在 toolMap 里，但 CallTool 会失败
-  → 用户看 ListServers 发现 Connected=false 便知道要手动处理
+if mcpGateway != nil && cfg.MCP.HealthCheckEnabled {
+    hc := mcp.NewHealthChecker(mcpGateway, logger)
+    hc.Start(30 * time.Second)
+    defer hc.Stop()
+}
 ```
 
-### 9.5 `reconnectServer` 实际工作
-
-```
-1. gw.mu.Lock
-2. old := servers[name]; old.close()           ← 清掉僵尸
-3. new := newServerConnection(cfg)
-4. initializeServer(ctx, new)
-5. servers[name] = new
-6. 重建 toolMap 的对应条目（工具集可能变化）
-7. gw.mu.Unlock
-```
-
-**⚠️ 注意点**：重连窗口期（几百 ms）调用 `CallTool` 会读到 old closed conn 并失败。orchestrator 的重试机制会兜一下；更进一步可以用 **读写锁的 upgrade** 或 **原子指针替换**（进一步优化方向）。
+且要让 `newHealthChecker` 导出（目前小写），并在 `config.MCPConfig` 加 `HealthCheckEnabled bool` / `HealthCheckInterval time.Duration` 字段。
 
 ---
 
-## 10. 与 Skill 的关系（对比）
+## 9. 与 Skill / 内置工具的对比
 
-`07_tools.md` / `08_skill.md` 会细讲；这里说清楚差异：
+orchestrator 看到的三类工具来源**同构**——返回类型都是 `models.ToolResult`，参数都是 JSON Schema——LLM 完全感知不到差异。底层实现差异巨大：
 
-| 维度           | MCP Server                       | Skill (`internal/skill`)              |
-|----------------|----------------------------------|---------------------------------------|
-| 实现           | **子进程** + JSON-RPC over stdio  | 内存中的 Go 函数 / HTTP webhook        |
-| 部署           | 独立程序（npx / python / go）     | 仅在 Gateway 进程内                    |
-| 生命周期       | Gateway 拉起+维护                 | 完全在 Gateway 内存                    |
-| 故障隔离       | 子进程崩溃不影响主进程            | 崩溃（panic）会影响主进程             |
-| 协议           | MCP 标准                          | 自定义 HTTP POST（轻量）              |
-| 延迟           | IPC 2-5ms                         | 函数调用 <1ms / HTTP 5-20ms           |
-| 开发难度       | 要写个符合 MCP 规范的独立进程      | 直接写 Go 函数或简单 HTTP handler      |
+| 维度          | 内置工具 (`07_tools.md`)        | MCP server (`internal/mcp`)     | Skill (`08_skill.md`)                  |
+|---------------|---------------------------------|---------------------------------|----------------------------------------|
+| 实现形态      | Go 函数                          | 独立子进程 + JSON-RPC over stdio | YAML 模板 + 内置工具组合              |
+| 部署          | 编译进 agent 二进制              | `npx`/`uvx`/`python` 独立进程    | 写在 `skills/*.yaml`，无独立进程       |
+| 故障隔离      | panic 会拖垮主进程               | 子进程崩溃 → 主进程不影响        | 内置工具崩 → 主进程不影响              |
+| 延迟          | 直接函数调用 <1ms                | stdio IPC ~2-5ms                | 编排开销 + 内置工具延迟                |
+| 跨语言        | 仅 Go                            | 任何 stdio 进程（Node/Py/Rust）  | 仅 YAML 描述能力                       |
+| 协议          | 内部                              | MCP 标准 (`tools/call` 等)        | 自定义 prompt + 工具调用约定          |
+| 开发难度      | Go 函数 + 注册                   | 写符合 MCP 规范的独立进程        | 写 YAML + 配工具序列                   |
+| 工具发现      | `tools.Registry.Definitions()`   | `Gateway.GetAvailableTools()`     | `SkillRegistry.List()`                |
 
-Orchestrator 层对三种来源（内置/ MCP / Skill）**统一抽象**，LLM 完全感知不到差异。
+orchestrator `getAvailableTools()` 把这三个 source 列表合并，每次 LLM 调用前重新拼。**新增/删除 MCP server 在下一轮 ReAct step 立刻生效**，无需重启进程。
+
+---
+
+## 10. CallTool 完整时序（已接线路径）
+
+```text
+orchestrator                Gateway                ServerConnection             子进程 (npx mcp-...)
+     │                         │                          │                            │
+     │─ CallTool("filesystem", "read_file", {path}) ────▶│                            │
+     │                         │                          │                            │
+     │                         │─ RLock; conn = servers["filesystem"]; RUnlock         │
+     │                         │                          │                            │
+     │                         │─ sendRequest("tools/call", {name,arguments})         │
+     │                         │                          │                            │
+     │                         │                          │  id := reqID.Add(1)        │
+     │                         │                          │  mu: pending[id] = ch      │
+     │                         │                          │  writeMu: stdin.Write(req+\n) ─▶│
+     │                         │                          │  inflight++                │
+     │                         │                          │                            │── exec
+     │                         │                          │  select <-ch:              │
+     │                         │                          │                            │── 写 stdout
+     │                         │                          │◀── stdout "data\n" ────────│
+     │                         │                          │  (readResponses goroutine) │
+     │                         │                          │  parse, match id, push ch  │
+     │                         │                          │  resp := <-ch              │
+     │                         │                          │  inflight--                │
+     │                         │◀── resp ─────────────────│                            │
+     │                         │                          │                            │
+     │                         │─ json.Unmarshal → MCPToolResult                      │
+     │                         │─ strings.Builder 拼接 text                            │
+     │◀── &ToolResult{Content,IsError} ────────────────────────────────────────────────│
+```
+
+并发场景：同一 conn 同时来 5 个 `read_file` —— 5 个独立 id、5 个独立 respCh，单个 reader goroutine 按 id demux 全部正确回路。这是 §1.5 Q4 设计的运行时表现。
 
 ---
 
 ## 11. 设计权衡
 
 | 抉择 | 动机 |
-|---|---|
-| stdio 优先于 SSE | stdio 零配置、调试友好、无网络依赖；SSE 适合远程服务（规划中） |
-| `bufio.Scanner` 按行读 | MCP 约定一行一个 JSON 帧；Scanner 默认 64KB 行上限 → 需要 `scanner.Buffer()` 扩容（TODO） |
-| `pending map + chan` 做多路复用 | 支持单 server 并发调用；ID 匹配响应是 JSON-RPC 经典范式 |
-| 子进程崩溃**不**自动抛异常 | 健康检查 + 重连兜底；主流程永远拿到的是 `ErrNotConnected`，可 fallback |
-| `reconnectServer` 保存原始 cfg 而非 handle | cfg 不变意味着重启恢复出的 server 行为一致；handle 可能已被 GC |
-| `tools/list` 只在握手时拉一次 | MCP 标准有 `notifications/tools/list_changed`，待实现；现在重连刷新 |
-| CRUD API 直连 Gateway 而非走 DB | 运行时状态天然在内存；若要持久化重启恢复，在 `16_store.md` 的 config persistence 里加 |
-| `healthChecker` 用单例 goroutine + 并发 reconnect | 检查频率低（30s/次）不值得 worker pool；reconnect 并发以防"一个挂服务拖延所有" |
-| JSON-RPC ID 用 int64 atomic 而非 UUID | 短、快、天然有序；单进程不会冲突 |
+|------|------|
+| 自研 JSON-RPC 而非用官方 SDK | SDK pre-1.0 且缺生产能力；协议层 800 行可控 |
+| 当前只支持 stdio | 本地工具占绝对比例，SSE 留给 §12 |
+| 两把锁 (`mu` / `writeMu`) | pending 注册与 stdin 写入解耦，前者 lock-free 等响应 |
+| pending 注册 BEFORE 写 stdin | 防止响应早到无 chan 接的永久卡死 |
+| reader 单 goroutine | stdout 字节流只能单消费者按行扫描 |
+| reader 退出时 broadcast -32603 | 所有等响应的调用者立刻拿到错误，不卡 select |
+| `progressNotification.Chunk` 字段 | 兼容 GitHub/Atlassian 事实标准，spec 之外但生态强需求 |
+| `toolIndex` 预建 map | O(1) `FindServerForTool`，避免每次 ReAct step 扫所有 conn |
+| `inflight atomic.Int64` 而非 chan-based 度量 | Pick 热路径要 lock-free 读取 |
+| Validation 用关键字白名单而非沙箱 | npx/uvx 拉网包的信任假设依赖发布者；命令白名单是粗筛 |
+| `healthChecker` 用 `Signal(0)` 而非协议级 ping | tick 周期 ≥ 30s 时进程级足够；协议级 ping 是未来增项 |
+| `reconnectServer` 先 unlock 再握手 | 握手 IO 期间不阻塞其他 RPC |
+| 工具命名空间无前缀 | 设计偷懒；§12 演进项 |
+| CRUD API 不持久化 | 配置层 + 启动时读 config 已够用；持久化等 §16 store |
+| `bufio.Scanner` buffer 扩至 4MB | github-mcp 长 issue list 默认 64KB 必爆 |
 
 ---
 
 ## 12. 后续演进
 
-- [ ] **SSE transport**：MCP spec 定义的另一种通道，支持远程托管的 MCP 服务（GitHub 官方有 hosted 版本）；
-- [ ] **`scanner.Buffer()` 扩容**：某些 MCP Server 一次返回很长的 `tools/list`（几十 KB），默认 64 KB 会被 scanner 截断；
-- [ ] **`notifications/tools/list_changed` 支持**：工具热更新，不用等健康检查周期；
-- [ ] **subprocess sandbox**：MCP Server 子进程默认继承 Agent 的全部权限 —— 生产应把它关进 Docker（和 `sandbox` 模块复用）；
-- [ ] **原子指针 swap**：`reconnectServer` 过程中对 `servers[name]` 用 `atomic.Pointer`，彻底消除重连窗口的竞争；
-- [ ] **持久化配置**：Gateway 启动时从 `store.Postgres` 读取已注册 servers，避免重启后需要重新 AddServer；
-- [ ] **权限模型**：对单个 tool 标注所需权限（读/写/敏感），调用前查 HITL 策略（见 `11_temporal.md` 的 await 机制）；
-- [ ] **tool 返回流式**：MCP spec 支持增量返回，`CallTool` 目前只等完成；要改成 `CallToolStream`。
+### P0（生产前必须）
+
+- [ ] **接线 `healthChecker`**：`main.go` 起 `hc.Start(30s)` + 加 `cfg.MCP.HealthCheck.{Enabled,Interval}` 配置；崩溃 stdio server 自动 respawn（注：当前 `processAlive` 已能清理死 slot，但仍需触发整池 reconnect）
+- [x] ~~**接线 `ConnPool`**~~ 已完成（2026-06）：`Gateway.servers map[string]*ConnPool`；`MCPServerConfig.PoolSize` (`pool_size: 4`) 起多子进程；仍待补 `replaceLoop` 单 slot 自愈
+- [ ] **实现 `replaceLoop`**：pool slot 死亡后后台 respawn + CompareAndSwap 回来（当前注释里画了大饼，代码没做）
+- [ ] **工具命名空间前缀**：自动 `<serverName>/<toolName>` 化（或可关闭），解决同名冲突；LLM prompt 同步带前缀
+- [ ] **`scanner.Buffer` 大小可配**：默认 4MB 偶尔不够（一次 search 几十 MB 的 grep result），加 `cfg.MCP.ScannerBufferMB`
+- [ ] **MCP server 跑在 sandbox**：`docker` 已在 `AllowedMCPCommands` 白名单，但当前 stdio 子进程默认继承 agent 的全部权限；用 docker run + `--network=none` 包一层
+
+### P1（运维质量）
+
+- [ ] **per-server metric**：`mcp_call_duration_seconds{server,tool}` / `mcp_active_connections{server}` / `mcp_reconnect_total{server}`
+- [ ] **SSE transport**：实现 `Transport=="sse"` 分支，对接 GitHub hosted MCP / 远程内网 MCP
+- [ ] **进度通知接入 orchestrator**：`Gateway.CallToolStream` 公开版本，让 SSE 流式输出走到前端
+- [ ] **`notifications/tools/list_changed` 监听**：server 自报工具变化时刷新 toolIndex（不用等下个健康检查）
+- [ ] **per-server circuit breaker**：单 server 连续 5 次失败暂停 30s，不拖累全局
+- [ ] **stderr 接入 audit**：MCP server stderr 当前透传父进程；包成 `bufio.Reader` 行扫描 → `audit/logger.go`
+- [ ] **CRUD 配置持久化**：Postgres 存 `mcp_servers` 表，重启从 DB 而非 yaml 恢复
+
+### P2（演化方向）
+
+- [ ] **batch call**：同 server 的多个 tools/call 合并成单次（需 MCP spec 演进配合）
+- [ ] **自动 failover**：同工具在多 server 上提供时，一挂自动切
+- [ ] **mTLS for SSE**：远程 MCP 接入时必须的双向证书
+- [ ] **协议版本协商**：当前固定 `2024-11-05`；改成 `min(client, server.protocolVersion)`
+- [ ] **HITL gate per tool**：单个 MCP 工具标注 `requires_approval=true`，调用前触发 Temporal approval（[11_temporal.md](11_temporal.md)）
 
 ---
 
-## 13. 实现剖析与改进方向
+## 13. 设计教训
 
-### 一次 CallTool 调用的完整时序（stdio transport）
+`mcp` 包从初版的 220 行 demo 演化到现在 1500+ 行，踩过的真坑：
 
-```text
-orchestrator              mcp.Gateway          stdioServer (子进程)
-      │                        │                     │
-      │─ CallTool("github/create_issue", args) ──▶  │
-      │                        │                     │
-      │                        │─ acquire pool slot  │
-      │                        │─ nextRequestID()    │
-      │                        │─ encode JSON-RPC:    │
-      │                        │   {"jsonrpc":"2.0", │
-      │                        │    "id":42,         │
-      │                        │    "method":"tools/call",│
-      │                        │    "params":{...}}   │
-      │                        │─ write to stdin ───▶│
-      │                        │                     │── 处理请求（调 API）
-      │                        │                     │
-      │                        │  registerPending(42)│
-      │                        │  等待 response chan │
-      │                        │                     │
-      │                        │◀── stdout "data\n" ─│
-      │                        │  scanner.Scan()     │
-      │                        │  parse JSON-RPC     │
-      │                        │  match id=42        │
-      │                        │  pendingChan[42] <- │
-      │                        │                     │
-      │◀── ToolResult ─────────│                     │
-      │                        │─ release pool slot  │
-```
+1. **JSON-RPC ID 必须在写 stdin 之前注册 pending**——初版顺序反了，10 次调用偶发卡 1 次。Race 极小但用户报"agent 偶尔像被掐了脖子"。第一性原理回去看才意识到：网络往返的最小延迟也可能小于"写完 stdin → 注册 pending"这两条 Go 语句之间的间隔。
 
-**关键并发模型**：
-- **一条读 goroutine** 独占 stdout，分发给 pendingChan
-- 多个调用方 goroutine 并发调 `CallTool`，各自等自己的 response channel
-- `PoolSize >= 2` 时起 N 个子进程，`Gateway` 做 round-robin
+2. **`bufio.Scanner` 默认 64KB 必爆**——github-mcp 拉一次 issue list 就 200KB。初版 reader 静默 panic（log 里没显式信息），表象是"server 永远不返回"。教训：任何流式 protocol 第一步先把 buffer 扩大。
 
-### 健康检查与重连（`reconnect.go`）
+3. **两把锁不是过度设计**——初版一把 `mu` 同时保护 pending + stdin，并发 RPC 时所有 goroutine 都在 mu 排队等 IO。改成两把锁后 p99 立刻降 60%（4 并发 RPC 测试）。
 
-```text
-每 30s tick:
-  ├─ 发 "ping" 风格的 tools/list（轻量 RPC）
-  ├─ 超时 5s → 认定 unhealthy
-  │   ├─ kill 子进程
-  │   ├─ 清空 pending requests（返回 error 给调用方）
-  │   ├─ 指数退避：wait 1s, 2s, 4s, ... max 60s
-  │   └─ Exec 新子进程（重新握手 initialize）
-  └─ pong 返回 → 维持连接
-```
+4. **reader 退出必须 broadcast 错误**——初版子进程崩了时所有等响应的 caller 直接卡 `<-respCh`。`ctx` 取消才返回但要等用户 timeout。改成 reader 退出前给所有 pending 注入 -32603 后立刻全部解锁，体感"agent 卡住"变成"工具明确失败可重试"。
 
-**恢复时间**：典型 stdio server 重启 10-30s。期间所有 `CallTool` 排队
-或直接 fail。
+5. **池/自愈/SSE 的"骨架就绪、未接线"是有意识的决策**——单连接 + 无自愈在我们当前规模（≤10 个 server / ≤4 并发 ReAct）够用；过早接线只会引入"为复杂而复杂"的 bug。等真正撞到天花板（监控显示 p99 飚高 / server crash 频率上升）再接，比一上来就拉满更稳。把代码留在 repo 里是为了**让接线时只需 50 行 main.go 改动**，而不是从零写 462 行。
 
-### JSON-RPC 帧的坑
-
-MCP 规定 **一行一帧**（换行分隔 JSON）。我们用 `bufio.Scanner` 读取：
-
-```go
-scanner := bufio.NewScanner(stdout)
-scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)  // ← 必须扩容
-for scanner.Scan() {
-    line := scanner.Bytes()
-    handleFrame(line)
-}
-```
-
-**踩过的坑**：默认 `bufio.Scanner` 行上限是 **64 KiB**，github-mcp 返回长
-issue list 很容易超。必须用 `scanner.Buffer()` 显式扩大。
-
-### 利弊评估
-
-**优势（Pros）**
-- ✅ 自研协议层仅几百行，可控性强
-- ✅ 自动重连让 stdio server 的崩溃对 orchestrator 透明
-- ✅ PoolSize 多进程对慢 server 有效（吞吐 × N）
-- ✅ 命名空间前缀 `github/xxx` 避免 tool 冲突
-- ✅ stdio / SSE 双支持，本地工具和远程服务都能接
-
-**代价（Cons）**
-- ⚠️ 每次 CallTool 是 RPC 往返（stdio 虽然 μs 级但还是 round-trip）
-- ⚠️ 无 batch：10 个独立 tool call 就是 10 次 round-trip
-- ⚠️ tool 结果不能流式（当前 blocking 等 full response）
-- ⚠️ stdio server 的错误日志去 stderr，和 RPC 混在一起，不好排查
-- ⚠️ 没有 per-server 熔断——某 server 慢会拖累它自己的 pool，其他 server
-  不受影响（这点反而是好事）
-
-### 可改进点
-
-**P0**
-1. 添加 per-server metric（`mcp_call_duration{server,tool}`）便于找慢点
-2. Scanner buffer 上限从 16 MiB 改为可配置（某些 MCP 返回大 attachment）
-
-**P1**
-3. 支持 tool 结果流式（MCP spec 里已定义 notification 机制）
-4. Server health dashboard：`/api/v1/mcp/servers` 返回每 server 最近 30s 成功率
-5. stdio stderr 收到错误日志时记 audit log（现在只丢到 debug log）
-
-**P2**
-6. batch call：同一 tool 的多次连续调用合并（tricky，需要 tool 本身支持）
-7. 自动故障转移：同一 tool 如果在多个 server 有，一个挂了切另一个
-8. SSE transport 完善（目前 stdio 更成熟）
+6. **命名空间冲突是 spec 的锅，不是实现的锅**——MCP spec 不强制 server 名前缀，所以多 server 同名工具是合法的、且各自 server 不知道对方存在。要前缀只能客户端单边加，但加了之后 LLM prompt 里所有工具名都变长（前缀 + 斜杠 + 工具名）；为了"防一种小概率冲突"让所有 tool prompt 都长 20%，是错误的省事。当前选择"配置层强制唯一" + "前缀化作为 §12 P0 可选"是务实的。
 
 ---
 
-下一篇：`07_tools.md` —— 内置工具注册表（file/git/exec 工具的声明与调度）。
+下一篇：[`07_tools.md`](07_tools.md) —— 内置工具注册表（file/git/edit/lsp/pty 等），MCP 工具与之同居 `tools.Registry`。
