@@ -84,12 +84,9 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 | `SpeculativeToolCache` | ✅ 已接 | Orchestrator 在 `NewOrchestrator` 构造并 `SetMetadataLookup` 给注册表 |
 | `RedisRateLimiter` | ✅ 已接 | `api/router.go:190-191` |
 
-**仍然死的**：
-| 组件 | 文件 | 说明 |
-|------|------|------|
-| MCP SSE 传输 | `internal/mcp/client.go::NewGateway` | 仅处理 `Transport=="stdio"`，SSE 配置被 skip |
+**仍然死的**：（暂无）
 
-修改 SSE 相关代码不会影响运行时行为。
+> ✅ MCP SSE 传输（2026-06）：`internal/mcp/transport_sse.go` 已实现 HTTP+SSE 传输，`dialTransport` 按 `cfg.Transport` 分发；`NewGateway` 不再 skip SSE 配置。详见 `llmdoc/architecture/infrastructure-subsystems.md::传输`。
 
 ## 双重 Token 估算器
 

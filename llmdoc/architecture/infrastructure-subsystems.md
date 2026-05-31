@@ -132,7 +132,7 @@ resolveRuntime → ensureImage → 解析内存/CPU限制 → ContainerCreate
 `healthChecker` (`internal/mcp/reconnect.go`)：
 
 - `connAlive(conn)` 委托 `conn.transport.Alive()`，两套传输各自实现存活语义：
-  - **stdio** (`transport_stdio.go`): 两层组合 `conn.exited` 原子位 + `Process.Signal(syscall.Signal(0))`
+  - **stdio** (`transport.go::stdioTransport`): 两层组合 `conn.exited` 原子位 + `Process.Signal(syscall.Signal(0))`
     1. `conn.exited`——reaper goroutine 在 `cmd.Wait()` 返回时置 true；Wait 同时**回收僵尸**，这是检出"已 exit 但 PID 仍占着进程表"的唯一可靠手段
     2. `Signal(0)`——处理 exit 与 reaper 回归之间的短暂竞态：`ESRCH` 视为死，其他错误（罕见 EPERM）假定活，避免瞬时 syscall 抖动误杀健康池
     - 单独看 `Signal(0)` 不够：僵尸进程的 PID 仍可接收信号，探针会误报存活；必须组合 `exited` 位
@@ -151,8 +151,6 @@ stdio + sse 双传输（2026-06）。差异封装在 `Transport` 接口（`inter
 - **stdio**: fork 子进程 + JSON-RPC over stdin/stdout，由命令白名单（`config.IsAllowedMCPCommand`）守门
 - **sse**: HTTP+SSE（`event: endpoint` 第一事件提供 POST URL，后续 `event: message` 承载 JSON-RPC 响应）。配置层仅要求 `url`；egress HTTP client 在 dial 时做 host 级安全 (CIDR ACL)
 - 配置/网关/API 三层校验都按 transport 分支：stdio 走命令白名单，sse 仅校验 url 非空
-
-### MCP 连接池
 
 ## Temporal（HITL 工作流）
 

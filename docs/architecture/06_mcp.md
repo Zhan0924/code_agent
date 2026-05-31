@@ -639,7 +639,7 @@ func connAlive(conn *ServerConnection) bool {
 
 | 传输 | `Alive()` 实现 | 抓什么 |
 |------|----------------|--------|
-| stdio (`transport_stdio.go`) | `conn.exited` 原子位 + `Signal(syscall.Signal(0))` | 两层组合：reaper 已 wait + Signal 探活；详见下方两层检测说明 |
+| stdio (`transport.go::stdioTransport`) | `conn.exited` 原子位 + `Signal(syscall.Signal(0))` | 两层组合：reaper 已 wait + Signal 探活；详见下方两层检测说明 |
 | sse (`transport_sse.go`) | `now - lastRecv < keepaliveTimeout`（默认 90s） | 90 秒内收到过任何 SSE 事件即视为存活；连接断流自动死 |
 
 stdio 的两层检测必须组合：
