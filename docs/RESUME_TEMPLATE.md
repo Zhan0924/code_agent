@@ -93,7 +93,7 @@
 - 构建**代码专用 RAG 引擎**：**AST-aware chunking**（tree-sitter 按函数/类粒度切分）+ **Qdrant 向量检索 + BM25 稀疏检索 + cross-encoder 重排序**，Top 5 检索在 100k chunks 上 p95 < 50ms；实现代码符号索引器为 agent 提供项目结构导航能力；
 - 基于 **Temporal Workflow + Signal** 实现 **Human-in-the-Loop（HITL）**：敏感操作（kubectl/DROP DB/rm -rf）触发审批流程，挂起期间 0 goroutine 占用，服务重启不丢状态，支持长时任务编排；
 - 实现 **DAG 多步规划器**作为 ReAct 的补充决策路径，支持复杂任务的分解和并行执行；
-- 完整的 **MCP（Model Context Protocol）标准集成**：JSON-RPC 2.0 双向通信，支持 stdio 传输（SSE 传输规划中），接入外部工具（GitHub/Jira/数据库）0 改码；
+- 完整的 **MCP（Model Context Protocol）标准集成**：JSON-RPC 2.0 双向通信，支持 stdio + HTTP+SSE 双传输（统一 `Transport` 抽象，pool/health/reconnect 路径完全复用），接入外部工具（GitHub/Jira/数据库）0 改码；
 - 构建 **Docker 沙箱隔离执行环境**：网络隔离（NetworkMode=none）+ 资源限制（cgroups v2）+ 多语言镜像支持，保障代码执行安全；
 - 完整的**安全与可观测性体系**：敏感内容检测 + 命令审批机制、审计日志、**27 个 Prometheus 指标** + **OTel 分布式追踪**，生产级监控覆盖。
 

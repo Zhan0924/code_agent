@@ -56,15 +56,14 @@
 package mcp
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/agent/code_agent/internal/models"
@@ -164,108 +163,52 @@ type MCPContent struct {
 //   - inflight: 当前 pending 请求数；连接池做 "least-pending" LB 的信号量
 //   - tools   : 握手时从 server 拿到的工具元数据快照
 type ServerConnection struct {
-	name     string
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   io.ReadCloser
-	scanner  *bufio.Scanner
-	reqID    atomic.Int64 // 请求 ID 原子自增器
-	inflight atomic.Int64 // 当前 pending 请求数（Pool LB）
-	// mu 只保护 pending/progress map。**不要**用它保护 stdin 写入，
+	name      string
+	transport Transport    // wire-level byte plumbing (stdio / sse / inmem)
+	reqID     atomic.Int64 // 请求 ID 原子自增器
+	inflight  atomic.Int64 // 当前 pending 请求数（Pool LB）
+	// mu 只保护 pending/progress map。**不要**用它保护 transport.Send，
 	// 否则"持锁写 IO"会与 readResponses 的锁竞争形成死锁：
-	// sender 持 mu 写 stdin → mock 端阻塞 outW → reader 想取 mu 找 pending → 阻塞。
+	// sender 持 mu 写 → mock 端阻塞 → reader 想取 mu 找 pending → 阻塞。
+	// transport.Send 实现自己负责写串行化（写锁内置在 transport 里）。
 	mu       sync.Mutex
-	writeMu  sync.Mutex                      // 独占 stdin 写串行化（io.Writer 并发不安全）
 	pending  map[int64]chan *JSONRPCResponse // id → 等待方
 	progress map[string]chan *progressNotification
 	tools    []MCPTool // 通过 tools/list 获得的工具列表
 	logger   *zap.Logger
 	readerWg sync.WaitGroup // 跟踪 readResponses goroutine 生命周期
 
-	// exited 由后台 reaper goroutine 在 cmd.Wait() 返回时设为 true。
-	// 健康检查（reconnect.go::isProcessAlive）通过它检出僵尸（exited
-	// 但还没被父进程 wait 回收的子进程）—— 这种情况下 kill(pid, 0) 仍
-	// 返回 0，单独的 Signal(0) 探针会误报"还活着"。
-	exited atomic.Bool
-
 	// testHook 让 mock server 在进程外用 io.Pipe 注入响应流而无需真正 fork 进程。
-	// 生产路径下永远为 nil；仅单元测试使用。
+	// 生产路径下永远为 false；仅单元测试使用。
 	testHook bool
 }
 
-// newServerConnection starts an MCP server process and establishes communication.
-func newServerConnection(cfg *config.MCPServerConfig, logger *zap.Logger) (*ServerConnection, error) {
-	if err := ValidateCommand(cfg.Command); err != nil {
-		return nil, fmt.Errorf("invalid MCP command: %w", err)
-	}
-	if err := ValidateArgs(cfg.Args); err != nil {
-		return nil, fmt.Errorf("invalid MCP args: %w", err)
-	}
-
-	cmd := exec.Command(cfg.Command, cfg.Args...)
-
-	// Set environment variables
-	for k, v := range cfg.Env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
-
-	stdin, err := cmd.StdinPipe()
+// newServerConnection starts an MCP server (stdio subprocess or SSE HTTP
+// stream depending on cfg.Transport) and establishes JSON-RPC plumbing.
+func newServerConnection(cfg *config.MCPServerConfig, httpClient *http.Client, logger *zap.Logger) (*ServerConnection, error) {
+	tr, err := dialTransport(context.Background(), cfg, httpClient, logger.With(zap.String("mcp_server", cfg.Name)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start MCP server %s: %w", cfg.Name, err)
+		return nil, err
 	}
 
 	conn := &ServerConnection{
-		name:     cfg.Name,
-		cmd:      cmd,
-		stdin:    stdin,
-		stdout:   stdout,
-		scanner:  bufio.NewScanner(stdout),
-		pending:  make(map[int64]chan *JSONRPCResponse),
-		progress: make(map[string]chan *progressNotification),
-		logger:   logger.With(zap.String("mcp_server", cfg.Name)),
+		name:      cfg.Name,
+		transport: tr,
+		pending:   make(map[int64]chan *JSONRPCResponse),
+		progress:  make(map[string]chan *progressNotification),
+		logger:    logger.With(zap.String("mcp_server", cfg.Name)),
 	}
-	// Set 4MB max token size to handle large JSON-RPC responses (matches test path)
-	conn.scanner.Buffer(make([]byte, 1<<14), 1<<22)
 
 	// Start response reader goroutine
 	conn.readerWg.Add(1)
 	go conn.readResponses()
 
-	// Reaper goroutine: waits for the child to exit, reaps the zombie, and
-	// flips `exited` so the health checker can detect dead processes
-	// reliably (Signal(0) alone treats zombies as alive — see reconnect.go::
-	// isProcessAlive).
-	//
-	// Per os/exec's documented contract, cmd.Wait() must NOT be called until
-	// all reads from StdoutPipe have completed — Wait closes the pipe from
-	// under any pending Read. So we block on `readerWg.Wait()` first;
-	// readResponses returns when the stdout pipe EOFs, which happens either
-	// when (a) the child exits naturally (kernel closes the write end) or
-	// (b) close() closes our read end explicitly.
-	//
-	// What cmd.Wait() does next depends on which path we came from:
-	//   - path (a): child is already gone → Wait returns quickly with the
-	//               exit status, reaping the zombie.
-	//   - path (b): child may still be running because close() closed stdout
-	//               before calling Process.Kill(). Wait blocks here until
-	//               close()'s Kill (later in close()) takes effect. That
-	//               blocking is fine — the reaper goroutine has no other
-	//               work — and once Kill lands, Wait returns and we set
-	//               exited.
-	go func() {
-		conn.readerWg.Wait()
-		_ = cmd.Wait()
-		conn.exited.Store(true)
-	}()
+	// For stdio: reaper goroutine waits for child exit and flips exited flag.
+	// Per os/exec contract, cmd.Wait() must follow all reads from StdoutPipe,
+	// so we sequence reaper-after-reader via readerWg.Wait inside startReaper.
+	if st, ok := tr.(*stdioTransport); ok {
+		st.startReaper(&conn.readerWg)
+	}
 
 	return conn, nil
 }
@@ -281,19 +224,15 @@ func newInMemoryConnection(name string, writerToClient *io.PipeWriter, readerFro
 	clientStdin io.WriteCloser, clientStdout io.ReadCloser, logger *zap.Logger) *ServerConnection {
 	_ = writerToClient
 	_ = readerFromClient
+	tr := newInMemoryTransport(name, clientStdin, clientStdout, logger.With(zap.String("mcp_server", name)))
 	conn := &ServerConnection{
-		name:     name,
-		cmd:      nil, // 测试场景无 cmd
-		stdin:    clientStdin,
-		stdout:   clientStdout,
-		scanner:  bufio.NewScanner(clientStdout),
-		pending:  make(map[int64]chan *JSONRPCResponse),
-		progress: make(map[string]chan *progressNotification),
-		logger:   logger.With(zap.String("mcp_server", name)),
-		testHook: true,
+		name:      name,
+		transport: tr,
+		pending:   make(map[int64]chan *JSONRPCResponse),
+		progress:  make(map[string]chan *progressNotification),
+		logger:    logger.With(zap.String("mcp_server", name)),
+		testHook:  true,
 	}
-	// 让 scanner 支持长帧（默认 64KB 不够写大 payload）
-	conn.scanner.Buffer(make([]byte, 1<<14), 1<<22)
 	conn.readerWg.Add(1)
 	go conn.readResponses()
 	return conn
@@ -318,8 +257,11 @@ func newInMemoryConnection(name string, writerToClient *io.PipeWriter, readerFro
 //  3. 其他通知（log/messages 等）——> 丢弃，debug 级别日志记录
 func (sc *ServerConnection) readResponses() {
 	defer sc.readerWg.Done()
-	for sc.scanner.Scan() {
-		line := sc.scanner.Bytes()
+	for {
+		line, ok := sc.transport.Recv()
+		if !ok {
+			break
+		}
 		if len(line) == 0 {
 			continue
 		}
@@ -376,9 +318,9 @@ func (sc *ServerConnection) readResponses() {
 		sc.logger.Debug("unhandled mcp notification", zap.String("method", resp.Method))
 	}
 
-	// Check for scanner errors after loop exits
-	if err := sc.scanner.Err(); err != nil {
-		sc.logger.Error("MCP scanner error", zap.Error(err))
+	// Check for transport errors after loop exits
+	if err := sc.transport.Err(); err != nil {
+		sc.logger.Error("MCP transport read error", zap.Error(err))
 		// Notify all pending requests with error
 		sc.mu.Lock()
 		for id, ch := range sc.pending {
@@ -464,10 +406,8 @@ func (sc *ServerConnection) sendRequest(ctx context.Context, method string, para
 	sc.pending[id] = respCh
 	sc.mu.Unlock()
 
-	// (3) 写 stdin；用独立的 writeMu 串行化（避免持 pending 锁进行 IO 导致死锁）。
-	sc.writeMu.Lock()
-	_, err = fmt.Fprintf(sc.stdin, "%s\n", data)
-	sc.writeMu.Unlock()
+	// (3) 写传输层；transport.Send 内部已 serialize 写操作。
+	err = sc.transport.Send(data)
 
 	if err != nil {
 		// 失败时主动清理 pending 防泄漏
@@ -494,22 +434,12 @@ func (sc *ServerConnection) sendRequest(ctx context.Context, method string, para
 	}
 }
 
-// close shuts down the MCP server process.
-//
-// 对 testHook=true 的 in-memory 连接，cmd 为 nil，只需关闭 stdin/stdout pipes，
-// readResponses goroutine 会因 scanner.Scan 返回 false 自然退出。
+// close shuts down the underlying transport (stdio subprocess / SSE stream /
+// in-memory pipe). The reader goroutine returns when the transport EOFs.
 func (sc *ServerConnection) close() error {
-	if sc.stdin != nil {
-		_ = sc.stdin.Close()
-	}
-	if sc.stdout != nil {
-		_ = sc.stdout.Close()
-	}
+	err := sc.transport.Close()
 	sc.readerWg.Wait()
-	if sc.cmd != nil && sc.cmd.Process != nil {
-		return sc.cmd.Process.Kill()
-	}
-	return nil
+	return err
 }
 
 // ─── Gateway (Registry + Client) ─────────────────────────────────────────────
@@ -528,8 +458,26 @@ type Gateway struct {
 	serverConfigs map[string]*config.MCPServerConfig // (F8) stored for reconnection
 	toolIndex     map[string]string                  // toolName -> serverName for O(1) lookup
 	httpClient    *http.Client
+	healthCheck   *healthChecker
 	mu            sync.RWMutex
 	logger        *zap.Logger
+}
+
+// StartHealthCheck launches the periodic health checker. Idempotent: calling
+// it twice replaces the previous checker. interval <= 0 disables the checker
+// (a no-op).
+func (gw *Gateway) StartHealthCheck(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	gw.mu.Lock()
+	if gw.healthCheck != nil {
+		gw.healthCheck.Stop()
+	}
+	hc := newHealthChecker(gw, gw.logger)
+	gw.healthCheck = hc
+	gw.mu.Unlock()
+	hc.Start(interval)
 }
 
 // NewGateway creates a new MCP gateway and connects to configured servers.
@@ -544,15 +492,10 @@ func NewGateway(cfg *config.MCPConfig, httpClient *http.Client, logger *zap.Logg
 
 	for i := range cfg.Servers {
 		serverCfg := &cfg.Servers[i]
-		if serverCfg.Transport != "stdio" {
-			gw.logger.Warn("unsupported MCP transport, skipping",
-				zap.String("server", serverCfg.Name),
-				zap.String("transport", serverCfg.Transport),
-			)
-			continue
-		}
+		// dialTransport 内部按 cfg.Transport 分派 stdio / sse；
+		// 未识别的传输由 dialTransport 报错，这里不必再做白名单。
 
-		pool := NewConnPool(serverCfg, gw.logger)
+		pool := NewConnPool(serverCfg, gw.httpClient, gw.logger)
 		if err := pool.Start(context.Background(), gw.initializeServer); err != nil {
 			gw.logger.Error("failed to start MCP server pool",
 				zap.String("server", serverCfg.Name),
@@ -585,7 +528,7 @@ func newSingletonPool(cfg *config.MCPServerConfig, conn *ServerConnection, logge
 	if cfg == nil {
 		cfg = &config.MCPServerConfig{Name: "test", PoolSize: 1}
 	}
-	p := NewConnPool(cfg, logger)
+	p := NewConnPool(cfg, nil, logger)
 	p.conns[0].Store(conn)
 	p.tools = conn.tools
 	return p
@@ -691,12 +634,26 @@ type ServerStatus struct {
 
 // AddServer connects a new MCP server at runtime. The server's tools become
 // immediately available to the LLM on the next ReAct step.
+//
+// Validation is transport-aware: stdio configs go through the command/args
+// whitelist (defense against shell injection via runtime-provided args);
+// SSE configs require a URL but skip the command checks — host-level
+// safety is the egress ACL's job at dial time.
 func (gw *Gateway) AddServer(cfg *config.MCPServerConfig) (*ServerStatus, error) {
-	if err := ValidateCommand(cfg.Command); err != nil {
-		return nil, fmt.Errorf("invalid MCP server command: %w", err)
-	}
-	if err := ValidateArgs(cfg.Args); err != nil {
-		return nil, fmt.Errorf("invalid MCP server args: %w", err)
+	switch cfg.Transport {
+	case "sse":
+		if cfg.URL == "" {
+			return nil, fmt.Errorf("invalid MCP server: sse transport requires a URL")
+		}
+	case "", "stdio":
+		if err := ValidateCommand(cfg.Command); err != nil {
+			return nil, fmt.Errorf("invalid MCP server command: %w", err)
+		}
+		if err := ValidateArgs(cfg.Args); err != nil {
+			return nil, fmt.Errorf("invalid MCP server args: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("invalid MCP server: unsupported transport %q", cfg.Transport)
 	}
 
 	gw.mu.Lock()
@@ -707,7 +664,7 @@ func (gw *Gateway) AddServer(cfg *config.MCPServerConfig) (*ServerStatus, error)
 		return nil, fmt.Errorf("MCP server '%s' already exists", cfg.Name)
 	}
 
-	pool := NewConnPool(cfg, gw.logger)
+	pool := NewConnPool(cfg, gw.httpClient, gw.logger)
 	if err := pool.Start(context.Background(), gw.initializeServer); err != nil {
 		return nil, fmt.Errorf("failed to start MCP server %s: %w", cfg.Name, err)
 	}
@@ -787,8 +744,15 @@ func (gw *Gateway) ListServers() []ServerStatus {
 // Close shuts down all MCP server connections.
 func (gw *Gateway) Close() error {
 	gw.mu.Lock()
-	defer gw.mu.Unlock()
+	hc := gw.healthCheck
+	gw.healthCheck = nil
+	gw.mu.Unlock()
+	if hc != nil {
+		hc.Stop()
+	}
 
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
 	for name, pool := range gw.servers {
 		if err := pool.Close(); err != nil {
 			gw.logger.Warn("failed to close MCP server pool", zap.String("server", name), zap.Error(err))

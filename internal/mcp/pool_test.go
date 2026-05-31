@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -237,12 +238,12 @@ func toJSON(v any) string {
 func newMockDialer(logger *zap.Logger,
 	onToolCall func(m *mockServer, callID int64, name string, args map[string]any, token string),
 	failSlots map[int]bool,
-) (func(cfg *config.MCPServerConfig, logger *zap.Logger) (*ServerConnection, error), *mockRegistry) {
+) (func(cfg *config.MCPServerConfig, httpClient *http.Client, logger *zap.Logger) (*ServerConnection, error), *mockRegistry) {
 
 	reg := &mockRegistry{}
 	var idx atomic.Int32
 
-	return func(cfg *config.MCPServerConfig, logger *zap.Logger) (*ServerConnection, error) {
+	return func(cfg *config.MCPServerConfig, _ *http.Client, logger *zap.Logger) (*ServerConnection, error) {
 		slot := int(idx.Add(1) - 1)
 		m := newMockServer(fmt.Sprintf("%s#%d", cfg.Name, slot), logger)
 		if failSlots[slot] {
@@ -298,7 +299,7 @@ func newPoolWithMocks(t *testing.T, name string, size int,
 		PoolSize:  size,
 	}
 	dialer, reg := newMockDialer(logger, onToolCall, failSlots)
-	pool := NewConnPool(cfg, logger)
+	pool := NewConnPool(cfg, nil, logger)
 	pool.dialer = dialer
 
 	// 握手函数用 Gateway.initializeServer 的同构实现
@@ -360,7 +361,7 @@ func TestPool_StartPartialFailureUnderMinAlive(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 	cfg := &config.MCPServerConfig{Name: "bad", Transport: "stdio", PoolSize: 4}
 	dialer, reg := newMockDialer(logger, nil, map[int]bool{0: true, 1: true, 2: true}) // 0/1/2 fail
-	pool := NewConnPool(cfg, logger)
+	pool := NewConnPool(cfg, nil, logger)
 	pool.dialer = dialer
 	defer func() {
 		_ = pool.Close()

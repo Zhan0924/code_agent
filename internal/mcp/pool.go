@@ -45,6 +45,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -88,11 +89,12 @@ type ToolChunk struct {
 // 并发安全：conns 在 Start 之后写入即不再增删（除 replace slot），所有读走
 // atomic load；Pick 本身是 O(N) 扫描 + atomic 比较，N 一般 ≤ 8 无性能问题。
 type ConnPool struct {
-	name     string
-	cfg      *config.MCPServerConfig
-	logger   *zap.Logger
-	size     int
-	minAlive int
+	name       string
+	cfg        *config.MCPServerConfig
+	httpClient *http.Client
+	logger     *zap.Logger
+	size       int
+	minAlive   int
 
 	// conns 是 atomic slot：每个元素是 *ServerConnection，某 slot 掉线时
 	// replaceLoop 会把它置 nil → 背景 reconnect → CompareAndSwap 回来。
@@ -110,14 +112,21 @@ type ConnPool struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	// dialer 在测试场景下被替换为 in-memory 注入
-	dialer func(cfg *config.MCPServerConfig, logger *zap.Logger) (*ServerConnection, error)
+	dialer func(cfg *config.MCPServerConfig, httpClient *http.Client, logger *zap.Logger) (*ServerConnection, error)
 }
 
 // NewConnPool 构造一个未启动的连接池。size<=0 时视为 1（退化为单连接）。
 // minAlive 默认为 max(1, size/2)，即允许一半进程初始化失败但仍可用。
-func NewConnPool(cfg *config.MCPServerConfig, logger *zap.Logger) *ConnPool {
+// httpClient 仅供 SSE 传输使用；stdio 传输可传 nil。
+func NewConnPool(cfg *config.MCPServerConfig, httpClient *http.Client, logger *zap.Logger) *ConnPool {
 	size := cfg.PoolSize
 	if size <= 0 {
+		size = 1
+	}
+	// SSE pool_size > 1 没有意义（HTTP 复用即可），强制 1。
+	if cfg.Transport == "sse" && size > 1 {
+		logger.Info("SSE transport forces pool_size=1 (HTTP multiplexing supplants subprocess pool)",
+			zap.String("server", cfg.Name), zap.Int("requested", size))
 		size = 1
 	}
 	minAlive := size / 2
@@ -125,13 +134,14 @@ func NewConnPool(cfg *config.MCPServerConfig, logger *zap.Logger) *ConnPool {
 		minAlive = 1
 	}
 	p := &ConnPool{
-		name:     cfg.Name,
-		cfg:      cfg,
-		logger:   logger.With(zap.String("mcp_pool", cfg.Name), zap.Int("size", size)),
-		size:     size,
-		minAlive: minAlive,
-		conns:    make([]atomic.Pointer[ServerConnection], size),
-		dialer:   newServerConnection, // 生产默认：fork 真进程
+		name:       cfg.Name,
+		cfg:        cfg,
+		httpClient: httpClient,
+		logger:     logger.With(zap.String("mcp_pool", cfg.Name), zap.Int("size", size)),
+		size:       size,
+		minAlive:   minAlive,
+		conns:      make([]atomic.Pointer[ServerConnection], size),
+		dialer:     newServerConnection, // 生产默认：fork 真进程 / 开 SSE 流
 	}
 	return p
 }
@@ -179,7 +189,7 @@ func (p *ConnPool) Start(ctx context.Context, handshake func(ctx context.Context
 // dialOne 新建一条连接并完成握手。独立抽出是为了给 replaceLoop 复用。
 func (p *ConnPool) dialOne(ctx context.Context, slot int,
 	handshake func(ctx context.Context, conn *ServerConnection) error) (*ServerConnection, error) {
-	conn, err := p.dialer(p.cfg, p.logger.With(zap.Int("slot", slot)))
+	conn, err := p.dialer(p.cfg, p.httpClient, p.logger.With(zap.Int("slot", slot)))
 	if err != nil {
 		return nil, err
 	}

@@ -17,12 +17,20 @@ import (
 
 // handleAddMCPServer adds a new MCP server at runtime.
 // POST /api/v1/mcp/servers
+//
+// Request shape depends on transport:
+//   - stdio: {name, transport: "stdio", command, args?, env?}
+//   - sse:   {name, transport: "sse",   url}
+//
+// Command is intentionally NOT bound as required at the JSON layer because
+// SSE configs don't carry one. Transport-specific validation runs below.
 func (s *Server) handleAddMCPServer(c *gin.Context) {
 	var req struct {
 		Name      string            `json:"name" binding:"required"`
 		Transport string            `json:"transport" binding:"required"`
-		Command   string            `json:"command" binding:"required"`
+		Command   string            `json:"command"`
 		Args      []string          `json:"args"`
+		URL       string            `json:"url"`
 		Env       map[string]string `json:"env"`
 	}
 
@@ -31,14 +39,31 @@ func (s *Server) handleAddMCPServer(c *gin.Context) {
 		return
 	}
 
-	// Validate command against whitelist to prevent command injection
-	cmd := filepath.Base(req.Command)
-	if !config.IsAllowedMCPCommand(cmd) {
-		s.logger.Warn("MCP server command rejected",
-			zap.String("command", req.Command),
-			zap.String("ip", c.ClientIP()),
-		)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "command not allowed: " + cmd})
+	switch req.Transport {
+	case "sse":
+		if req.URL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "sse transport requires url"})
+			return
+		}
+	case "", "stdio":
+		if req.Command == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "stdio transport requires command"})
+			return
+		}
+		// Whitelist guard — defence in depth against command-injection via
+		// the runtime CRUD path. mcp.Gateway.AddServer re-validates, but
+		// rejecting here gives a clearer 400 and skips a pool allocation.
+		cmd := filepath.Base(req.Command)
+		if !config.IsAllowedMCPCommand(cmd) {
+			s.logger.Warn("MCP server command rejected",
+				zap.String("command", req.Command),
+				zap.String("ip", c.ClientIP()),
+			)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "command not allowed: " + cmd})
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported transport: " + req.Transport})
 		return
 	}
 
@@ -52,6 +77,7 @@ func (s *Server) handleAddMCPServer(c *gin.Context) {
 		Transport: req.Transport,
 		Command:   req.Command,
 		Args:      req.Args,
+		URL:       req.URL,
 		Env:       req.Env,
 	}
 

@@ -89,14 +89,12 @@ func TestGateway_ConnectServer_StdioTransport(t *testing.T) {
 	}
 }
 
+// SSE was unsupported pre-2026-06; this case now only covers truly-unknown
+// transports (e.g. grpc). SSE itself is covered by transport_sse_test.go and
+// the AddServer transport-aware validation path.
 func TestGateway_ConnectServer_UnsupportedTransport(t *testing.T) {
 	cfg := &config.MCPConfig{
 		Servers: []config.MCPServerConfig{
-			{
-				Name:      "sse-server",
-				Transport: "sse",
-				URL:       "http://localhost:9999/mcp",
-			},
 			{
 				Name:      "grpc-server",
 				Transport: "grpc",

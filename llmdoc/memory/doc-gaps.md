@@ -12,7 +12,6 @@
 
 | 组件 | 位置 | 状态 | 包级文档 |
 |------|------|------|----------|
-| MCP SSE 传输 | `internal/mcp/client.go` | `doc.go` 提及 SSE 支持，`NewGateway` 仍仅处理 stdio 传输 | `docs/architecture/06_mcp.md` |
 | `chatApi.stream()` | 前端 `code_agent_ui/src/api/client.ts`（兄弟仓库，行号略） | 前端定义 `/chat/stream` 调用但 `ChatPage.tsx` 直接 fetch `/chat/react-stream` | （前端，无包级文档） |
 | `internal/audit` / `internal/errors` | 整包孤儿 | 零生产 importer（构建可过但无调用点） | `docs/architecture/19_observability.md` |
 | `internal/pool` | 单一 importer | 仅 `session/manager.go` 使用 | `docs/architecture/19_observability.md` |
@@ -27,6 +26,8 @@
 | `LLMSummarizer` | `cmd/agent/main.go:194` `sessionMgr.Summarizer = session.NewLLMSummarizer(...)` |
 | `ConnPool` ↔ `Gateway` | `internal/mcp/...`（按 working-agreement.md:80 描述已切换为 `map[string]*ConnPool`） |
 | `RedisRateLimiter` | `internal/api/router.go:190` `auth.NewRedisRateLimiter(...)` |
+| MCP `healthChecker` 自启动 | `cmd/agent/main.go` MCP 初始化块尾 `mcpGateway.StartHealthCheck(30*time.Second)`；池级 slot 死亡 → reconnect 兜底 |
+| MCP SSE transport | `internal/mcp/transport_sse.go` + `dialTransport(cfg, ...)` 分派；`NewGateway` 不再白名单 stdio，由 `dialTransport` 直接报错未识别 transport |
 
 ## 功能缺口 — 前端
 

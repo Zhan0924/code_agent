@@ -131,22 +131,28 @@ resolveRuntime → ensureImage → 解析内存/CPU限制 → ContainerCreate
 
 `healthChecker` (`internal/mcp/reconnect.go`)：
 
-- `isProcessAlive(conn)` 两层判定：
-  1. `conn.exited` 原子位——由 reaper goroutine 在 `cmd.Wait()` 返回时置 true；Wait 同时**回收僵尸**，这是检出"已 exit 但 PID 仍占着进程表"的唯一可靠手段
-  2. `Process.Signal(syscall.Signal(0))`——处理 exit 与 reaper 回归之间的短暂竞态：`ESRCH` 视为死，其他错误（罕见 EPERM）假定活，避免瞬时 syscall 抖动误杀健康池
-- 单独看 `Signal(0)` 不够：僵尸进程的 PID 仍可接收信号（`kill(pid, 0) == 0`），探针会误报存活；必须组合 `exited` 位
-- **reaper goroutine 的生命周期约束**：`os/exec` 文档要求 `cmd.Wait()` 不得在 StdoutPipe 还在被读取时调用——Wait 会关闭 pipe 把 reader 抽空。因此 reaper 不是 `Start` 后立刻 Wait，而是先 `readerWg.Wait()`：等 `readResponses` 因 stdout EOF（子进程退出或 `close()` 关读端）自然结束，再调 Wait
-  - 路径 (a) 子进程已退出：Wait 快速返回 reap 僵尸
-  - 路径 (b) `close()` 触发：`stdout.Close()` 让 reader 提前 EOF，子进程此刻可能还活着；reaper 的 Wait 会阻塞，**直到 `close()` 后续的 `Process.Kill()` 把子进程干掉**才返回。reaper 无其他工作，阻塞无害
-- `processAlive(pool)` 逐 slot 调 `isProcessAlive`；遇到死进程 CAS 清空 slot（避免 Pick 派发到死连接）。pool 实现尚无自动 replaceLoop，所以这步必须显式做
+- `connAlive(conn)` 委托 `conn.transport.Alive()`，两套传输各自实现存活语义：
+  - **stdio** (`transport_stdio.go`): 两层组合 `conn.exited` 原子位 + `Process.Signal(syscall.Signal(0))`
+    1. `conn.exited`——reaper goroutine 在 `cmd.Wait()` 返回时置 true；Wait 同时**回收僵尸**，这是检出"已 exit 但 PID 仍占着进程表"的唯一可靠手段
+    2. `Signal(0)`——处理 exit 与 reaper 回归之间的短暂竞态：`ESRCH` 视为死，其他错误（罕见 EPERM）假定活，避免瞬时 syscall 抖动误杀健康池
+    - 单独看 `Signal(0)` 不够：僵尸进程的 PID 仍可接收信号，探针会误报存活；必须组合 `exited` 位
+    - **reaper 生命周期约束**：`os/exec` 文档要求 `cmd.Wait()` 不得在 StdoutPipe 还在被读取时调用。reaper 先 `readerWg.Wait()`，等 `readResponses` 因 stdout EOF 自然结束后再 Wait
+  - **sse** (`transport_sse.go`): `now - lastRecv < keepaliveTimeout`（默认 90s）。任何 SSE 事件（含 endpoint/message）都会刷新 lastRecv；连接断流则下次检查死
+- `processAlive(pool)` 逐 slot 调 `connAlive`；遇到死连接 CAS 清空 slot（避免 Pick 派发到死连接）。pool 实现尚无自动 replaceLoop，所以这步必须显式做
 - `ConnPool.Alive()` 只查 slot 指针非空；**健康检查必须用 `processAlive`，不能只看 `Alive()`**
-- 整池零活进程时触发 `reconnectServer`：关闭旧池 → 新建并 Start
+- 整池零活时触发 `reconnectServer`：关闭旧池 → 新建并 Start
 - 指数退避：Initial=1s, Max=30s, MaxRetries=5
-- `healthChecker.Start` 仍未在 `main.go` 调用，自愈循环并未运转——`reconnectServer` 当前只在外部主动调用时执行
+- **已接线**（2026-06）：`cmd/agent/main.go` MCP 初始化尾部调 `mcpGateway.StartHealthCheck(30 * time.Second)`，自愈循环以 30s tick 运转
 
-### 传输限制
+### 传输
 
-当前仅实现 stdio 传输。SSE 传输在 `NewGateway` 中标记为 "unsupported, skipping"。
+stdio + sse 双传输（2026-06）。差异封装在 `Transport` 接口（`internal/mcp/transport.go`）下，pool/health/reconnect 路径完全复用：
+
+- **stdio**: fork 子进程 + JSON-RPC over stdin/stdout，由命令白名单（`config.IsAllowedMCPCommand`）守门
+- **sse**: HTTP+SSE（`event: endpoint` 第一事件提供 POST URL，后续 `event: message` 承载 JSON-RPC 响应）。配置层仅要求 `url`；egress HTTP client 在 dial 时做 host 级安全 (CIDR ACL)
+- 配置/网关/API 三层校验都按 transport 分支：stdio 走命令白名单，sse 仅校验 url 非空
+
+### MCP 连接池
 
 ## Temporal（HITL 工作流）
 

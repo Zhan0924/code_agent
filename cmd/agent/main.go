@@ -329,11 +329,21 @@ func main() {
 	}
 
 	// ─── Initialize MCP Gateway ──────────────────────────────────────────
-	mcpGateway, err := mcp.NewGateway(&cfg.MCP, egressHTTPClient, logger)
+	// SSE transports require an *http.Client; when egress enforcement is
+	// disabled, egressHTTPClient is nil and SSE configs would fail to dial.
+	// Fall back to the default client so MCP-over-SSE works regardless of
+	// the security toggle — egress-on still uses the wrapped client which
+	// enforces the ACL.
+	mcpHTTPClient := egressHTTPClient
+	if mcpHTTPClient == nil {
+		mcpHTTPClient = http.DefaultClient
+	}
+	mcpGateway, err := mcp.NewGateway(&cfg.MCP, mcpHTTPClient, logger)
 	if err != nil {
 		logger.Warn("MCP gateway initialization failed", zap.Error(err))
 	} else {
 		defer mcpGateway.Close()
+		mcpGateway.StartHealthCheck(30 * time.Second)
 		logger.Info("MCP gateway initialized",
 			zap.Int("servers", len(cfg.MCP.Servers)),
 		)

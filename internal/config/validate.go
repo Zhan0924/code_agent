@@ -196,20 +196,29 @@ func IsAllowedMCPCommand(cmd string) bool {
 	return allowedMCPCommands[cmd]
 }
 
-// validateMCPServers checks that all MCP server commands pass security validation.
+// validateMCPServers checks each MCP server config; rules differ per
+// transport. stdio requires a whitelisted command + sanitized args; sse
+// requires only a URL (the egress ACL handles host-level safety at
+// dial time).
 func (c *Config) validateMCPServers() error {
 	for i, srv := range c.MCP.Servers {
-		if srv.Command == "" {
-			return fmt.Errorf("mcp.servers[%d].command is empty", i)
-		}
-
-		// Use the same validation logic as runtime AddServer
-		if err := validateMCPCommand(srv.Command); err != nil {
-			return fmt.Errorf("mcp.servers[%d]: %w", i, err)
-		}
-
-		if err := validateMCPArgs(srv.Args); err != nil {
-			return fmt.Errorf("mcp.servers[%d]: %w", i, err)
+		switch srv.Transport {
+		case "sse":
+			if srv.URL == "" {
+				return fmt.Errorf("mcp.servers[%d].url is empty (required for sse)", i)
+			}
+		case "", "stdio":
+			if srv.Command == "" {
+				return fmt.Errorf("mcp.servers[%d].command is empty", i)
+			}
+			if err := validateMCPCommand(srv.Command); err != nil {
+				return fmt.Errorf("mcp.servers[%d]: %w", i, err)
+			}
+			if err := validateMCPArgs(srv.Args); err != nil {
+				return fmt.Errorf("mcp.servers[%d]: %w", i, err)
+			}
+		default:
+			return fmt.Errorf("mcp.servers[%d]: unsupported transport %q (allowed: stdio, sse)", i, srv.Transport)
 		}
 	}
 	return nil

@@ -35,10 +35,10 @@ orchestrator 那一层把 MCP 工具与内置工具、Skill 三种来源**同构
 | `validation.go` 白名单   | `validation.go`     | ✅ 已接线          | `Gateway.AddServer` 调 `ValidateCommand` + `ValidateArgs` |
 | 进度通知订阅 (chunked)   | `client.go` `subscribeProgress` | ⚠️ 只在 `pool.CallToolStream` 用 | Gateway.CallTool 走非流式路径 |
 | `ConnPool`（多进程池）    | `pool.go`           | ✅ **已接线**（2026-06）| `Gateway.servers map[string]*ConnPool`；`PoolSize<=1` 退化为单连接 |
-| `healthChecker`（自愈）  | `reconnect.go`      | ❌ **未启动**      | `newHealthChecker` 存在但 main.go 仍未 `Start`；崩了不会自动重启（但 ConnPool 内自带 slot 清理） |
-| SSE / HTTP transport    | —                   | ❌ **未实现**      | `NewGateway` 显式 `if cfg.Transport != "stdio" { skip }` |
+| `healthChecker`（自愈）  | `reconnect.go`      | ✅ **已接线**（2026-06）| `cmd/agent/main.go` MCP 初始化尾调 `mcpGateway.StartHealthCheck(30*time.Second)`；30s tick → `processAlive` → 0 存活则触发整池重连（指数退避，最多 5 次） |
+| SSE / HTTP transport    | `transport_sse.go`  | ✅ **已接线**（2026-06）| `dialTransport(cfg.Transport=="sse")` → `newSSETransport`：GET 拉流 + `event: endpoint` 取 POST URL + JSON-RPC 响应走 SSE 推回；`Alive()` 用 90s 无流量阈值触发 reconnect |
 
-下文会同时讲清"已接线的核心通路"与"待接线的健康检查/SSE 设计"，避免把蓝图当成现状。
+下文按"已接线的核心通路 + 关键失败模式"展开，所有未实现项都明确标 §12 后续演进。
 
 ---
 
@@ -50,19 +50,21 @@ orchestrator 那一层把 MCP 工具与内置工具、Skill 三种来源**同构
 
 **协议层 JSON-RPC 2.0 本身仅 800 行可控**：自研换来熔断点、池化、进度订阅这些生产能力的接入自由。代价是要跟 spec 演进（如 `2024-11-05` → `2025-03-26`），目前固定 `2024-11-05`（`client.go:553`）。
 
-### Q2 — stdio vs SSE：当前只支持哪个？
+### Q2 — stdio vs SSE：两种 transport 如何分派？
 
-MCP spec 定义两种 transport：stdio（本地子进程，UNIX pipe）和 SSE（远程服务，HTTP）。**当前实现只接 stdio**：`NewGateway` (`client.go:506-514`) 显式跳过非 stdio 配置并打 Warn 日志。
+MCP spec 定义两种 transport：stdio（本地子进程，UNIX pipe）和 SSE（远程服务，HTTP）。**两种均已实现**：`dialTransport` (`transport.go`) 根据 `cfg.Transport` 直接分派——`stdio`/空 → `newStdioTransport`（fork 子进程 + StdinPipe/StdoutPipe），`sse` → `newSSETransport`（GET 拉流 + endpoint 事件取 POST URL）。`Transport` 接口仅 5 个方法（`Send`/`Recv`/`Err`/`Alive`/`Close`），`ServerConnection` 对两侧完全透明。
 
-| 维度       | stdio                              | SSE（**未实现**）               |
-|------------|------------------------------------|--------------------------------|
-| 部署       | 本地子进程（`npx`/`uvx`/`python`） | 独立 HTTP 服务                  |
-| 延迟       | μs 级（pipe）                       | ms 级（网络）                    |
-| 隔离       | 进程级（崩溃不影响 agent）          | 网络级（更强但要做 mTLS）        |
-| 调试       | `stdin`/`stdout` 可 tail            | 需要 HTTP debug 工具             |
-| 适配场景   | 本地工具（filesystem-mcp、github） | 远程托管 MCP（GitHub hosted）    |
+| 维度       | stdio                              | SSE                              |
+|------------|------------------------------------|----------------------------------|
+| 部署       | 本地子进程（`npx`/`uvx`/`python`） | 独立 HTTP 服务                    |
+| 延迟       | μs 级（pipe）                       | ms 级（网络）                      |
+| 隔离       | 进程级（崩溃不影响 agent）          | 网络级（HTTP client 强制 egress ACL）|
+| 调试       | `stdin`/`stdout` 可 tail            | 需要 HTTP debug 工具               |
+| 适配场景   | 本地工具（filesystem-mcp、github） | 远程托管 MCP（GitHub hosted、内网 MCP）|
+| 健康检查   | `Signal(0)` + reaper 标志           | `lastRecv` 90s keepalive 超时       |
+| 连接池     | `pool_size>1` 多子进程并行          | 强制 `pool_size=1`（HTTP 复用即可）|
 
-为什么选 stdio 先做：本地工具是高频场景（filesystem / git / shell），SSE 主要是远程 hosted MCP（覆盖面窄）。SSE 列在 §12 后续演进。
+SSE 实现要点：① 协议第一帧必须是 `event: endpoint`，data 携带 POST URL（`Send` 阻塞等 `postURLReady`）；② JSON-RPC 响应**不**在 POST 的 HTTP body 里——服务端从 SSE 推回；③ HTTP client 由 `Gateway` 注入（继承 egress ACL）；④ 90s 无事件即认为流死，`healthChecker` 触发整池 reconnect。
 
 ### Q3 — 为什么独立 `writeMu` 而非和 `mu` 共用？
 
@@ -223,15 +225,18 @@ conn.sendRequest(ctx, "tools/call", {name, arguments:argsMap}):
 ### 流 C：运行时 CRUD（REST API → Gateway）
 
 ```text
-POST /api/v1/mcp/servers {name, command, args, env}
+POST /api/v1/mcp/servers {name, transport, command?, args?, env?, url?}
    │
    ▼
 Gateway.AddServer(cfg):
-   ① ValidateCommand(cfg.Command) → reject if not whitelisted
-   ② ValidateArgs(cfg.Args)       → reject --eval / -c / ...
-   ③ mu.Lock
-   ④ if servers[cfg.Name] exist  → return err "already exists"
-   ⑤ newServerConnection(cfg) + initializeServer(ctx, conn)
+   ① switch cfg.Transport:
+        case "sse":         require cfg.URL != ""
+        case "", "stdio":   ValidateCommand(cfg.Command) + ValidateArgs(cfg.Args)
+        default:            return "unsupported transport"
+   ② mu.Lock
+   ③ if servers[cfg.Name] exist  → return err "already exists"
+   ④ dialTransport(cfg, httpClient) → stdio fork / sse open stream
+   ⑤ newServerConnection(transport) + initializeServer(ctx, conn)
        (失败立刻 conn.close + return err)
    ⑥ servers[name]=conn; serverConfigs[name]=cfg
    ⑦ for t in conn.tools: toolIndex[t.Name]=name        ← 即时生效
@@ -595,9 +600,9 @@ return best
 | `Gateway.AddServer/RemoveServer/Close` 用 pool 生命周期 | ✅ 已切换 |
 | 测试用 `newSingletonPool` 把 mock 连接包成 1-slot pool | ✅ 已提供 |
 | **`replaceLoop` 自动 respawn**：slot 挂掉后自动 fork | ❌ **未实现**——pool.go 注释提及（`pool.go:98`），但代码无对应 goroutine |
-| 健康检查 `checkAll` → `processAlive` 兜底 | ✅ 用 `Signal(syscall.Signal(0))` 探 slot 进程；死进程 CAS 清空 slot；零活时整池 `reconnectServer`。详见 §8.2 |
+| 健康检查 `checkAll` → `processAlive` 兜底 | ✅ 通过 `transport.Alive()` 探各 slot；死链 CAS 清空 slot；零活时整池 `reconnectServer`。详见 §8.2 |
 
-**关键缺口**：`replaceLoop` 仍未实现，所以"slot 挂了下一个 slot 顶上"这一段在文档里有、代码里没。当前的兜底是 `healthChecker`（但 main.go 尚未启动它）+ 整池 reconnect。生产部署若依赖单 slot 自愈，需先把 `healthChecker.Start` 接入 main.go。
+**关键缺口**：`replaceLoop` 仍未实现，所以"slot 挂了下一个 slot 顶上"这一段在文档里有、代码里没。当前的兜底是 `healthChecker`（2026-06 已在 `main.go` 启动 30s tick）+ 整池 reconnect。单 slot 死亡仅靠下次 tick 清理（最坏 30s 内被 Pick 命中会暴露错误）。
 
 P0 加固详见 §12。
 
@@ -605,7 +610,7 @@ P0 加固详见 §12。
 
 ## 8. `healthChecker` —— 自愈引擎（`reconnect.go`）
 
-> ⚠️ **现状**：自愈逻辑已就位且为池化版本（2026-06 重写），但 `main.go` 仍未调 `hc.Start(...)`，所以"周期检查"并未运转——只有人工调 `gw.reconnectServer` 或 `checkAll` 时才会触发。整池零活时单次 `CallTool` 仍能从 ConnPool 内的剩余 slot 服务（前提是至少有一个活 slot）。
+> ✅ **现状**（2026-06）：自愈完整接线——`cmd/agent/main.go` MCP 初始化尾部调 `mcpGateway.StartHealthCheck(30*time.Second)`，开启 30s 周期检查。`processAlive` 不再绑死 `Signal(0)`，而是委托 `transport.Alive()`：stdio 用"reaper 标志 + Signal(0)"，SSE 用"90s 内有事件"——两类传输统一走 `connAlive` 路径。零活 slot → 指数退避 5 次整池重建。
 
 ### 8.1 配置（`reconnect.go:23-27`）
 
@@ -619,25 +624,25 @@ var defaultReconnectConfig = reconnectConfig{
 
 退避序列：1s → 2s → 4s → 8s → 16s → 30s（cap）。5 次失败后 `Error` 日志放弃，等待人工或下个 tick。
 
-### 8.2 `processAlive` —— 进程级而非协议级（`reconnect.go`）
+### 8.2 `connAlive` —— 传输级抽象（`reconnect.go`）
 
 ```go
-func isProcessAlive(conn *ServerConnection) bool {
-    if conn == nil || conn.cmd == nil || conn.cmd.Process == nil {
+func connAlive(conn *ServerConnection) bool {
+    if conn == nil || conn.transport == nil {
         return false
     }
-    if conn.exited.Load() {          // ① reaper 已 wait 回来
-        return false
-    }
-    err := conn.cmd.Process.Signal(syscall.Signal(0))
-    if err == nil {
-        return true                  // ② 进程仍在
-    }
-    return !errors.Is(err, syscall.ESRCH)
+    return conn.transport.Alive()
 }
 ```
 
-**两层检测必须组合**：
+健康判定委托给 `Transport.Alive()`，由具体传输实现两套语义（见 `transport.go`）：
+
+| 传输 | `Alive()` 实现 | 抓什么 |
+|------|----------------|--------|
+| stdio (`transport_stdio.go`) | `conn.exited` 原子位 + `Signal(syscall.Signal(0))` | 两层组合：reaper 已 wait + Signal 探活；详见下方两层检测说明 |
+| sse (`transport_sse.go`) | `now - lastRecv < keepaliveTimeout`（默认 90s） | 90 秒内收到过任何 SSE 事件即视为存活；连接断流自动死 |
+
+stdio 的两层检测必须组合：
 
 | 层 | 抓什么 | 漏什么 |
 |----|--------|--------|
@@ -671,7 +676,7 @@ go func() {
 | 误判 | 进程活着但 hung 检测不到 | 真实可用性更准 |
 | 实现 | ~20 行（含 reaper） | 要在 `ping` 加超时 + 处理无 `ping` 的旧 server |
 
-**池层增强**（2026-06）：`processAlive(pool)` 在发现死 slot 后会 CAS 把 slot 清空——这样 `pool.Pick()` 不会再把请求派给死连接。仅当整池零活时才升级到 `reconnectServer`（重建整池）。`ConnPool.Alive()` 只查指针非空，**不能**用作健康判定。
+**池层增强**（2026-06）：`processAlive(pool)` 用 `connAlive` 探各 slot，在发现死 slot 后会 CAS 把 slot 清空——这样 `pool.Pick()` 不会再把请求派给死连接。仅当整池零活时才升级到 `reconnectServer`（重建整池）。`ConnPool.Alive()` 只查指针非空，**不能**用作健康判定。stdio 与 sse 走同一套池/健康/重连路径，差异完全封装在 `Transport` 接口下。
 
 ### 8.3 重连流程（`reconnect.go`）
 
@@ -781,8 +786,10 @@ orchestrator                Gateway                ServerConnection             
 | 抉择 | 动机 |
 |------|------|
 | 自研 JSON-RPC 而非用官方 SDK | SDK pre-1.0 且缺生产能力；协议层 800 行可控 |
-| 当前只支持 stdio | 本地工具占绝对比例，SSE 留给 §12 |
-| 两把锁 (`mu` / `writeMu`) | pending 注册与 stdin 写入解耦，前者 lock-free 等响应 |
+| stdio + SSE 两套 transport 接口化 | 5 方法接口（`Send`/`Recv`/`Err`/`Alive`/`Close`）把"子进程 vs 远程 HTTP"差异收敛在 transport 层；`ServerConnection` 上层完全不感知 |
+| `Transport.Alive()` 自带语义 | stdio 用 `Signal(0)+exited`，SSE 用 90s 无事件；`healthChecker.processAlive` 统一调用 `conn.transport.Alive()` 而非自己 instanceof |
+| SSE 强制 `pool_size=1` | HTTP 客户端层已能复用 keep-alive；多进程订阅同一 SSE 会重复 session token |
+| 两把锁 (`mu` / `writeMu`) | pending 注册与 stdin 写入解耦，前者 lock-free 等响应；transport 层内部各自维护 writeMu，client.go 不再持有 |
 | pending 注册 BEFORE 写 stdin | 防止响应早到无 chan 接的永久卡死 |
 | reader 单 goroutine | stdout 字节流只能单消费者按行扫描 |
 | reader 退出时 broadcast -32603 | 所有等响应的调用者立刻拿到错误，不卡 select |
@@ -790,7 +797,6 @@ orchestrator                Gateway                ServerConnection             
 | `toolIndex` 预建 map | O(1) `FindServerForTool`，避免每次 ReAct step 扫所有 conn |
 | `inflight atomic.Int64` 而非 chan-based 度量 | Pick 热路径要 lock-free 读取 |
 | Validation 用关键字白名单而非沙箱 | npx/uvx 拉网包的信任假设依赖发布者；命令白名单是粗筛 |
-| `healthChecker` 用 `Signal(0)` 而非协议级 ping | tick 周期 ≥ 30s 时进程级足够；协议级 ping 是未来增项 |
 | `reconnectServer` 先 unlock 再握手 | 握手 IO 期间不阻塞其他 RPC |
 | 工具命名空间无前缀 | 设计偷懒；§12 演进项 |
 | CRUD API 不持久化 | 配置层 + 启动时读 config 已够用；持久化等 §16 store |
@@ -802,9 +808,10 @@ orchestrator                Gateway                ServerConnection             
 
 ### P0（生产前必须）
 
-- [ ] **接线 `healthChecker`**：`main.go` 起 `hc.Start(30s)` + 加 `cfg.MCP.HealthCheck.{Enabled,Interval}` 配置；崩溃 stdio server 自动 respawn（注：当前 `processAlive` 已能清理死 slot，但仍需触发整池 reconnect）
+- [x] ~~**接线 `healthChecker`**~~ 已完成（2026-06）：`cmd/agent/main.go` 调 `mcpGateway.StartHealthCheck(30*time.Second)`；`processAlive` 用 `transport.Alive()` 统一探活，零活 slot 触发整池退避重连
 - [x] ~~**接线 `ConnPool`**~~ 已完成（2026-06）：`Gateway.servers map[string]*ConnPool`；`MCPServerConfig.PoolSize` (`pool_size: 4`) 起多子进程；仍待补 `replaceLoop` 单 slot 自愈
-- [ ] **实现 `replaceLoop`**：pool slot 死亡后后台 respawn + CompareAndSwap 回来（当前注释里画了大饼，代码没做）
+- [x] ~~**SSE transport**~~ 已完成（2026-06）：`transport_sse.go` 实现 endpoint→message 流；`dialTransport(cfg)` 按 `cfg.Transport` 分派；与 stdio 透明共存；6 项单元测试覆盖 endpoint/relative path/Send-before-ready/Alive keepalive/Close 幂等/多行 data 合并
+- [ ] **实现 `replaceLoop`**：pool slot 死亡后后台 respawn + CompareAndSwap 回来（当前 healthChecker 整池重连兜底，但单 slot 自愈仍未做）
 - [ ] **工具命名空间前缀**：自动 `<serverName>/<toolName>` 化（或可关闭），解决同名冲突；LLM prompt 同步带前缀
 - [ ] **`scanner.Buffer` 大小可配**：默认 4MB 偶尔不够（一次 search 几十 MB 的 grep result），加 `cfg.MCP.ScannerBufferMB`
 - [ ] **MCP server 跑在 sandbox**：`docker` 已在 `AllowedMCPCommands` 白名单，但当前 stdio 子进程默认继承 agent 的全部权限；用 docker run + `--network=none` 包一层
@@ -812,7 +819,6 @@ orchestrator                Gateway                ServerConnection             
 ### P1（运维质量）
 
 - [ ] **per-server metric**：`mcp_call_duration_seconds{server,tool}` / `mcp_active_connections{server}` / `mcp_reconnect_total{server}`
-- [ ] **SSE transport**：实现 `Transport=="sse"` 分支，对接 GitHub hosted MCP / 远程内网 MCP
 - [ ] **进度通知接入 orchestrator**：`Gateway.CallToolStream` 公开版本，让 SSE 流式输出走到前端
 - [ ] **`notifications/tools/list_changed` 监听**：server 自报工具变化时刷新 toolIndex（不用等下个健康检查）
 - [ ] **per-server circuit breaker**：单 server 连续 5 次失败暂停 30s，不拖累全局
