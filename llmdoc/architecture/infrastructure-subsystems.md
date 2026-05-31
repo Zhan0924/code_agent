@@ -132,8 +132,8 @@ resolveRuntime → ensureImage → 解析内存/CPU限制 → ContainerCreate
 `healthChecker` (`internal/mcp/reconnect.go`)：
 
 - `connAlive(conn)` 委托 `conn.transport.Alive()`，两套传输各自实现存活语义：
-  - **stdio** (`transport.go::stdioTransport`): 两层组合 `conn.exited` 原子位 + `Process.Signal(syscall.Signal(0))`
-    1. `conn.exited`——reaper goroutine 在 `cmd.Wait()` 返回时置 true；Wait 同时**回收僵尸**，这是检出"已 exit 但 PID 仍占着进程表"的唯一可靠手段
+  - **stdio** (`transport.go::stdioTransport`): 两层组合 `stdioTransport.exited` 原子位 + `Process.Signal(syscall.Signal(0))`
+    1. `stdioTransport.exited`——reaper goroutine 在 `cmd.Wait()` 返回时置 true；Wait 同时**回收僵尸**，这是检出"已 exit 但 PID 仍占着进程表"的唯一可靠手段
     2. `Signal(0)`——处理 exit 与 reaper 回归之间的短暂竞态：`ESRCH` 视为死，其他错误（罕见 EPERM）假定活，避免瞬时 syscall 抖动误杀健康池
     - 单独看 `Signal(0)` 不够：僵尸进程的 PID 仍可接收信号，探针会误报存活；必须组合 `exited` 位
     - **reaper 生命周期约束**：`os/exec` 文档要求 `cmd.Wait()` 不得在 StdoutPipe 还在被读取时调用。reaper 先 `readerWg.Wait()`，等 `readResponses` 因 stdout EOF 自然结束后再 Wait

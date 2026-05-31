@@ -639,14 +639,14 @@ func connAlive(conn *ServerConnection) bool {
 
 | 传输 | `Alive()` 实现 | 抓什么 |
 |------|----------------|--------|
-| stdio (`transport.go::stdioTransport`) | `conn.exited` 原子位 + `Signal(syscall.Signal(0))` | 两层组合：reaper 已 wait + Signal 探活；详见下方两层检测说明 |
+| stdio (`transport.go::stdioTransport`) | `stdioTransport.exited` 原子位 + `Signal(syscall.Signal(0))` | 两层组合：reaper 已 wait + Signal 探活；详见下方两层检测说明 |
 | sse (`transport_sse.go`) | `now - lastRecv < keepaliveTimeout`（默认 90s） | 90 秒内收到过任何 SSE 事件即视为存活；连接断流自动死 |
 
 stdio 的两层检测必须组合：
 
 | 层 | 抓什么 | 漏什么 |
 |----|--------|--------|
-| `conn.exited` (reaper goroutine) | 已 exit + 已 reap 的进程 | exit 与 Wait 返回之间的短暂窗口 |
+| `stdioTransport.exited` (reaper goroutine) | 已 exit + 已 reap 的进程 | exit 与 Wait 返回之间的短暂窗口 |
 | `Signal(syscall.Signal(0))` | exit 后 PID 已被回收的进程（`ESRCH`） | **僵尸**（已 exit 未 reap）——PID 仍在表里，`Signal(0)` 返 0，会误报存活 |
 
 `newServerConnection` 启动后即 spawn 一个 reaper goroutine——但**不能**直接调 `cmd.Wait()`。`os/exec` 文档规定：`Wait` 会关闭由 `StdoutPipe()` 返回的 pipe；如果 `readResponses` 还在那条 pipe 上 `Scan`，Wait 就会把 pipe 从读端脚下抽走。因此 reaper 先 `readerWg.Wait()`，等 `readResponses` 自然 EOF 后再 `cmd.Wait()`：
@@ -655,7 +655,7 @@ stdio 的两层检测必须组合：
 go func() {
     conn.readerWg.Wait()   // 等 stdout reader drain
     _ = cmd.Wait()          // 见下方对两条路径的说明
-    conn.exited.Store(true)
+    stdioTransport.exited.Store(true)
 }()
 ```
 

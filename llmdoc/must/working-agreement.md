@@ -84,9 +84,9 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 | `SpeculativeToolCache` | ✅ 已接 | Orchestrator 在 `NewOrchestrator` 构造并 `SetMetadataLookup` 给注册表 |
 | `RedisRateLimiter` | ✅ 已接 | `api/router.go:190-191` |
 
-**仍然死的**：（暂无）
+**仍然死的**（本表只列"曾在此处声明但已修复"的项；其它跨子系统死代码以 `llmdoc/memory/doc-gaps.md` 为准）：
 
-> ✅ MCP SSE 传输（2026-06）：`internal/mcp/transport_sse.go` 已实现 HTTP+SSE 传输，`dialTransport` 按 `cfg.Transport` 分发；`NewGateway` 不再 skip SSE 配置。详见 `llmdoc/architecture/infrastructure-subsystems.md::传输`。
+> ✅ MCP SSE 传输（2026-06）：`internal/mcp/transport_sse.go` 已实现 HTTP+SSE 传输，`dialTransport` 按 `cfg.Transport` 分发；`NewGateway` 不再 skip SSE 配置。详见 `llmdoc/architecture/infrastructure-subsystems.md::传输`。其它未接线项（如 `internal/audit`、`internal/pool` 单一 importer 等）见 `llmdoc/memory/doc-gaps.md::死代码`。
 
 ## 双重 Token 估算器
 
