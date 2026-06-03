@@ -353,7 +353,7 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 ⚠️ **旧 doc 在改进建议里列 "P1: `safePath` 缺少 symlink 防护"——这是错误**：
 - 代码 L333 明确调用 `filepath.EvalSymlinks(absPath)`
 - 代码 L338 在父目录 EvalSymlinks fallback 路径也做了 symlink 解析
-- 代码 L299 用 `HasPrefix(realPath, ws.RootDir+sep)` 边界检查（`ws.RootDir` 本身就是 EvalSymlinks 之后的真实路径，见 §1.5 Q2）
+- 代码 L347 用 `HasPrefix(realPath, ws.RootDir+sep)` 边界检查（`ws.RootDir` 本身就是 EvalSymlinks 之后的真实路径，见 §1.5 Q2）
 
 **实际状态**：symlink 防护已完整实现。如果有遗留怀疑，跑 `manager_test.go` 看 `TestSafePath_SymlinkAttack` 系列即可验证。
 
