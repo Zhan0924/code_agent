@@ -419,11 +419,11 @@ manifest 是 JSON，向后兼容：
 | `ReadFile(ws, relPath)` | L188 | safePath + os.ReadFile |
 | `ListFiles(ws)` | L201 | Walk 收集相对路径（不过滤 hidden / `.workspace.json`） |
 | `MkdirAll(ws, relPath)` | L227 | 逐段 lstat（已存在祖先做 EvalSymlinks 校验仍在 RootDir 内）+ os.MkdirAll(0o755)。**不再走 safePath**，2026-06-03 起 |
-| `Archive(ws, w io.Writer)` | L227 | tar+gzip 流式写；header.Name = `<project>/<rel>` |
-| `Cleanup(id)` | L263 | workspaces.Delete + os.RemoveAll —— **不写 manifest 删除日志** |
-| `ListWorkspaces()` | L307 | Range → []*Workspace |
-| `ListDir(ws, relPath)` | L317 | safePath + os.ReadDir + 给目录加 `/` 后缀 |
-| `TreeString(ws)` | L346 | Walk + 缩进字符串（用于 prompt 注入） |
+| `Archive(ws, w io.Writer)` | L275 | tar+gzip 流式写；header.Name = `<project>/<rel>` |
+| `Cleanup(id)` | L311 | workspaces.Delete + os.RemoveAll —— **不写 manifest 删除日志** |
+| `ListWorkspaces()` | L355 | Range → []*Workspace |
+| `ListDir(ws, relPath)` | L365 | safePath + os.ReadDir + 给目录加 `/` 后缀 |
+| `TreeString(ws)` | L394 | Walk + 缩进字符串（用于 prompt 注入） |
 
 ⚠️ **`Cleanup` 不删除 manifest**：实际上 `os.RemoveAll(ws.RootDir)` 把整个目录连同 `.workspace.json` 一起删了，所以 manifest 跟着没了。代码注释没明说这点，但语义是对的。
 
