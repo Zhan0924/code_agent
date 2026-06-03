@@ -340,8 +340,8 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 | 嵌套新目录 | path=`internal/shortcode`（两层都不存在） | MkdirAll 走逐段 lstat：existing 段做 EvalSymlinks 边界校验，missing 段交给 os.MkdirAll | accept |
 | symlink 父级 | `ln -s /etc ws/foo` 已存在，path=`foo/bar` | MkdirAll 第一段 lstat `foo` 是 symlink → EvalSymlinks → realCurr=/etc，HasPrefix(RootDir) 失败 | **reject** |
 
-**WriteFile 的 nested 限制**：WriteFile L164 显式 `os.MkdirAll(Dir(absPath), 0o755)` 在 safePath 之后预创建，但 `safePath` 自己拿到的 `absPath` 是 `Join(ws.RootDir, cleaned)`（**未 EvalSymlinks**），所以 `Dir(absPath)` 是 `ws.RootDir/a/b` 这种逻辑路径——MkdirAll 之后再 WriteFile 时父目录已存在，EvalSymlinks 成功。
-但 `safePath` 单独被调时（如 ListDir 一个不存在的子目录），可能在父目录链不完整时报错——见 ListDir L322-329 的 fallback 处理。
+**WriteFile 的 nested 限制**：WriteFile 的实际顺序是 `safePath` **先**跑（L159），然后才是 `os.MkdirAll(Dir(absPath))`（L164）—— 也就是说 nested-and-missing parents 在 `safePath` 阶段就会 reject（父目录与祖父都不存在时，L2 fallback 的 `EvalSymlinks(parentDir)` 会失败）。换句话说 **WriteFile 不会自动递归创建多层 missing parents**，调用方必须先 `MkdirAll` 把父链建出来，再 WriteFile。
+`safePath` 单独被调时（如 ListDir 一个不存在的子目录），同样可能在父目录链不完整时报错——见 ListDir L322-329 的 fallback 处理。
 
 **MkdirAll 的 symlink 防御**（2026-06-03 引入）：`MkdirAll` 早期版本直接走 `safePath`，对 `internal/shortcode` 这种 missing-ancestor 直接 reject；后来去掉 safePath 改成"path 字符串校验 + `os.MkdirAll`"——但这样如果 `internal/` 是已存在的 symlink 指向 `/etc`，`os.MkdirAll` 会跟随 symlink 在 `/etc/shortcode` 创建。所以现在的实现是：
 1. 字符串层防 `..` 与 RootDir prefix
@@ -418,8 +418,7 @@ manifest 是 JSON，向后兼容：
 | `DeleteFile(ws, relPath)` | L175 | safePath + os.Remove（IsNotExist 不报错） |
 | `ReadFile(ws, relPath)` | L188 | safePath + os.ReadFile |
 | `ListFiles(ws)` | L201 | Walk 收集相对路径（不过滤 hidden / `.workspace.json`） |
-| `MkdirAll(ws, relPath)` | L218 | 逐段 lstat（已存在祖先做 EvalSymlinks 校验仍在 RootDir 内）+ os.MkdirAll(0o755)。**不再走 safePath**，2026-06-03 起 |
-
+| `MkdirAll(ws, relPath)` | L217 | 逐段 lstat（已存在祖先做 EvalSymlinks 校验仍在 RootDir 内）+ os.MkdirAll(0o755)。**不再走 safePath**，2026-06-03 起 |
 | `Archive(ws, w io.Writer)` | L227 | tar+gzip 流式写；header.Name = `<project>/<rel>` |
 | `Cleanup(id)` | L263 | workspaces.Delete + os.RemoveAll —— **不写 manifest 删除日志** |
 | `ListWorkspaces()` | L307 | Range → []*Workspace |

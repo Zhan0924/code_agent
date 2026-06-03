@@ -677,9 +677,9 @@ if !skipHITL(ctx) {
 
 | 工具                     | RiskLevel | 备注 |
 | ------------------------ | --------- | ---- |
-| `read_file` / `search_code` / `list_files` | 0 | safe，缓存 idempotent |
+| `read_file` / `search_code` / `list_files` / `run_tests` | 0 | safe，缓存 idempotent；`run_tests` 在 Docker sandbox 里执行（隔离），故标 0 |
 | `write_file` / `patch_file` / `edit_file` / `apply_diff` | 1 | 工作区已隔离 |
-| `run_workspace_cmd` / `run_tests`         | 2 | 任意命令，触发审批 |
+| `run_workspace_cmd`                       | 2 | 宿主 shell 任意命令，触发审批 |
 | `git_commit` / `git_push`                 | 2 | git 历史改写 / 远端推送，触发审批 |
 
 ---
