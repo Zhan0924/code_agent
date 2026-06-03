@@ -109,6 +109,12 @@ type Orchestrator struct {
 	approvalMu sync.RWMutex
 	approvalCh map[string]chan models.ApprovalResponse
 
+	// Tool-level HITL: per-task pending approval for a single high-risk tool
+	// call. Distinct from approvalCh (which suspends the whole task) — this
+	// only blocks executeTool until the user decides.
+	toolApprovalMu sync.RWMutex
+	toolApprovalCh map[string]chan models.ApprovalResponse
+
 	// [P2-E1] Interrupt: per-session interrupt signal channel
 	interruptMu sync.RWMutex
 	interruptCh map[string]chan InterruptSignal
@@ -225,6 +231,7 @@ Always use tools when they would produce better answers. After receiving tool re
 		maxContextTokens: maxTokens,
 		logger:           logger.With(zap.String("component", "orchestrator")),
 		approvalCh:       make(map[string]chan models.ApprovalResponse),
+		toolApprovalCh:   make(map[string]chan models.ApprovalResponse),
 		interruptCh:      make(map[string]chan InterruptSignal),
 		txMap:            make(map[string]*ToolTransaction),
 		intentCache:      make(map[string]intentCacheEntry),
@@ -711,14 +718,37 @@ func (o *Orchestrator) suspendForApprovalInProcess(ctx context.Context, task *mo
 	}, nil
 }
 
-// HandleApproval processes an approval/rejection for a suspended task.
+// HandleApproval processes an approval/rejection for a suspended task or a
+// blocked tool call. Tool-level pending approvals (waitToolApproval) are
+// dispatched first; falling through to task-level suspendForApproval matches
+// the pre-existing behaviour.
 func (o *Orchestrator) HandleApproval(ctx context.Context, resp models.ApprovalResponse) (*models.ChatResponse, error) {
+	// Tool-level HITL: a single tool call inside a running ReAct loop. Resolve
+	// before consulting Temporal because Temporal only tracks task-level
+	// suspends.
+	o.toolApprovalMu.RLock()
+	toolCh, hasTool := o.toolApprovalCh[resp.TaskID]
+	o.toolApprovalMu.RUnlock()
+	if hasTool {
+		select {
+		case toolCh <- resp:
+		default:
+			return nil, fmt.Errorf("tool approval already submitted for task: %s", resp.TaskID)
+		}
+		state := models.TaskStateExecuting
+		msg := "Tool approved. Continuing execution…"
+		if !resp.Approved {
+			msg = "Tool rejected. Agent will pick an alternative approach."
+		}
+		return &models.ChatResponse{TaskID: resp.TaskID, Message: msg, State: state}, nil
+	}
+
 	// Temporal path: when available, signal the workflow directly
 	if o.temporalClient != nil {
 		return o.HandleApprovalTemporal(ctx, resp)
 	}
 
-	// In-process fallback
+	// In-process fallback (task-level suspend)
 	o.approvalMu.RLock()
 	ch, ok := o.approvalCh[resp.TaskID]
 	o.approvalMu.RUnlock()
@@ -1366,17 +1396,45 @@ func (o *Orchestrator) retrieveRAGContext(ctx context.Context, query string) str
 func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*models.ToolResult, error) {
 	start := time.Now()
 
-	// [P5] Tool-level HITL: check RiskLevel before execution
+	// [P5] Tool-level HITL: high-risk tools pause for human approval via SSE
+	// → /tasks/:id/approve. Without task+sink in ctx (multiagent / planner
+	// callers) we fall back to the legacy "block with error" behaviour so the
+	// safety check still trips.
 	if !skipHITL(ctx) {
 		if def, ok := o.getToolRiskLevel(tc.Name); ok && def.RiskLevel >= 2 {
-			o.logger.Info("high-risk tool blocked pending approval",
-				zap.String("tool", tc.Name), zap.Int("risk_level", def.RiskLevel))
-			return &models.ToolResult{
-				ToolCallID: tc.ID,
-				Content: fmt.Sprintf("⚠️ Tool '%s' requires approval (risk_level=%d). "+
-					"This operation modifies system state. Please confirm execution.", tc.Name, def.RiskLevel),
-				IsError: true,
-			}, nil
+			task := taskFromCtx(ctx)
+			sink := sinkFromCtx(ctx)
+			if task != nil && sink != nil {
+				approved, err := o.waitToolApproval(ctx, task, tc, def, sink)
+				if err != nil {
+					o.logger.Warn("tool approval failed",
+						zap.String("tool", tc.Name),
+						zap.Int("risk_level", def.RiskLevel),
+						zap.Error(err))
+					return &models.ToolResult{
+						ToolCallID: tc.ID,
+						Content:    fmt.Sprintf("⚠️ Tool '%s' approval failed: %v", tc.Name, err),
+						IsError:    true,
+					}, nil
+				}
+				if !approved {
+					return &models.ToolResult{
+						ToolCallID: tc.ID,
+						Content:    fmt.Sprintf("❌ Tool '%s' rejected by user. Choose a different approach.", tc.Name),
+						IsError:    true,
+					}, nil
+				}
+				// fall through and execute normally
+			} else {
+				o.logger.Info("high-risk tool blocked pending approval (no task/sink in ctx)",
+					zap.String("tool", tc.Name), zap.Int("risk_level", def.RiskLevel))
+				return &models.ToolResult{
+					ToolCallID: tc.ID,
+					Content: fmt.Sprintf("⚠️ Tool '%s' requires approval (risk_level=%d). "+
+						"This operation modifies system state. Please confirm execution.", tc.Name, def.RiskLevel),
+					IsError: true,
+				}, nil
+			}
 		}
 	}
 

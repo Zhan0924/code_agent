@@ -489,19 +489,29 @@ POST /api/v1/tools  {name, parameters, executor_type, executor_config, risk_leve
 
 ---
 
-## 8. RiskLevel 与 HITL 拦截
+## 8. RiskLevel 与工具级 HITL
 
-`ToolDefinition.RiskLevel` 字段是 P5 设计——`executeTool` 入口检查（`orchestrator.go:1364-1375`）：
+`ToolDefinition.RiskLevel` 字段是 P5 设计——`executeTool` 入口检查（`orchestrator.go:1369` 起）：
 
 | RiskLevel | 含义                          | 示例工具                                     |
 |-----------|------------------------------|---------------------------------------------|
 | 0         | safe（只读 / 沙箱）           | `read_file` / `search_code` / `execute_code`（沙箱里） |
-| 1         | moderate（写文件 / git 修改） | `write_file` / `edit_file` / `git_commit`   |
-| 2         | high（外部副作用）             | `git_push` / 部分 MCP / 用户标记的 Dynamic 工具 |
+| 1         | moderate（写工作区文件 / 修改既有文件） | `write_file` / `patch_file` / `edit_file` / `apply_diff` |
+| 2         | high（外部副作用 / 任意命令） | `run_workspace_cmd` / `git_commit` / `git_push` / `create_directory`（OS 级）|
 
-`RiskLevel >= 2` 时 `executeTool` 直接返回 `IsError: true` + 提示需要审批，不实际执行。**当前实现是简单拦截**而非走 Temporal 审批 workflow——还是 P1 演进项（[11_temporal.md](11_temporal.md)）。
+`RiskLevel >= 2` 时 `executeTool` 调用 `waitToolApproval`（`tool_approval.go`）：
 
-`ctxKeySkipHITL` 上下文键可以绕过该拦截（如自动化测试场景）；生产路径不要主动塞这个 key。
+1. 在 SSE 流里发 `approval_request` 事件（携带 `tool_name` / `tool_call_id` / args 摘要 / `risk_level` 标签）
+2. 创建 `toolApprovalCh[task.ID]` 通道，阻塞 `executeTool` 最多 5 分钟
+3. 前端 ChatPage 渲染 Approval 模态框，用户点同意/拒绝 → `POST /api/v1/tasks/:id/approve`
+4. `HandleApproval` 先看 `toolApprovalCh` 再回退到任务级 `approvalCh`，命中后把 `ApprovalResponse` 投递到通道
+5. `executeTool` 解除阻塞：批准 → fallthrough 正常执行；拒绝 → 返回 `❌ Tool '…' rejected by user`；超时 → 返回 `approval timed out`
+
+> ⚠ **fail-safe 兜底**：multiagent / planner 等其他 `executeTool` caller 没有把 `task` + `sink` 注入 ctx，此时仍走旧的"直接返回错误"路径，避免在没有审批通道时悄悄放过高风险工具。
+
+`ctxKeySkipHITL` 上下文键可以绕过该 gate（自动化测试 / Temporal activity 回调）；生产路径不要主动塞这个 key。
+
+`write_file` 历史上是 RiskLevel=2，2026-06-03 起降为 1：写动作发生在 `/tmp/agent-workspaces/<id>` 隔离目录中，与 `patch_file` 同档。
 
 ---
 
@@ -546,7 +556,7 @@ if toolCache.shouldInvalidate(tc.Name) { toolCache.Invalidate(scope) }
 | dispatch 三级顺序 MCP > Registry > Skill | MCP 可 shadow 内置（运行时灵活性）；Skill 兜底（最不常用） |
 | Dynamic webhook 用 http.DefaultClient | MVP 简单，但走不到 egress validator——已识别 P0 |
 | Inline 执行器留占位未实现 | 等 sandbox 接口稳定后再接；UI 已有相关入口但灰色 |
-| HITL 用简单拦截而非 Temporal workflow | P5 简化版，生产前接 Temporal 审批 |
+| 工具级 HITL 走进程内 channel + SSE，不走 Temporal | Temporal workflow 是任务级单位；工具级粒度过细且需阻塞当前 `executeTool`，进程内 channel 更直接。durable HITL 仍由任务级 `suspendForApproval` 提供 |
 | 没有 per-tool 限流 / ACL | 留给上层（auth / rate-limit middleware） |
 
 ---
@@ -557,7 +567,7 @@ if toolCache.shouldInvalidate(tc.Name) { toolCache.Invalidate(scope) }
 
 - [ ] **全局 sorted 工具列表**：`orchestrator.GetAvailableTools` 把三个 source 合并后**统一**按 Name 排序，提升 LLM prompt cache 命中
 - [ ] **Dynamic webhook 走 egress validator**：当前 `http.DefaultClient` 可访问任意 URL（含内网）；改用项目里的 `egressHTTPClient`（已在 `main.go` 注入到 MCP，但 Dynamic 没用）
-- [ ] **`RiskLevel >= 2` 走 Temporal 审批**：当前简单拦截 + 返回错误；接到 [11_temporal.md](11_temporal.md) 的 approval workflow 才是真 HITL
+- [x] ~~**`RiskLevel >= 2` 走 Temporal 审批**~~：2026-06-03 已接通 `waitToolApproval` + 前端 Approval 模态框（进程内 channel）。如需 durable HITL，再把 channel 改成 Temporal signal——尚未做
 - [ ] **`Unregister` 批量化**：MCP server 下线时要清掉它注册的所有 tool（如果将来真把 MCP 接进 Registry），加 `UnregisterByPrefix` / `UnregisterBySource`
 
 ### P1（运维质量）

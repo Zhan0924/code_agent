@@ -195,7 +195,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 				"required": ["path", "content"]
 			}`),
 			Source:           "builtin",
-			RiskLevel:        2, // High risk: modifies files
+			RiskLevel:        1, // Moderate risk: writes inside the isolated workspace, mirrors patch_file
 			IsFileWrite:      true,
 			TriggersAutoTest: true,
 			InvalidatesCache: true,

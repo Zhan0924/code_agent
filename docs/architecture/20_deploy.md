@@ -126,7 +126,7 @@ AllInOne 的进程模型其实是**伪 supervisor** —— 它启动 6 个后台
 
 | 服务 | 容器名 | 默认端口（host:container） | 镜像（带 CN mirror） |
 |---|---|---|---|
-| code-agent | `code-agent` | `8080:8080` (HTTP), `8081:8081` (WS/SSE) | 本地构建 |
+| code-agent | `code-agent` | `18080:8080` (HTTP), `18081:8081` (WS/SSE) | 本地构建 |
 | Redis | `agent-redis` | `6379:6379` | `docker.m.daocloud.io/library/redis:7-alpine` |
 | Postgres | `agent-postgres` | `5432:5432` | `docker.m.daocloud.io/pgvector/pgvector:pg16` |
 | Qdrant | `agent-qdrant` | `6333:6333` (HTTP), `6334:6334` (gRPC) | `docker.m.daocloud.io/qdrant/qdrant:v1.12.4` |
@@ -719,9 +719,9 @@ CN 网络环境下：
 ```bash
 make docker-up                              # 启动栈
 sleep 30                                    # 等待 healthy
-curl -f http://localhost:8080/healthz       # 进程活
-curl -f http://localhost:8080/readyz        # 依赖就绪
-curl -X POST http://localhost:8080/api/v1/chat ... # 业务可用
+curl -f http://localhost:18080/healthz      # 进程活
+curl -f http://localhost:18080/readyz       # 依赖就绪
+curl -X POST http://localhost:18080/api/v1/chat ... # 业务可用
 make docker-down                            # 清理
 ```
 
@@ -756,8 +756,8 @@ make docker-build           # 构建 agent 镜像
 make docker-up              # 启动 7 服务
 
 # 3. 验证
-curl http://localhost:8080/healthz
-curl http://localhost:8080/readyz
+curl http://localhost:18080/healthz
+curl http://localhost:18080/readyz
 open http://localhost:16686  # Jaeger UI
 open http://localhost:8088   # Temporal UI
 

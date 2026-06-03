@@ -330,8 +330,14 @@ for step := 0; step < maxSteps; step++:
 ```
 executeTool(tc):
     ├─ RiskLevel >= 2 && !skipHITL(ctx)?
-    │     → 直接返回 IsError=true（不进入审批流，只是阻断）
-    │     ⚠ 真实 HITL 在更上层 sensitive check，本处仅"硬阻断"
+    │     ├─ ctx 含 task + sink（react_core 已注入）?
+    │     │     → waitToolApproval(task, tc, sink):
+    │     │         · SSE Emit approval_request 事件（含 tool_name / args / risk）
+    │     │         · toolApprovalCh[task.ID] = chan，阻塞最多 5 分钟
+    │     │         · HandleApproval 通过 /tasks/:id/approve 投递 → 唤醒
+    │     │         · approved → fallthrough；rejected → IsError；timeout → IsError
+    │     └─ 否（multiagent / planner 等 caller，ctx 无 task/sink）:
+    │           → 旧 fail-safe：直接返回 IsError=true 提示 "requires approval"
     │
     ├─ toolCache.Get(scope, name, args)?  → 命中直接返回
     │
@@ -350,41 +356,52 @@ executeTool(tc):
     └─ toolCache.shouldInvalidate? → toolCache.Invalidate(scope)
 ```
 
-### 流 4：HITL Approval 闭环
+### 流 4：HITL Approval 闭环（两条独立路径）
 
 ```
+路径 A —— 任务级（sensitive content / IntentDeploy）
+─────────────────────────────────────────────────
 sensitive check 命中
     │
     ▼
-suspendForApproval(task)
+suspendForApproval(task)               → 整个 task 暂停，HTTP 立即返回
     │
     ├─ temporalClient != nil?
-    │     → suspendForApprovalTemporal（temporal_bridge.go）
-    │     ⚠ 当前 main.go 不 wire temporal worker，路径不可达
+    │     → suspendForApprovalTemporal（temporal_bridge.go，main.go 已 wire worker）
     │
     └─ suspendForApprovalInProcess:
-         ├─ HITLPendingGauge.Inc
          ├─ approvalCh[taskID] = make(chan, 1)
-         ├─ approvalRequest := {taskID, sessionID, action, risk, details}
-         │
-         ├─ go: 等 30 分钟
-         │      select <-ch: approved → reactLoop(skipHITL ctx)
-         │      select <-ch: rejected → done
-         │      <-timeout → HITLApprovalTotal{"timeout"} ++ + 记日志
-         │
-         └─ return ChatResponse{State: Suspended, Approval: ...}
-                ↓
-            前端 SSE/WS 收到 approval_request 事件，弹窗
-                ↓
-            用户点击 → POST /api/v1/approval
-                ↓
-            HandleApproval(resp)
-                ├─ Temporal? → HandleApprovalTemporal
-                └─ in-process: approvalCh[taskID] <- resp（非阻塞）
-                       ↓ 唤醒上面 goroutine
-                ↓
-            ChatResponse{State: Executing, "approved"}
+         └─ go: 等 30 分钟
+              select <-ch: approved → reactLoop(skipHITL ctx) → 后台跑完入 session
+              select <-ch: rejected → done
+              <-timeout → HITLApprovalTotal{"timeout"} ++
+
+路径 B —— 工具级（RiskLevel >= 2，2026-06-03 引入）
+─────────────────────────────────────────────────
+ReAct 循环里 LLM 选了一个高风险工具
+    │
+    ▼
+executeTool → waitToolApproval(task, tc, sink)   → 单次 tool call 同步阻塞
+    │
+    ├─ sink.Emit(ReactStreamEvent{Type: "approval_request", task_id, tool_name, args, risk})
+    ├─ toolApprovalCh[task.ID] = make(chan, 1)
+    └─ select 等 5 分钟
+
+前端 SSE 收到 approval_request → ChatPage 渲染 Approval 模态框
+    │  （tool_approval.go + ChatPage.tsx）
+    ▼
+用户点击 → POST /api/v1/tasks/:id/approve
+    ▼
+HandleApproval(resp):
+    ├─ toolApprovalCh[taskID] 存在? → 投递 → 唤醒 waitToolApproval（路径 B）
+    ├─ Temporal? → HandleApprovalTemporal（路径 A durable）
+    └─ approvalCh[taskID] → 投递 → 唤醒 suspendForApprovalInProcess goroutine（路径 A in-process）
+    ▼
+路径 A：ChatResponse{State: Executing, "approved"} + 后台 reactLoop 续跑
+路径 B：waitToolApproval 返回，executeTool 继续走原流程（命中缓存 / dispatch）
 ```
+
+> 同一 task 同时只能有一个工具级 pending approval（ReAct 是串行的）。如果重复触发，`waitToolApproval` 返回 "another tool approval already pending" 错误。
 
 ### 流 5：中断信号
 

@@ -58,6 +58,11 @@ type reactCoreResult struct {
 func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, sink reactEventSink) reactCoreResult {
 	// Inject session ID into context for downstream use (e.g., tool feedback recording)
 	ctx = context.WithValue(ctx, ctxKeySessionID, opts.task.SessionID)
+	// Tool-level HITL plumbing: executeTool reads task + sink from ctx to
+	// decide whether to surface an approval_request event or fall back to a
+	// blocking error. Keep this scoped to the loop's ctx; downstream callers
+	// (multiagent / planner) build their own ctx and won't pick it up.
+	ctx = withToolApprovalContext(ctx, opts.task, sink)
 	messages := opts.messages
 
 	failTracker := &consecutiveFailureTracker{}

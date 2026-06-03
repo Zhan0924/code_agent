@@ -215,11 +215,59 @@ func (m *Manager) ListFiles(ws *Workspace) ([]string, error) {
 }
 
 // MkdirAll creates a directory tree inside the workspace.
+//
+// safePath()'s single EvalSymlinks pass fails on nested-and-missing inputs
+// like `internal/shortcode` when `internal/` also doesn't exist yet. We can't
+// just drop the symlink check though — a pre-existing intermediate component
+// could be a symlink pointing outside ws.RootDir, and os.MkdirAll would
+// silently follow it (CVE-class path-traversal). So: walk the cleaned path
+// segment by segment, EvalSymlinks every *existing* component, abort if it
+// leaves the workspace, stop the check at the first missing component, then
+// hand the rest to os.MkdirAll which only ever creates real directories.
 func (m *Manager) MkdirAll(ws *Workspace, relPath string) error {
-	absPath, err := m.safePath(ws, relPath)
-	if err != nil {
-		return err
+	cleaned := filepath.Clean(relPath)
+	if filepath.IsAbs(cleaned) {
+		return fmt.Errorf("absolute paths not allowed: %s", relPath)
 	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path traversal not allowed: %s", relPath)
+	}
+	absPath := filepath.Join(ws.RootDir, cleaned)
+	if !strings.HasPrefix(absPath, ws.RootDir+string(filepath.Separator)) && absPath != ws.RootDir {
+		return fmt.Errorf("path traversal not allowed: %s", relPath)
+	}
+
+	// Walk each existing ancestor and verify symlinks (if any) still resolve
+	// within ws.RootDir.
+	rootReal, err := filepath.EvalSymlinks(ws.RootDir)
+	if err != nil {
+		return fmt.Errorf("workspace root invalid: %w", err)
+	}
+	parts := strings.Split(cleaned, string(filepath.Separator))
+	curr := ws.RootDir
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		curr = filepath.Join(curr, part)
+		info, err := os.Lstat(curr)
+		if err != nil {
+			if os.IsNotExist(err) {
+				break // first missing component — remaining segments will be created by MkdirAll
+			}
+			return fmt.Errorf("stat %s: %w", curr, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			realCurr, err := filepath.EvalSymlinks(curr)
+			if err != nil {
+				return fmt.Errorf("symlink resolve %s: %w", curr, err)
+			}
+			if !strings.HasPrefix(realCurr, rootReal+string(filepath.Separator)) && realCurr != rootReal {
+				return fmt.Errorf("path traversal detected (symlink %s → %s)", curr, realCurr)
+			}
+		}
+	}
+
 	return os.MkdirAll(absPath, 0o755)
 }
 
