@@ -272,3 +272,88 @@ func TestRestore(t *testing.T) {
 		t.Errorf("content after restore = %q, want %q", content, "data")
 	}
 }
+
+// TestMkdirAll_NestedMissing exercises the canonical "agent wants to create
+// internal/shortcode but neither segment exists yet" case. Before
+// 2026-06-03 MkdirAll went through safePath, whose EvalSymlinks pass failed
+// when both ancestors were missing — agent then looped on the error.
+func TestMkdirAll_NestedMissing(t *testing.T) {
+	m := newTestManager(t)
+	ws, err := m.CreateForSession("ws-nest", "sess-nest", "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.MkdirAll(ws, "internal/shortcode/handlers"); err != nil {
+		t.Fatalf("MkdirAll nested missing: %v", err)
+	}
+	full := filepath.Join(ws.RootDir, "internal", "shortcode", "handlers")
+	info, err := os.Stat(full)
+	if err != nil {
+		t.Fatalf("Stat created dir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("expected directory, got mode %v", info.Mode())
+	}
+}
+
+// TestMkdirAll_SymlinkAncestorEscapes guards against a class of CVE: if a
+// pre-existing intermediate component is a symlink pointing outside the
+// workspace, naive os.MkdirAll would silently create the new path on the
+// symlink target. MkdirAll must reject that.
+func TestMkdirAll_SymlinkAncestorEscapes(t *testing.T) {
+	m := newTestManager(t)
+	ws, err := m.CreateForSession("ws-sym", "sess-sym", "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage a side directory the symlink will point to. Use t.TempDir so the
+	// test does not need to write outside the test root.
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inside the workspace, create a symlink whose target is outside.
+	linkPath := filepath.Join(ws.RootDir, "escape")
+	if err := os.Symlink(outside, linkPath); err != nil {
+		t.Fatalf("symlink setup: %v", err)
+	}
+
+	err = m.MkdirAll(ws, "escape/inner")
+	if err == nil {
+		// If MkdirAll succeeded, confirm whether it followed the symlink — if
+		// it did, the bug is back; if it created a real `escape/inner` next
+		// to the symlink that's a different (still wrong) story.
+		t.Fatalf("MkdirAll through symlink-ancestor should be rejected")
+	}
+	if !strings.Contains(err.Error(), "traversal") {
+		t.Errorf("error %q does not mention traversal", err.Error())
+	}
+	// Outside dir must not have gained an `inner/` child.
+	if _, statErr := os.Stat(filepath.Join(outside, "inner")); statErr == nil {
+		t.Errorf("MkdirAll leaked into outside path %s", outside)
+	}
+}
+
+// TestMkdirAll_RejectsParentTraversal sanity-checks the cleaned-path guard
+// against `..`-based escape attempts.
+func TestMkdirAll_RejectsParentTraversal(t *testing.T) {
+	m := newTestManager(t)
+	ws, err := m.CreateForSession("ws-trav", "sess-trav", "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{
+		"../escape",
+		"../../etc",
+		"a/../../escape",
+	} {
+		if err := m.MkdirAll(ws, bad); err == nil {
+			t.Errorf("MkdirAll(%q) should reject parent-escape", bad)
+		}
+	}
+}
+

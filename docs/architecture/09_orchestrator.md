@@ -634,37 +634,53 @@ suspendForApprovalTemporal:
     4. activity 内调用 orch.ProcessMessage（重入，但跳过 HITL）
 ```
 
-**接线状态**：
+**接线状态**（2026-06-03 起）：
 
 - `temporal_bridge.go` 代码完整；
-- `cmd/agent/main.go:initTemporalWorker` **被注释掉**（SDK 调用 placeholder）；
-- **结果**：当前 `temporalClient` 始终是 nil，永远走 in-process 路径。
+- `cmd/agent/main.go:723` 调 `startTemporalWorker` → `Dial` + `RegisterWorkflow(AgentTaskWorkflow)` + `RegisterActivity(activities)` + 非阻塞 `Start`；
+- **Dial 失败降级**：`temporalClient` = nil，整个 HITL 仍由 `suspendForApprovalInProcess` 兜底，HTTP 路径保留可用；
+- **结果**：默认 compose 起栈 Temporal 在线时走 durable approval；Temporal 不可用时优雅降级，行为可观察。
 
-文档若描述 Temporal HITL 在生产生效，是与现实不符。修复方式：要么 wire worker，要么删除 `temporal_bridge.go` + 把 RFC 标记为 "未实现"。
+### 6.4 Tool-level HITL（`orchestrator.go:1369` + `tool_approval.go`）
 
-### 6.4 Tool-level HITL（`orchestrator.go:1363-1374`）
+2026-06-03 起从"硬阻断"升级为真正的审批闭环。`executeTool` 检测 `RiskLevel>=2` 时：
 
 ```go
 if !skipHITL(ctx) {
     if def, ok := o.getToolRiskLevel(tc.Name); ok && def.RiskLevel >= 2 {
-        return &ToolResult{
-            Content: fmt.Sprintf("⚠️ Tool '%s' requires approval (risk_level=%d)..."),
-            IsError: true,
-        }, nil
+        task := taskFromCtx(ctx); sink := sinkFromCtx(ctx)
+        if task != nil && sink != nil {
+            approved, err := o.waitToolApproval(ctx, task, tc, def, sink)
+            // ... 批准 fallthrough；拒绝 / 超时 / err → IsError 返回
+        } else {
+            // multiagent / planner 等无 task+sink 的 caller：保留旧 fail-safe 硬阻断
+        }
     }
 }
 ```
 
-**这不是审批**，是**硬阻断**。LLM 看到 `IsError=true` 后自己决定不再调用。当前没有"工具级"的 approval channel —— 比 message-level 审批弱。
+`waitToolApproval`（`tool_approval.go`）的关键步骤：
+
+1. `sink.Emit(ReactStreamEvent{Type: "approval_request", ToolName, ToolArgs, TaskID, Metadata})` —— 前端 ChatPage 已经监听这个事件并渲染 Approval 模态框
+2. 占用 `toolApprovalCh[task.ID]`（同一 task 同时只允许一个 pending 工具，ReAct 是串行的）
+3. `select` 等 5 分钟：`<-ch` → 用户答复；`<-waitCtx.Done()` → 超时
+4. `HandleApproval(resp)` 收到 `POST /tasks/:id/approve` 时**优先**查 `toolApprovalCh`，命中则投递并立即返回；未命中再走任务级 `approvalCh` 与 Temporal
+
+**两条路径并存**：
+
+| 路径 | 触发  | 暂停粒度 | 通道                     | 持久化 |
+| ---- | ----- | -------- | ------------------------ | ------ |
+| A    | sensitive content / IntentDeploy | 整个 task | `approvalCh` / Temporal | 任务级，可重启续 |
+| B    | 工具 RiskLevel>=2 | 单次 tool call | `toolApprovalCh`（进程内） | 否，进程重启则 timeout |
 
 `RiskLevel` 字段在 `ToolDefinition` 上，由各 builtin 工具自行声明（参见 `file_tools.go` / `git_tools.go`）。当前生产配置：
 
-| 工具                     | RiskLevel |
-| ------------------------ | --------- |
-| `run_tests`              | 2         |
-| `shell_exec`             | 2         |
-| `git_push`（如启用）     | 2         |
-| 其他 read / write 工具   | 0 或 1    |
+| 工具                     | RiskLevel | 备注 |
+| ------------------------ | --------- | ---- |
+| `read_file` / `search_code` / `list_files` | 0 | safe，缓存 idempotent |
+| `write_file` / `patch_file` / `edit_file` / `apply_diff` | 1 | 工作区已隔离 |
+| `run_workspace_cmd` / `run_tests`         | 2 | 任意命令，触发审批 |
+| `git_commit` / `git_push`                 | 2 | git 历史改写 / 远端推送，触发审批 |
 
 ---
 

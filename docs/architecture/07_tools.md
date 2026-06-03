@@ -567,11 +567,12 @@ if toolCache.shouldInvalidate(tc.Name) { toolCache.Invalidate(scope) }
 
 - [ ] **全局 sorted 工具列表**：`orchestrator.GetAvailableTools` 把三个 source 合并后**统一**按 Name 排序，提升 LLM prompt cache 命中
 - [ ] **Dynamic webhook 走 egress validator**：当前 `http.DefaultClient` 可访问任意 URL（含内网）；改用项目里的 `egressHTTPClient`（已在 `main.go` 注入到 MCP，但 Dynamic 没用）
-- [x] ~~**`RiskLevel >= 2` 走 Temporal 审批**~~：2026-06-03 已接通 `waitToolApproval` + 前端 Approval 模态框（进程内 channel）。如需 durable HITL，再把 channel 改成 Temporal signal——尚未做
+- [x] ~~**工具级 HITL 接通审批闭环**~~：2026-06-03 完成 —— `executeTool` 检测 `RiskLevel >= 2` 时 `waitToolApproval` 发 SSE `approval_request` 事件、阻塞 5 分钟等 `POST /tasks/:id/approve` 注入 `toolApprovalCh`，前端 ChatPage Approval 模态框已对接
 - [ ] **`Unregister` 批量化**：MCP server 下线时要清掉它注册的所有 tool（如果将来真把 MCP 接进 Registry），加 `UnregisterByPrefix` / `UnregisterBySource`
 
 ### P1（运维质量）
 
+- [ ] **工具级 HITL 持久化**：现在 `toolApprovalCh` 是进程内 map，进程重启则 pending tool approval 必然 timeout。要 durable 需把 channel 改成 Temporal signal（仿 `suspendForApprovalTemporal` 的工作流）或 Redis stream
 - [ ] **Inline 执行器实现**：接 `sandbox.Manager.Execute`（[05_sandbox.md](05_sandbox.md)），让用户上传一段 bash / python 注册成工具
 - [ ] **TTL 回收**：`DynamicToolConfig.TTLSeconds` 字段已定义但无回收 goroutine，过期工具至今还在 Registry
 - [ ] **per-user ACL**：按 `claims.Role` 过滤可见工具——配合 [18_auth.md](18_auth.md)
