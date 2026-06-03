@@ -71,7 +71,7 @@ ws := &Workspace{RootDir: realDir, ...}
 
 为什么不直接存 `filepath.Join(baseDir, id)` 这个理论路径？
 
-因为 `safePath` 的安全检查（L299）用 `strings.HasPrefix(realPath, ws.RootDir+sep)` 判断越界：
+因为 `safePath` 的安全检查（L347）用 `strings.HasPrefix(realPath, ws.RootDir+sep)` 判断越界：
 - 如果 `ws.RootDir` 是含 symlink 的逻辑路径（如 `/tmp/agent-workspaces/ws-1`）
 - 而 `realPath` 是 EvalSymlinks 解析过的真实路径（如 `/private/tmp/agent-workspaces/ws-1/file.go`，macOS 下 `/tmp → /private/tmp`）
 - HasPrefix 就**永远不匹配**，所有正常文件都被判为越界 → 拒绝写入
@@ -103,7 +103,7 @@ Workspace 的读写模式正好命中：
 
 ### Q4 — `safePath` 为什么有 "parent dir EvalSymlinks fallback"？
 
-L286-296：
+L334-344：
 ```go
 realPath, err := filepath.EvalSymlinks(absPath)
 if err != nil {
@@ -206,7 +206,7 @@ orchestrator.handleFileWrite                           [file_tools.go:392]
 workspaceMgr.WriteFile(ws, relPath, content)           [manager.go:158]
        │
        ▼
-safePath(ws, relPath)                                  [manager.go:274]
+safePath(ws, relPath)                                  [manager.go:322]
        │
        │ 1. cleaned := filepath.Clean(relPath)
        │ 2. if IsAbs(cleaned) → reject
@@ -291,7 +291,7 @@ manifest 内容就是 `json.Marshal(ws)`，即上面 `Workspace` 结构体的字
 
 ---
 
-## 4. ★ `safePath` —— 三层路径沙箱（manager.go:274-304）
+## 4. ★ `safePath` —— 三层路径沙箱（manager.go:322-352）
 
 ### 4.1 完整算法
 
@@ -351,8 +351,8 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 ### 4.3 与旧文档的差异（**重要纠正**）
 
 ⚠️ **旧 doc 在改进建议里列 "P1: `safePath` 缺少 symlink 防护"——这是错误**：
-- 代码 L285 明确调用 `filepath.EvalSymlinks(absPath)`
-- 代码 L290 在父目录 EvalSymlinks fallback 路径也做了 symlink 解析
+- 代码 L333 明确调用 `filepath.EvalSymlinks(absPath)`
+- 代码 L338 在父目录 EvalSymlinks fallback 路径也做了 symlink 解析
 - 代码 L299 用 `HasPrefix(realPath, ws.RootDir+sep)` 边界检查（`ws.RootDir` 本身就是 EvalSymlinks 之后的真实路径，见 §1.5 Q2）
 
 **实际状态**：symlink 防护已完整实现。如果有遗留怀疑，跑 `manager_test.go` 看 `TestSafePath_SymlinkAttack` 系列即可验证。
