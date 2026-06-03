@@ -675,12 +675,13 @@ if !skipHITL(ctx) {
 
 `RiskLevel` 字段在 `ToolDefinition` 上，由各 builtin 工具自行声明（参见 `file_tools.go` / `git_tools.go`）。当前生产配置：
 
-| 工具                     | RiskLevel | 备注 |
-| ------------------------ | --------- | ---- |
-| `read_file` / `search_code` / `list_files` / `run_tests` | 0 | safe，缓存 idempotent；`run_tests` 在 Docker sandbox 里执行（隔离），故标 0 |
-| `write_file` / `patch_file` / `edit_file` / `apply_diff` | 1 | 工作区已隔离 |
-| `run_workspace_cmd`                       | 2 | 宿主 shell 任意命令，触发审批 |
-| `git_commit` / `git_push`                 | 2 | git 历史改写 / 远端推送，触发审批 |
+| 工具                     | RiskLevel | 缓存 | 备注 |
+| ------------------------ | --------- | ---- | ---- |
+| `read_file` / `search_code` / `list_files` | 0 | 可缓存（idempotent） | safe，纯只读 |
+| `run_tests`              | 0 | **不可缓存** | 在 Docker sandbox 内执行（隔离），结果与 sandbox 状态相关，每次都跑 |
+| `write_file` / `patch_file` / `edit_file` / `apply_diff` | 1 | 写入即失效 scope | 工作区已隔离 |
+| `run_workspace_cmd`      | 2 | 不缓存 | 宿主 shell 任意命令，触发审批 |
+| `git_commit` / `git_push` | 2 | 不缓存 | git 历史改写 / 远端推送，触发审批 |
 
 ---
 
