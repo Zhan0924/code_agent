@@ -431,7 +431,7 @@ manifest 是 JSON，向后兼容：
 
 ---
 
-## 7. tar.gz 归档（manager.go:227-260）
+## 7. tar.gz 归档（manager.go:275-308）
 
 ```go
 gw := gzip.NewWriter(w)

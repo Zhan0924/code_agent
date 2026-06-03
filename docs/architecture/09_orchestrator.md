@@ -680,7 +680,8 @@ if !skipHITL(ctx) {
 | `read_file` / `list_files` | 0 | 可缓存（`IsIdempotentRead=true`） | safe，纯只读 |
 | `search_code`            | 0 | **豁免缓存** | RAG 语义检索，索引重建会改变结果，`tool_metadata_test.go` 明确标注 intentional exemption |
 | `run_tests`              | 0 | **不可缓存** | 在 Docker sandbox 内执行（隔离），结果与 sandbox 状态相关，每次都跑 |
-| `git_status` / `git_diff` / `git_log` / `git_branch` | 0 | — | git 只读 / 元数据查询 |
+| `git_status` / `git_diff` / `git_log` | 0 | — | git 只读 / 元数据查询 |
+| `git_branch`             | 0 | **写入即失效 scope**（`InvalidatesCache=true`） | 创建或切换分支会改写 working tree 内容，缓存的文件读结果可能过期 |
 | `write_file` / `patch_file` / `edit_file` / `apply_diff` | 1 | 写入即失效 scope | 工作区已隔离 |
 | `run_workspace_cmd`      | 2 | 不缓存 | 宿主 shell 任意命令，触发审批 |
 | `git_commit`             | 2 | 不缓存（`InvalidatesCache=true`） | 改写本地 git 历史，触发审批 |
