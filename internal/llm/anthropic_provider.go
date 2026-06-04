@@ -407,10 +407,44 @@ func (p *anthropicProvider) convertMessages(msgs []models.Message) ([]anthropic.
 		}, messages...)
 	}
 
+	// Anthropic Messages API 强校验两件事：
+	//  1. 任何 tool_use(N) 块后必须紧跟一条含 N 个匹配 tool_result 块的 user 消息；
+	//  2. 整体严格 user/assistant 交替，不允许两条同角色消息相邻。
+	//
+	// 我们的内部 models.Message 是"一调用 / 一结果 = 一条消息"扁平结构（兼容 OpenAI
+	// 风格），ReAct 单步并行 9 个 tool_call → 9 条 RoleTool 消息 → 9 条独立 user
+	// MessageParam。DeepSeek 的 /anthropic 端点会立即报：
+	//   "tool_use ids were found without tool_result blocks immediately after"
+	// 同一步内还可能在工具结果后追加一条 RoleUser 的"continue/step-back hint"，
+	// 形成更长的连续 user 序列。
+	//
+	// 出于最小侵入，统一在序列化末尾合并所有连续同角色消息的 content blocks。
+	// 这同时保留 OpenAI 端点已知的良好行为（多余的合并对 OpenAI 端不发往该函数）。
+	messages = coalesceConsecutiveRoles(messages)
+
 	// Merge system messages
 	systemText := strings.Join(systemParts, "\n\n")
 
 	return messages, systemText
+}
+
+// coalesceConsecutiveRoles 合并相邻同角色 MessageParam 的 content blocks。
+// 见 convertMessages 末尾长注释解释为什么 Anthropic 端必须做这个合并。
+func coalesceConsecutiveRoles(in []anthropic.MessageParam) []anthropic.MessageParam {
+	if len(in) <= 1 {
+		return in
+	}
+	out := make([]anthropic.MessageParam, 0, len(in))
+	out = append(out, in[0])
+	for _, m := range in[1:] {
+		last := &out[len(out)-1]
+		if last.Role == m.Role {
+			last.Content = append(last.Content, m.Content...)
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // convertTools converts internal ToolDefinition to Anthropic ToolUnionParam format.

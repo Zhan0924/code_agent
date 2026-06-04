@@ -81,6 +81,45 @@ func TestAnthropicProvider_ConvertMessages(t *testing.T) {
 			wantSystemText: "",
 			wantFirstRole:  "user",
 		},
+		{
+			// 触发场景：ReAct 单步并行触发 9 个 tool_use，扁平 models.Message 会
+			// 产生 1 条 assistant + 9 条 RoleTool。Anthropic 严格要求 9 个 tool_result
+			// 必须打包进同一条 user 消息，否则 DeepSeek /anthropic 端会 400：
+			// "tool_use ids were found without tool_result blocks immediately after".
+			name: "parallel_tool_results_coalesce_into_single_user_message",
+			input: []models.Message{
+				{Role: models.RoleUser, Content: "List multiple files"},
+				{Role: models.RoleAssistant, Content: "", ToolCalls: []models.ToolCall{
+					{ID: "call_1", Name: "read_file", Args: json.RawMessage(`{"path":"a"}`)},
+					{ID: "call_2", Name: "read_file", Args: json.RawMessage(`{"path":"b"}`)},
+					{ID: "call_3", Name: "read_file", Args: json.RawMessage(`{"path":"c"}`)},
+				}},
+				{Role: models.RoleTool, Content: "A content", ToolCallID: "call_1"},
+				{Role: models.RoleTool, Content: "B content", ToolCallID: "call_2"},
+				{Role: models.RoleTool, Content: "C content", ToolCallID: "call_3"},
+			},
+			wantMsgCount:   3, // user + assistant(3 tool_use) + user(3 tool_result merged)
+			wantSystemText: "",
+			wantFirstRole:  "user",
+		},
+		{
+			// ReAct 步内连续 user 注入（如 step-back hint / auto-continue prompt）落到
+			// 工具结果之后，也必须与之合并以维持 user/assistant 严格交替。
+			name: "tool_results_then_user_text_all_coalesce",
+			input: []models.Message{
+				{Role: models.RoleUser, Content: "do x"},
+				{Role: models.RoleAssistant, Content: "", ToolCalls: []models.ToolCall{
+					{ID: "c1", Name: "t", Args: json.RawMessage(`{}`)},
+					{ID: "c2", Name: "t", Args: json.RawMessage(`{}`)},
+				}},
+				{Role: models.RoleTool, Content: "r1", ToolCallID: "c1"},
+				{Role: models.RoleTool, Content: "r2", ToolCallID: "c2"},
+				{Role: models.RoleUser, Content: "Continue."},
+			},
+			wantMsgCount:   3, // user / assistant / user(2 tool_result + 1 text)
+			wantSystemText: "",
+			wantFirstRole:  "user",
+		},
 	}
 
 	for _, tt := range tests {
@@ -97,6 +136,49 @@ func TestAnthropicProvider_ConvertMessages(t *testing.T) {
 			}
 		})
 	}
+
+	// 严格契约：assistant(N tool_use) → user(N tool_result) 的 ID 一一对应。
+	t.Run("tool_use_ids_match_tool_result_ids_after_coalesce", func(t *testing.T) {
+		input := []models.Message{
+			{Role: models.RoleUser, Content: "go"},
+			{Role: models.RoleAssistant, Content: "", ToolCalls: []models.ToolCall{
+				{ID: "call_01_alpha", Name: "t", Args: json.RawMessage(`{}`)},
+				{ID: "call_02_beta", Name: "t", Args: json.RawMessage(`{}`)},
+				{ID: "call_03_gamma", Name: "t", Args: json.RawMessage(`{}`)},
+			}},
+			{Role: models.RoleTool, Content: "ra", ToolCallID: "call_01_alpha"},
+			{Role: models.RoleTool, Content: "rb", ToolCallID: "call_02_beta"},
+			{Role: models.RoleTool, Content: "rc", ToolCallID: "call_03_gamma"},
+		}
+		got, _ := p.convertMessages(input)
+		if len(got) != 3 {
+			t.Fatalf("expected 3 coalesced messages, got %d", len(got))
+		}
+		assistant := got[1]
+		toolRes := got[2]
+		// assistant 第 0 个 block 是 tool_use（无 text，因为 Content==""）
+		var useIDs []string
+		for _, b := range assistant.Content {
+			if b.OfToolUse != nil {
+				useIDs = append(useIDs, b.OfToolUse.ID)
+			}
+		}
+		var resIDs []string
+		for _, b := range toolRes.Content {
+			if b.OfToolResult != nil {
+				resIDs = append(resIDs, b.OfToolResult.ToolUseID)
+			}
+		}
+		if len(useIDs) != 3 || len(resIDs) != 3 {
+			t.Fatalf("expected 3 tool_use + 3 tool_result, got %d / %d (use=%v res=%v)",
+				len(useIDs), len(resIDs), useIDs, resIDs)
+		}
+		for i, id := range useIDs {
+			if resIDs[i] != id {
+				t.Errorf("position %d: tool_use ID=%s, tool_result.tool_use_id=%s — Anthropic API will 400", i, id, resIDs[i])
+			}
+		}
+	})
 }
 
 func TestAnthropicProvider_ConvertMessages_CacheControl(t *testing.T) {
@@ -125,32 +207,31 @@ func TestAnthropicProvider_ConvertMessages_CacheControl(t *testing.T) {
 	}
 
 	messages, _ := p.convertMessages(input)
-	if len(messages) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(messages))
+	// 两条相邻 RoleUser 在 Anthropic API 下必须合并（strict alternation）。
+	// 历史断言"2 messages"是旧 buggy 行为；切到 DeepSeek /anthropic 严格端点会 400。
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 coalesced user message, got %d", len(messages))
 	}
 
-	// First message should have cache_control
-	firstContent := messages[0].Content
-	if len(firstContent) == 0 {
-		t.Fatal("first message has no content blocks")
+	contents := messages[0].Content
+	if len(contents) != 2 {
+		t.Fatalf("expected 2 content blocks in coalesced message, got %d", len(contents))
 	}
-	if firstContent[0].OfText == nil {
+
+	// First block keeps cache_control
+	if contents[0].OfText == nil {
 		t.Fatal("first content block is not text")
 	}
-	if firstContent[0].OfText.CacheControl.Type != "ephemeral" {
-		t.Errorf("first message cache_control.type = %s, want ephemeral", firstContent[0].OfText.CacheControl.Type)
+	if contents[0].OfText.CacheControl.Type != "ephemeral" {
+		t.Errorf("first block cache_control.type = %s, want ephemeral", contents[0].OfText.CacheControl.Type)
 	}
 
-	// Second message should not have cache_control
-	secondContent := messages[1].Content
-	if len(secondContent) == 0 {
-		t.Fatal("second message has no content blocks")
-	}
-	if secondContent[0].OfText == nil {
+	// Second block must NOT carry cache_control
+	if contents[1].OfText == nil {
 		t.Fatal("second content block is not text")
 	}
-	if secondContent[0].OfText.CacheControl.Type != "" {
-		t.Errorf("second message should not have cache_control, got type=%s", secondContent[0].OfText.CacheControl.Type)
+	if contents[1].OfText.CacheControl.Type != "" {
+		t.Errorf("second block should not have cache_control, got type=%s", contents[1].OfText.CacheControl.Type)
 	}
 }
 
