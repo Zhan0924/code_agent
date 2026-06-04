@@ -110,12 +110,14 @@
 | P1-tiktoken | `internal/llm/tokenizer.go:39` import `pkoukk/tiktoken-go`，`ExactTokenCount` 已被 `react_core.go:155` 使用 |
 | 双 Token 估算器 | `session/manager.go:540` 与 `llm/client.go:337` 均委托 `llm.FastEstimate`，`len/4+1` 在 session 中已不存在 |
 
-### B. 部分完成、需更新表述
+### B. 部分完成 → 已完成（2026-06-04 落地后过账）
 
-| 原待办 | 实际状态 | 剩余工作 |
-|---|---|---|
-| P1-Egress-wire | LLM ✅ `main.go:165`；MCP ✅ `main.go:337-341`；Reranker ❌ `rag/reranker.go:64` 仍裸 `http.Client`；Embedder ❌ `rag/embedder.go:57` 用默认 openai client | 把 egress transport 注入 reranker / embedder |
-| P1-Streaming-breaker | `client.go:302` 流式入口已 `sharedBreaker.Allow()`，但**未在流式失败路径调 `RecordFailure`**（非流式在 `client.go:238-239` 有调）| 流式错误路径补 `sharedBreaker.RecordFailure` |
+> 本节原记录 P1-Egress-wire 与 P1-Streaming-breaker 的半接线状态，两者均已在 2026-06-04 的 9 PR 批量修复中补齐，故下沉到「历史回溯」。代码当前位置：
+
+| 原待办 | 现位置 |
+|---|---|
+| P1-Egress-wire | Reranker `cmd/agent/main.go:277` + `internal/rag/reranker.go::NewAPIReranker(... httpClient ...)`；Embedder `cmd/agent/main.go:231` + `internal/rag/embedder.go::NewOpenAIEmbedder(... httpClient ...)`。LLM/MCP 既有接线点未变。需要启用时设 `security.egress_enabled: true` |
+| P1-Streaming-breaker | `internal/llm/client.go::ChatCompletionStream` 失败路径调用 `sharedBreaker.RecordFailure`，与非流式 `client.go:238-239` 对称 |
 
 ### C. 仍属实、待修复（带 file:line）
 
@@ -135,8 +137,7 @@
 
 ### E. 同步动作
 
-- [ ] `30_recent_improvements.md::F 节 P1 待办` 删除：P1-Redis-RL-wire / P1-tiktoken
-- [ ] `30_recent_improvements.md::F 节 P1 待办` 改写：P1-Egress-wire（仅剩 rerank/embedder）/ P1-Streaming-breaker（仅缺 RecordFailure）
-- [ ] `must/working-agreement.md::已接线` 表 RedisRateLimiter / tiktoken / 双估算器 三项可下沉为"历史回溯"
-- [ ] `must/working-agreement.md::工具分发拆分` 把 "9 处" 修订为 "18+ 文件含硬编码工具名"
-- [ ] 在 `docs/architecture/09_orchestrator.md::§11 P0` 把 ORC-1 / ORC-3 / shutdown-drain 标 file:line 并保留
+- [x] `30_recent_improvements.md::F 节` 已重写为「完成状态对账」表（2026-06-04 commit `b87d848` + `ed4ccd7`）
+- [x] `must/working-agreement.md::工具分发拆分` 已追加「工具名常量化」段落，指向 `tool_names.go`
+- [ ] `must/working-agreement.md::已接线` 表 RedisRateLimiter / tiktoken / 双估算器 三项下沉为「历史回溯」（仍可延后）
+- [ ] `docs/architecture/09_orchestrator.md::§11 P0` 把 ORC-1 / ORC-3 / shutdown-drain 标记为已修复并保留 file:line（仍可延后）

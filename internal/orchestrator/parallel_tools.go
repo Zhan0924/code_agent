@@ -35,13 +35,13 @@ func canParallelExecute(toolCalls []models.ToolCall) bool {
 // caller's ctx was cancelled. Now wg.Wait races against ctx.Done — when ctx
 // is cancelled we return immediately with whatever results already landed.
 //
-// Race-free snapshot: each worker publishes through its own channel rather
-// than writing into a shared slice. After ctx.Done we drain whatever has
-// already been delivered and return; late workers block on the unbuffered-1
-// channel until GC'd, but the caller has a fully-owned []toolExecResult
-// that no goroutine retains a reference to. This is what the audit caught —
-// the prior "per-index slot" assumption was wrong because the caller could
-// iterate the slice concurrently with a late worker's write.
+// Race-free snapshot: each worker publishes through its own buffer-1 channel
+// rather than writing into a shared slice. After ctx.Done we drain whatever
+// has already been delivered into a freshly-allocated []toolExecResult and
+// return; late workers send into their buffered slot and exit (no blocking,
+// no goroutine retains a reference to the returned slice). This closes the
+// gap the prior "per-index slot isolation" assumption left open — the caller
+// could iterate the returned slice concurrently with a late worker's write.
 func (o *Orchestrator) parallelExecuteTools(ctx context.Context, toolCalls []models.ToolCall) []toolExecResult {
 	// Per-slot channel so a late worker writing after we return doesn't race
 	// the caller iterating the returned slice. Buffer=1 so the worker can
