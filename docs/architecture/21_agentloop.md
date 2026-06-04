@@ -10,8 +10,9 @@
 > - `metacognition.go` (170) — 元认知状态（confidence / stuck score / 反思 prompt）
 > - `pruner.go` (83) — 消息窗口裁剪
 > - `trajectory_memory.go` (90) — 历史成功轨迹复用
+> - `dedupe_tool_calls.go` (141) — `DedupeToolCalls` 按 `(Name, 规范化JSON Args)` 折叠同步内重复 ToolCall（被 orchestrator.reactLoopCore 与本包 Runner 共用，避免 HITL 重复审批 / SSE 幽灵卡片 / tool_calls↔tool_results 错位）
 >
-> 测试：`runner_test.go` (190) / `tool_error_test.go` (210) / `adaptive_feedback_test.go` (140) / `trajectory_memory_test.go` (95)
+> 测试：`runner_test.go` (190) / `tool_error_test.go` (210) / `adaptive_feedback_test.go` (140) / `trajectory_memory_test.go` (95) / `dedupe_tool_calls_test.go` (125)
 
 ---
 
