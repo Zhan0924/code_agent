@@ -501,8 +501,8 @@ curl -N -X POST localhost:8080/api/v1/projects/generate/stream \
 
 **可靠性（Reliability）**
 - gobreaker Interval/Timeout 分开配置（见 [03 §12](03_llm.md)）
-- SharedBreaker 接入 streaming（见 [03 §12](03_llm.md)）
-- HTTP shutdown drain detached goroutines（见 [17 §13](17_api.md)）
+- ✅ ~~SharedBreaker 接入 streaming~~（2026-06-04 完成，见 [03 §12](03_llm.md)）
+- ✅ ~~HTTP shutdown drain detached goroutines~~（2026-06-04 完成，见 [17 §13](17_api.md)）
 - 压缩失败兜底 + error metric（见 [12 §13](12_session.md)）
 - MCP per-server 熔断（见 [06 §13](06_mcp.md)）
 - Generator 异步任务持久化（重启后能续传，见 [28 §11](28_generator.md)）

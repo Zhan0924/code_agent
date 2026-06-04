@@ -796,7 +796,7 @@ CI 零外部依赖（不真发 HTTP）。
 
 **P1 — 数周内**
 
-- [ ] **SharedBreaker 接入 streaming 路径**：当前仅 `ChatCompletion` 接入，`ChatCompletionStream` 未走 RecordFailure；
+- [x] **SharedBreaker 接入 streaming 路径**：✅ 2026-06-04 完成 — `internal/llm/client.go::ChatCompletionStream` 失败路径调用 `sharedBreaker.RecordFailure`，与非流式 `client.go:238-239` 对称。
 - [ ] **gobreaker 换用 `FailureRate ≥ 0.3` 判据**：当前 `ConsecutiveFailures`——40% 错误率但不连续不会跳；
 - [ ] **请求级 timeout 单独配置**：`req.Timeout = 60s` 与 `ctx deadline` 区分；
 - [ ] **支持多 provider 注册表**：不止 primary + fallback，按模型名路由到不同 provider（如 embedding 用 OpenAI、聊天用 Anthropic）；

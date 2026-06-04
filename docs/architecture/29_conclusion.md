@@ -332,8 +332,8 @@ Temporal workflow 有 retry policy + exp backoff；
 
 ### 二、可靠性升级
 
-- **P0 S2** LLM streaming 路径接入 SharedBreaker（当前只 non-stream 接入）
-- **P0 S2** HTTP shutdown 时 drain detached-context goroutines（见 [17 §Q3](17_api.md)）
+- ✅ ~~**P0 S2** LLM streaming 路径接入 SharedBreaker~~（2026-06-04 完成 — `internal/llm/client.go::ChatCompletionStream` 失败路径 `sharedBreaker.RecordFailure`）
+- ✅ ~~**P0 S2** HTTP shutdown 时 drain detached-context goroutines~~（2026-06-04 完成 — `internal/api/router.go::Server.inflight` + `Server.Drain()`，`cmd/agent/main.go` shutdown 之后调用）
 - **P1 S5** LLM retryWithBackoff 加 jitter + 加到主路径
 - **P1 S5** Temporal worker 弹性（Dial 失败后定时重试）
 - **P2 S8** 跨区域多活 / 读写分离
