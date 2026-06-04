@@ -192,7 +192,7 @@ token 端点必须**位于 AuthMiddleware 之外**，否则没人能拿到第一
 
 ⚠️ **生命周期空白**：
 - 文件 watcher 用 `context.Background()` 启动（L565）—— **优雅关闭时未被取消**，详 `15_indexer_repomap.md` §10
-- ✅ ~~`handleChat` 的 detached goroutine 在 shutdown 时未 drain~~（2026-06-04 修复 — `internal/api/router.go::Server.inflight` + `Server.Drain()`，`cmd/agent/main.go` 在 `httpServer.Shutdown` 之后调用；详见 §13 与 `30_recent_improvements.md::F`）
+- ✅ ~~`handleChat` 的 detached goroutine 在 shutdown 时未 drain~~（2026-06-04 修复 — `internal/api/router.go::Server.inflight` + `Server.Drain()`，`cmd/agent/main.go` 在 `httpServer.Shutdown` 之后调用；详见 §10.2.9 与 `30_recent_improvements.md::F`）
 
 ---
 
