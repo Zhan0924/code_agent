@@ -348,7 +348,7 @@ tiktoken-go，但日常预算决策这个估算足够。
 
 Redis 不可用时 fail-open（可用性 > 严格执行）。
 
-**集成状态**：`Client.ChatCompletion` 已接入。`ChatCompletionStream` 待接入。
+**集成状态**：`Client.ChatCompletion` 与 `Client.ChatCompletionStream` 均已接入（2026-06-04 起，详见本文 §F 的「流式 SharedBreaker 失败记账」行）。
 
 ---
 

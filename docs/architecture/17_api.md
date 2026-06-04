@@ -192,7 +192,7 @@ token 端点必须**位于 AuthMiddleware 之外**，否则没人能拿到第一
 
 ⚠️ **生命周期空白**：
 - 文件 watcher 用 `context.Background()` 启动（L565）—— **优雅关闭时未被取消**，详 `15_indexer_repomap.md` §10
-- `handleChat` 的 detached goroutine 也用 `context.Background()` —— **shutdown 时没有 drain**
+- ✅ ~~`handleChat` 的 detached goroutine 在 shutdown 时未 drain~~（2026-06-04 修复 — `internal/api/router.go::Server.inflight` + `Server.Drain()`，`cmd/agent/main.go` 在 `httpServer.Shutdown` 之后调用；详见 §13 与 `30_recent_improvements.md::F`）
 
 ---
 
@@ -749,9 +749,8 @@ if inm := c.GetHeader("If-None-Match"); inm == snap.ETag {
 8. **文件 watcher 用 Background ctx 启动**
    `main.go:565`：shutdown 时未 cancel，goroutine 泄漏。
 
-9. **`handleChat` 的孤儿 goroutine 也用 Background**
-   shutdown 时 detached goroutine 还在跑 → 数据库可能在 shutdown 后被写入 → race。
-   应该有 server-level 的 detached pool，shutdown 时 drain。
+9. ✅ ~~**`handleChat` 的孤儿 goroutine 也用 Background**~~
+   2026-06-04 修复：`internal/api/router.go::Server.inflight` (`sync.WaitGroup`) + `Server.Drain(ctx)`，`cmd/agent/main.go` 在 `httpServer.Shutdown` 之后调用,bounded by `shutdownCtx`。`handleChat` 的 detached goroutine 通过 `trackInflight` 自动登记。
 
 10. **`/readyz` 检查覆盖不全**
     仅 Redis + PG。Qdrant、Temporal、LLM、MCP 都没纳入——
@@ -782,7 +781,7 @@ if inm := c.GetHeader("If-None-Match"); inm == snap.ETag {
   - allowedOrigins 从 config 读
   - WS 实现 ping/pong heartbeat（30s 间隔）
   - main.go watcher.Start 传 shutdown ctx
-  - Detached goroutine pool + Shutdown 时 drain
+  - ✅ ~~Detached goroutine pool + Shutdown 时 drain~~（2026-06-04 完成，见 §10.2.9）
   - /readyz 增加 Qdrant/Temporal/MCP
 
 明季修（P2）:
