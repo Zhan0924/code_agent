@@ -276,16 +276,31 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			return reactCoreResult{content: resp.Content, messages: messages, stepsUsed: step + 1, done: true}
 		}
 
-		// Append assistant message
+		// Dedupe identical ToolCalls within a single LLM step. Long ReAct loops
+		// occasionally emit the same (Name, Args) twice — most commonly when a
+		// high-risk tool needs HITL approval, the user approves once, and the
+		// loop discovers there's a second identical call still queued and
+		// stalls waiting for a second click. Dedupe upstream so both the
+		// SSE stream and the LLM tool-call/tool-result correspondence stay
+		// 1:1. See PR after audit: tool_approval.toolApprovalCh is keyed by
+		// task.ID and rejects concurrent registrations, so a duplicate would
+		// previously bubble back as an error to the LLM mid-step.
+		dedupedCalls := dedupeToolCalls(resp.ToolCalls, o.logger)
+
+		// Append assistant message using the deduped set so the LLM history
+		// shows exactly the calls we're going to execute (otherwise the model
+		// sees N tool_calls in the assistant turn but only K < N matching
+		// tool results and may re-emit the missing ones).
 		messages = append(messages, models.Message{
-			Role: models.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
+			Role: models.RoleAssistant, Content: resp.Content, ToolCalls: dedupedCalls,
 		})
 
 		// Execute tools — parallel for read-only batches, sequential otherwise
 		var editedFilePaths []string
 
-		// Emit all tool_call events upfront
-		for _, tc := range resp.ToolCalls {
+		// Emit all tool_call events upfront (over deduped set so the UI
+		// doesn't render phantom duplicate cards).
+		for _, tc := range dedupedCalls {
 			sink.Emit(models.ReactStreamEvent{
 				Type: "tool_call", Step: globalStep,
 				ToolName: tc.Name, ToolArgs: string(tc.Args), ToolCallID: tc.ID,
@@ -300,10 +315,10 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 
 		var processed []processedResult
 
-		if canParallelExecute(resp.ToolCalls) {
+		if canParallelExecute(dedupedCalls) {
 			// All tools are idempotent — execute concurrently. Pass execCtx
 			// so cancel/pause cuts hung workers, not just step boundaries.
-			parallelResults := o.parallelExecuteTools(execCtx, resp.ToolCalls)
+			parallelResults := o.parallelExecuteTools(execCtx, dedupedCalls)
 			for _, pr := range parallelResults {
 				// parallelExecuteTools may return zero-valued slots if execCtx
 				// was cancelled before that worker finished. Skip those —
@@ -320,10 +335,10 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				}
 				processed = append(processed, processedResult{tc: pr.tc, content: content, isErr: (pr.execErr != nil) || (pr.result != nil && pr.result.IsError)})
 			}
-			o.logger.Debug("parallel tool execution", zap.Int("count", len(resp.ToolCalls)))
+			o.logger.Debug("parallel tool execution", zap.Int("count", len(dedupedCalls)))
 		} else {
 			// Sequential execution for write tools or single calls
-			for _, tc := range resp.ToolCalls {
+			for _, tc := range dedupedCalls {
 				// Step-internal interrupt gate: when a step has N tool calls
 				// and a cancel arrives between call 1 and call 2, we want to
 				// stop without firing call 2. Before this check, the for loop
