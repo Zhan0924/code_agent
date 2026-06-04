@@ -119,14 +119,11 @@
 
 ### C. 仍属实、待修复（带 file:line）
 
+> **2026-06-04 更新**：ORC-1 / ORC-2 / ORC-3 / P1-shutdown-drain / CFG-EXPAND / TOOL-NAMES 已在本日落地的 9 PR 中修复（见 `docs/architecture/30_recent_improvements.md::F 节 完成状态对账`），本表删除已完成行。仅保留**当前仍未修复**条目。
+
 | 编号 | 现象 | 位置 |
 |---|---|---|
-| ORC-1 | `ToolTransaction.Rollback` 定义但零生产调用方；`checkInterrupt` cancel 分支只返回字符串，未触达 `tx.Rollback()` | `orchestrator/tool_transaction.go:67-69`、`orchestrator/interrupt.go:62-89` |
-| ORC-2 | `parallelExecuteTools` 裸 `wg.Wait()` 不 select ctx。**但**：`canParallelExecute` 仅允许 `IsIdempotentTool`，`shell_exec`/`run_tests` 走顺序 `executeTool`，cancel 失灵的根因是工具内部不 select ctx | `orchestrator/parallel_tools.go:50` + `executeTool` 各分支 |
-| ORC-3 | `react_core.go:171-184` 3 次 `2^n` 退避，无 `IsRetryable` 判断；401/400/quota 一律重试 | `orchestrator/react_core.go:171-184` |
-| P1-shutdown-drain | `handlers.go:135` `agentCtx = context.Background()`，client disconnect 分支显式不 cancel；`main.go:748-767` shutdown 仅 `httpServer.Shutdown`，无 `sync.WaitGroup` 等 detached goroutine | `api/handlers.go:130-168` + `cmd/agent/main.go:748-767` |
-| CFG-EXPAND | `config.go:377-397` 手工逐字段 `expandEnv`（18 字段 + MCP 循环），新字段需人工登记，无反射/编译期检查 | `internal/config/config.go:377-397` |
-| TOOL-NAMES | 硬编码工具名字符串散落 **18 个 .go 文件**（远超 working-agreement.md 记录的 9 处），`tool_metadata` 只统一行为 bit、未统一名称清单 | 详见 `rg --count 'apply_diff\|read_file\|write_file' --type go -g '!*_test.go' -g '!_principles.go'` |
+| TOOL-NAMES-XPKG | orchestrator 包内硬编码已收敛到 `tool_names.go`；但跨包硬编码（`multiagent/` / `agentloop/` / `planner/`）仍未迁移 —— 需要先决定共享常量包位置（避免 import cycle）再展开 | `rg --count '\"read_file\"\|\"write_file\"' internal/{multiagent,agentloop,planner}` |
 | HITL-INPROC-LOSS | In-process HITL 回退通道在以下任一场景下导致 approval 返回 `404 no pending approval`：(a) 进程在 suspend 与 approve 之间重启；(b) `approvalCh[taskID]` 30 分钟超时清理后；(c) 前端用过期 taskID。Temporal 路径不受影响。修复方向待定（Redis 持久化 / 状态机恢复 / 强制 Temporal） | `orchestrator/orchestrator.go:659-718`（suspend + 30min cleanup）+ `orchestrator/orchestrator.go:751-757`（404 lookup） |
 
 ### D. 论述偏差（举例不准确，底层问题仍在）

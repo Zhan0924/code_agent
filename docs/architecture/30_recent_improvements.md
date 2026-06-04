@@ -520,35 +520,30 @@ sparse vector 或 Meilisearch，见 bm25.go 的类型注释）。
 
 ## F. 未完成项（P1 待办）
 
-> **2026-06-04 更新**：本表已根据 `llmdoc/memory/doc-gaps.md::2026-06-03 二次复核` 与同日落地的 9 个 PR 对账。已完成项删除；半完成项仅保留剩余部分（已无）；新接线点用 file:line 标注。
-
 | 编号 | 描述 | 状态 |
 |---|---|---|
 | P1-SSRF-全局默认 | LLM/MCP/Rerank 默认走 egress validator（现在要显式配置） | — |
 
-**已完成（按本轮 9 PR 落地）**：
+### 完成状态对账（持续维护）
 
-| 原编号 | 完成接线 |
+> 历次 P1 待办的落地以代码位置为准。当本表与 `llmdoc/memory/doc-gaps.md` 不一致时，以 git 中的实际代码为准；本表只追溯改动指针。
+
+| 主题 | 落地位置 |
 |---|---|
-| P1-Redis-RL-wire | `internal/api/router.go:188-195`（Redis 可用即走 `auth.NewRedisRateLimiter`） |
-| P1-tiktoken | `internal/llm/tokenizer.go:39` import `pkoukk/tiktoken-go`；`react_core.go:155` 已使用 `ExactTokenCount` |
-| P1-Egress-wire（完整） | LLM `main.go:165`、MCP `main.go:337-341`、Reranker `main.go:277`（PR 1）、Embedder `main.go:231`（PR 1） |
-| P1-Streaming-breaker | `client.go:328-330` 流式失败路径补 `sharedBreaker.RecordFailure`（PR 2） |
-| P1-shutdown-drain | `Server.inflight` + `Server.Drain()`（PR 6）；`main.go:761-765` 在 `httpServer.Shutdown` 之后调用 |
-
-**本轮另落地的相关修复**（不在原 F 表内但需追溯）：
-
-| 主题 | 代码位置 |
-|---|---|
-| LLM 错误分类 IsRetryable | `internal/llm/retryable.go`（PR 3） + `react_core.go:179-184` |
-| ToolTransaction Rollback on interrupt | `tool_transaction.go::registerTx` + `react_core.go::interrupt case` 内联 Rollback（PR 4） |
-| 流式路径补 ToolTransaction 注册 | `orchestrator.go::ProcessMessageStreamFull` 增 `registerTx`（PR 4） |
-| 工具执行期 ctx 取消（watchdog + execCtx） | `react_core.go::reactLoopCore` 头部 watchdog（PR 5） |
-| parallelExecuteTools wg.Wait 与 ctx.Done race | `parallel_tools.go::parallelExecuteTools`（PR 5） |
-| sandbox/volume.go 等待 select 缺 ctx.Done | `internal/sandbox/volume.go:160-167`（PR 5） |
-| `expandEnv` 反射化 | `internal/config/config.go::walkExpandEnv`（PR 7） |
-| Tool 名常量中心化（orchestrator 包内） | `internal/orchestrator/tool_names.go`（PR 8） |
-| CI workflow + golangci-lint Go 1.25 | `.github/workflows/ci.yml`、`.golangci.yml:3`（PR 9） |
+| Redis 限流 | `internal/api/router.go:188-195`（Redis 可用即走 `auth.NewRedisRateLimiter`） |
+| tiktoken 精确 token 计数 | `internal/llm/tokenizer.go:39`（`pkoukk/tiktoken-go`）；消费点 `react_core.go::ExactTokenCount` |
+| Egress 注入（LLM/MCP/Reranker/Embedder） | `cmd/agent/main.go:165`（LLM）、`:231`（Embedder）、`:277`（Reranker）、`:337-341`（MCP）；构造方在 `internal/rag/{embedder,reranker}.go`、`internal/security/egress_http.go` |
+| 流式 SharedBreaker 失败记账 | `internal/llm/client.go::ChatCompletionStream` 失败路径调用 `sharedBreaker.RecordFailure`（与非流式 `:238-239` 对称） |
+| HTTP shutdown drain | `internal/api/router.go::Server.inflight` + `Server.Drain()`；`cmd/agent/main.go` 在 `httpServer.Shutdown` 之后调用 |
+| LLM 错误分类 | `internal/llm/retryable.go::IsRetryable`；消费点 `internal/orchestrator/react_core.go` ReAct 重试循环 |
+| ToolTransaction 与 interrupt 联动 | `internal/orchestrator/tool_transaction.go::registerTx`；触发点在 `react_core.go::reactLoopCore` 的 interrupt 分支内联 `Rollback` |
+| 流式路径注册 ToolTransaction | `internal/orchestrator/orchestrator.go::ProcessMessageStreamFull` 调用 `registerTx` |
+| 工具执行期 ctx 取消（execCtx watchdog） | `internal/orchestrator/react_core.go::reactLoopCore` 头部 watchdog；步内中断检查在串行 ToolCalls 循环 |
+| parallelExecuteTools 取消语义 + race-free 快照 | `internal/orchestrator/parallel_tools.go::parallelExecuteTools`（per-slot buffered channel） |
+| sandbox volume wait 响应 ctx 取消 | `internal/sandbox/volume.go` ContainerWait select 含 `<-ctx.Done()` arm |
+| 配置 `${VAR}` 反射展开 | `internal/config/config.go::walkExpandEnv`，opt-out 标签 `env_expand:"false"` |
+| 内置工具名常量化 | `internal/orchestrator/tool_names.go::Tool*` |
+| CI workflow + Go 1.25 对齐 | `.github/workflows/ci.yml`、`.golangci.yml:3`（与 `go.mod` 一致） |
 
 ---
 

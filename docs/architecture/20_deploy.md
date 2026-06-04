@@ -668,13 +668,13 @@ CN 网络环境下：
 | ID | 缺陷 | 文件:行 | 严重度 | 修复建议 |
 |---|---|---|---|---|
 | **DEP-1** | `Dockerfile.allinone:79 COPY configs/config.allinone.yaml` 与 `.dockerignore` 中 `configs/config.allinone.yaml` 互斥 → 构建会失败 | `Dockerfile.allinone:79` ⊕ `.dockerignore:23` | 🔴 P0 | 二选一：要么 `.dockerignore` 添加 `!Dockerfile.allinone` 路径白名单，要么 allinone 改成运行时 bind mount |
-| **DEP-2** | 无 `.github/workflows/ci.yml`，仅有 `pr-review.yml`（LLM 评审）。test/build/push 镜像全靠手工 | `.github/workflows/` | 🟠 P1 | 补 CI：go test + docker build + push 到 registry |
+| **DEP-2** | ~~无 `.github/workflows/ci.yml`~~ ✅ 2026-06-04 已补：`ci.yml` 三 job（`test` race+short 含 Redis service container / `lint` golangci / `build` 二进制）；docker build/push 仍未接入 CI，留作下一轮 | `.github/workflows/ci.yml` | 🟡 P2（已降级） | 在 build job 后追加 `docker build` + push 到 registry |
 | **DEP-3** | `entrypoint.sh` 前 6 服务挂掉无人察觉。e.g. PG 后台死掉，Agent 仍在跑但所有持久化操作 500 | `deploy/entrypoint.sh` | 🟠 P1 | 引入 supervisord 或在 Agent /readyz 里加深度检查 |
 | **DEP-4** | `deployments/k8s/deployment.yaml` 未注入 `CODE_AGENT_AUTH_JWT_SECRET` env → 多副本时 JWT 签名密钥独立随机生成，跨 Pod token 互相验签失败 | `deployments/k8s/deployment.yaml:28` | 🔴 P0 | 添加 secretKeyRef 注入 JWT_SECRET，与 18_auth_security AS-1 联动修复 |
 | **DEP-5** | `deployments/k8s/deployment.yaml` 中 Secret 包含明文占位符 `your-api-key-here` —— 容易被误 commit 真实密钥 | `deployments/k8s/deployment.yaml:120` | 🟠 P1 | 用 sealed-secrets / external-secrets-operator 替代 |
 | **DEP-6** | `docker-compose.yml:39 user: "0:0"` 把 Agent 跑成 root —— sandbox 逃逸即 host root | `docker-compose.yml:39` | 🟠 P1 | 改用 rootless docker 或 user namespaces remap |
 | **DEP-7** | `Dockerfile.allinone` 依赖宿主机预下载的 `deploy/bin/{qdrant,temporal,jaeger-all-in-one}`，构建脚本未提供（仅 `download_jaeger.sh`）| `Dockerfile.allinone:63-75` | 🟡 P2 | 补 `deploy/download_all.sh` 一键下载 |
-| **DEP-8** | `golangci-lint` 配置 `go: "1.22"`，但 `go.mod` 声明 `go 1.25.0` —— CI 可能版本不匹配 | `.golangci.yml` ⊕ `go.mod` | 🟡 P2 | 统一到 1.25 或在 CLAUDE.md 中文档化 GOTOOLCHAIN=auto |
+| **DEP-8** | ~~`golangci-lint` 配置 `go: "1.22"`，但 `go.mod` 声明 `go 1.25.0`~~ ✅ 2026-06-04 已对齐：`.golangci.yml:3` 改 `go: "1.25"`，新 `ci.yml` 全部 setup-go `1.25` | `.golangci.yml:3` | ✅ 已修复 | — |
 | **DEP-9** | `docker-compose.yml:53 redis healthcheck` 间隔 10s，启动期 50s 才确认健康 —— Agent 启动延迟过长 | `docker-compose.yml:53-56` | 🟢 P3 | start_period: 5s + start_interval: 1s（compose 2.20+）|
 | **DEP-10** | `GOSUMDB=off` 关闭 Go 模块校验和验证 —— 供应链攻击风险 | `Dockerfile:12` | 🟢 P3 | 改 `GOSUMDB=sum.golang.google.cn` |
 

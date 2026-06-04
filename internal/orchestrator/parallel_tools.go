@@ -34,11 +34,22 @@ func canParallelExecute(toolCalls []models.ToolCall) bool {
 // RAG retrieval inside a read_file call) would pin the loop even after the
 // caller's ctx was cancelled. Now wg.Wait races against ctx.Done — when ctx
 // is cancelled we return immediately with whatever results already landed.
-// Late-arriving goroutines still write into their own index slot (per-index
-// slot isolation makes the late write race-free), but the caller has already
-// taken its copy of `results` and moved on.
+//
+// Race-free snapshot: each worker publishes through its own channel rather
+// than writing into a shared slice. After ctx.Done we drain whatever has
+// already been delivered and return; late workers block on the unbuffered-1
+// channel until GC'd, but the caller has a fully-owned []toolExecResult
+// that no goroutine retains a reference to. This is what the audit caught —
+// the prior "per-index slot" assumption was wrong because the caller could
+// iterate the slice concurrently with a late worker's write.
 func (o *Orchestrator) parallelExecuteTools(ctx context.Context, toolCalls []models.ToolCall) []toolExecResult {
-	results := make([]toolExecResult, len(toolCalls))
+	// Per-slot channel so a late worker writing after we return doesn't race
+	// the caller iterating the returned slice. Buffer=1 so the worker can
+	// always send and exit even if no one drains the channel.
+	slots := make([]chan toolExecResult, len(toolCalls))
+	for i := range slots {
+		slots[i] = make(chan toolExecResult, 1)
+	}
 	var wg sync.WaitGroup
 	wg.Add(len(toolCalls))
 
@@ -46,7 +57,7 @@ func (o *Orchestrator) parallelExecuteTools(ctx context.Context, toolCalls []mod
 		go func(idx int, call models.ToolCall) {
 			defer wg.Done()
 			result, err := o.executeTool(ctx, call)
-			results[idx] = toolExecResult{
+			slots[idx] <- toolExecResult{
 				index:   idx,
 				tc:      call,
 				result:  result,
@@ -63,10 +74,21 @@ func (o *Orchestrator) parallelExecuteTools(ctx context.Context, toolCalls []mod
 	select {
 	case <-done:
 	case <-ctx.Done():
-		// Caller cancelled; surface whatever has already completed. Empty
-		// slots stay zero-valued (ToolCall name empty), and the calling
-		// loop in react_core treats those as a no-op rather than feeding
-		// half-finished tool output back to the LLM.
+		// Caller cancelled; fall through to the drain loop below. Workers
+		// that have not yet finished will eventually publish into their
+		// buffered slot and exit on their own.
 	}
-	return results
+
+	out := make([]toolExecResult, len(toolCalls))
+	for i, ch := range slots {
+		select {
+		case r := <-ch:
+			out[i] = r
+		default:
+			// Worker hasn't published yet — leave zero-valued. react_core
+			// skips entries with empty tc.Name to avoid feeding half-baked
+			// results back to the LLM.
+		}
+	}
+	return out
 }

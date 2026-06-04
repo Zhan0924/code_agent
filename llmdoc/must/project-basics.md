@@ -46,7 +46,7 @@ make docker-up      # docker compose up -d（redis/postgres/qdrant/temporal/agen
 
 单包测试：`go test -race -run TestXxx ./internal/orchestrator`
 
-注意：`go.mod` 声明 go 1.25.0，但 CI 和 `.golangci.yml` 使用 Go 1.22。若 `go build` 报 toolchain 问题，设置 `GOTOOLCHAIN=auto`。
+Go 版本：`go.mod` 声明 `go 1.25.0`，`.golangci.yml:3` 与 `.github/workflows/ci.yml` 全部对齐到 `1.25`（2026-06-04 同步，原 1.22 偏差已消）。若本地 toolchain 不匹配，设置 `GOTOOLCHAIN=auto`。
 
 ### 前端
 

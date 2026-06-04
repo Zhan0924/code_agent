@@ -633,8 +633,10 @@ Filter {
 ### 7.1 `OpenAIEmbedder` — 生产默认
 
 ```go
-NewOpenAIEmbedder(ragCfg, llmFallback, logger)
+NewOpenAIEmbedder(ragCfg, llmFallback, egressHTTPClient, logger)
 ```
+
+2026-06-04 起新增第三参数 `*http.Client`：当 `security.egress_enabled: true` 时由 `cmd/agent/main.go:231` 传入 `security.NewEgressHTTPClient(...)` 构造的 SSRF-protected client；为 nil 时回退到 go-openai SDK 默认 transport（向后兼容）。`NewAPIReranker` 同步增加了同名参数（`main.go:277`）。
 
 要点：
 
