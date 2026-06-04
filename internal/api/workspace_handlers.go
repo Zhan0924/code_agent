@@ -256,6 +256,11 @@ func (s *Server) handleDownloadWorkspace(c *gin.Context) {
 
 // resolveWorkspace resolves the workspace from the URL parameter :id.
 // If the workspace is not found but there's a "default" workspace, return it.
+// Sessions live in Redis (durable across container restarts) while workspaces
+// live on the container filesystem; a container rebuild leaves the frontend
+// pointed at a session_id whose workspace dir was wiped. When that happens
+// we lazy-create a fresh workspace tied to the still-existing session, which
+// matches handleGetSessionWorkspace's recovery behaviour.
 func (s *Server) resolveWorkspace(c *gin.Context) *workspace.Workspace {
 	if s.workspaceMgr == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace manager not available"})
@@ -282,6 +287,22 @@ func (s *Server) resolveWorkspace(c *gin.Context) *workspace.Workspace {
 			return nil
 		}
 		return ws
+	}
+
+	// Lazy recovery: the frontend passes session_id as workspace_id; if the
+	// session is still alive in Redis we recreate its workspace dir rather
+	// than 404-ing. Same code path as handleGetSessionWorkspace.
+	if s.sessionMgr != nil {
+		if _, err := s.sessionMgr.Get(c.Request.Context(), id); err == nil {
+			label := "session-" + id
+			if len(id) > 8 {
+				label = "session-" + id[:8]
+			}
+			ws, createErr := s.workspaceMgr.CreateForSession(id, id, label)
+			if createErr == nil {
+				return ws
+			}
+		}
 	}
 
 	c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found: " + id})
