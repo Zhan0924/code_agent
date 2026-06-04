@@ -42,7 +42,7 @@ func (o *Orchestrator) RegisterLSPTools(reg *tools.Registry) error {
 			handler: o.toolHoverInfo,
 		},
 		{
-			name:    "rename_symbol",
+			name:    ToolRenameSymbol,
 			desc:    "Semantically rename a symbol across all files in the workspace. Returns the list of changes.",
 			params:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string","description":"File path"},"line":{"type":"integer","description":"Line number (1-based)"},"column":{"type":"integer","description":"Column number (1-based)"},"new_name":{"type":"string","description":"New name for the symbol"}},"required":["file","line","column","new_name"]}`),
 			handler: o.toolRenameSymbol,
@@ -60,7 +60,7 @@ func (o *Orchestrator) RegisterLSPTools(reg *tools.Registry) error {
 		switch lt.name {
 		case "goto_definition", "find_references", "hover_info":
 			def.IsIdempotentRead = true
-		case "rename_symbol":
+		case ToolRenameSymbol:
 			def.RiskLevel = 2 // high risk: cross-file modification
 			def.IsFileWrite = true
 			def.TriggersAutoTest = true

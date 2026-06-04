@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -132,6 +133,124 @@ func (r *Registry) Len() int {
 	return len(r.tools)
 }
 
+// semanticAliases groups tokens that share an intent so the LLM's hallucinated
+// name (e.g. `shell_exec`) still scores against the real tool (`run_workspace_cmd`).
+// Each row lists synonyms in ONE direction: any query token in the row
+// matches any registered-tool token in the same row. Keep small and stable —
+// blowing this up undermines determinism.
+var semanticAliases = [][]string{
+	{"shell", "exec", "run", "cmd", "command", "execute", "bash", "sh"},
+	{"read", "load", "open", "view", "show", "cat", "get"},
+	{"write", "save", "create", "new"},
+	{"delete", "remove", "rm", "unlink"},
+	{"list", "ls", "tree", "dir"},
+	{"search", "find", "grep", "query"},
+	{"test", "check", "verify", "validate"},
+	{"edit", "patch", "modify", "update", "change"},
+}
+
+// suggestSimilarNames returns up to limit tool names whose substring overlap
+// with the requested name suggests the LLM was reaching for one of them, plus
+// the total registered count (captured under the same read lock as the names,
+// so the two values are coherent). Cheap heuristic — case-insensitive
+// shared-prefix / shared-token / substring + semantic-alias match — good
+// enough to short-circuit common hallucinations like `shell_exec` →
+// `run_workspace_cmd` or `git_commit` → `git_diff`. Falls back to
+// alphabetical first N when no overlap exists so the LLM always gets *some*
+// signal about what's available.
+func (r *Registry) suggestSimilarNames(query string, limit int) ([]string, int) {
+	r.mu.RLock()
+	names := make([]string, 0, len(r.tools))
+	for n := range r.tools {
+		names = append(names, n)
+	}
+	total := len(r.tools)
+	r.mu.RUnlock()
+	if len(names) == 0 {
+		return nil, total
+	}
+	sort.Strings(names) // determinism for cache hits
+
+	q := strings.ToLower(query)
+	type scored struct {
+		name  string
+		score int
+	}
+	scoredNames := make([]scored, 0, len(names))
+	qTokens := strings.FieldsFunc(q, splitOnNonAlnum)
+	qAliases := expandAliases(qTokens)
+	for _, n := range names {
+		ln := strings.ToLower(n)
+		nameTokens := strings.FieldsFunc(ln, splitOnNonAlnum)
+		s := 0
+		switch {
+		case ln == q:
+			s = 1000
+		case strings.HasPrefix(ln, q) || strings.HasPrefix(q, ln):
+			s = 100
+		case strings.Contains(ln, q) || strings.Contains(q, ln):
+			s = 50
+		}
+		// Reward literal shared tokens (e.g. `git_commit` vs `git_diff` share "git").
+		for _, t := range qTokens {
+			if len(t) >= 3 && strings.Contains(ln, t) {
+				s += 10
+			}
+		}
+		// Reward semantic-alias overlap (e.g. `shell_exec` vs `run_workspace_cmd`
+		// both belong to the {shell, exec, run, cmd, ...} alias row).
+		for _, nt := range nameTokens {
+			if _, ok := qAliases[nt]; ok {
+				s += 25
+			}
+		}
+		scoredNames = append(scoredNames, scored{n, s})
+	}
+	sort.SliceStable(scoredNames, func(i, j int) bool {
+		if scoredNames[i].score != scoredNames[j].score {
+			return scoredNames[i].score > scoredNames[j].score
+		}
+		return scoredNames[i].name < scoredNames[j].name
+	})
+	if limit > len(scoredNames) {
+		limit = len(scoredNames)
+	}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		out = append(out, scoredNames[i].name)
+	}
+	return out, total
+}
+
+// expandAliases walks every token from the query and returns the set of all
+// semantic aliases linked via semanticAliases. Used to bridge LLM-side phrasing
+// (`shell_exec`) to repo-side phrasing (`run_workspace_cmd`).
+func expandAliases(tokens []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(tokens)*4)
+	for _, t := range tokens {
+		set[t] = struct{}{}
+		for _, row := range semanticAliases {
+			hit := false
+			for _, w := range row {
+				if w == t {
+					hit = true
+					break
+				}
+			}
+			if hit {
+				for _, w := range row {
+					set[w] = struct{}{}
+				}
+			}
+		}
+	}
+	return set
+}
+
+func splitOnNonAlnum(r rune) bool {
+	return !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9')
+}
+
 // Execute looks up a tool by name, invokes it, and records metrics (latency +
 // outcome counters partitioned by source tag).
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (*models.ToolResult, error) {
@@ -139,7 +258,14 @@ func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessag
 	t, ok := r.tools[name]
 	r.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrToolNotFound, name)
+		// Defensive: when the LLM hallucinates a tool name (e.g. `shell_exec`
+		// for `run_workspace_cmd`), echo back the closest matches so the next
+		// turn can self-correct instead of repeating the broken call until the
+		// fix-loop tracker aborts. Plain `%w: %s` would only tell the model
+		// "shell_exec doesn't exist" — useless without context.
+		suggestions, total := r.suggestSimilarNames(name, 5)
+		return nil, fmt.Errorf("%w: %q. Did you mean one of [%s]? (%d tools registered total)",
+			ErrToolNotFound, name, strings.Join(suggestions, ", "), total)
 	}
 	start := time.Now()
 	source := t.Definition().Source

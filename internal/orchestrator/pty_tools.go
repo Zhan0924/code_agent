@@ -19,7 +19,7 @@ func (o *Orchestrator) RegisterPTYTools(reg *tools.Registry) error {
 
 	tool := &builtinTool{
 		def: models.ToolDefinition{
-			Name:        "shell_exec",
+			Name:        ToolShellExec,
 			Description: "Execute a command in a persistent shell session. State (cwd, env vars, aliases) persists across calls within the same workspace.",
 			Parameters: json.RawMessage(`{
 				"type": "object",

@@ -126,3 +126,24 @@ func (t *ToolTransaction) HasDirtyFiles() bool {
 	defer t.mu.Unlock()
 	return len(t.dirtyFiles) > 0
 }
+
+// registerTx creates a ToolTransaction for sessionID, registers it in
+// o.txMap so CaptureBeforeWrite (orchestrator.go:1681-1685 iterates the map)
+// can populate it, and returns a release closure for the caller's defer.
+//
+// Extracted from reactLoop:447-456 so the streaming path
+// (ProcessMessageStreamFull) can also participate. Before this refactor the
+// streaming path never registered a transaction, so file writes on that path
+// could not be rolled back on interrupt.
+func (o *Orchestrator) registerTx(sessionID string) (tx *ToolTransaction, release func()) {
+	tx = NewToolTransaction(sessionID, o.logger)
+	o.txMu.Lock()
+	o.txMap[sessionID] = tx
+	o.txMu.Unlock()
+	release = func() {
+		o.txMu.Lock()
+		delete(o.txMap, sessionID)
+		o.txMu.Unlock()
+	}
+	return tx, release
+}

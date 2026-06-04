@@ -156,6 +156,15 @@ func (m *Manager) ExecuteWithVolume(ctx context.Context, language, command, host
 		}
 	case status := <-statusCh:
 		exitCode = int(status.StatusCode)
+	case <-ctx.Done():
+		// Caller-side cancellation (interrupt, request abort) must terminate
+		// the wait promptly. The deferred ContainerRemove (force=true) at
+		// :131 still tears down the running container so we don't leak it.
+		return &models.SandboxResult{
+			ExitCode: -1,
+			Stdout:   "sandbox execution cancelled: " + ctx.Err().Error(),
+			Duration: time.Since(startTime),
+		}, ctx.Err()
 	}
 
 	// Collect output

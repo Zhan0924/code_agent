@@ -49,6 +49,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agent/code_agent/internal/auth"
@@ -90,6 +91,13 @@ type Server struct {
 	store         *store.Store                     // 可选 PG 持久化（动态工具等）
 	p0            *P0Probes                       // [P0-debug] 可观测探针（可选）
 	logger        *zap.Logger
+
+	// inflight tracks in-flight chat work that outlives the HTTP handler
+	// scope (notably the detached goroutine in handleChat that keeps the
+	// ReAct loop running after a client disconnect). Drain() waits on this
+	// during shutdown so detached agents finish writing to their sessions
+	// before the process exits.
+	inflight sync.WaitGroup
 }
 
 // Indexer 是仓库索引接口，独立定义以避免 api 包反向依赖 indexer 包。
@@ -181,6 +189,42 @@ func (s *Server) SetIndexer(idx Indexer) {
 // Handler returns the underlying http.Handler for use with custom servers.
 func (s *Server) Handler() http.Handler {
 	return s.router
+}
+
+// trackInflight wraps a function so its execution counts toward the Drain
+// barrier. Use it from chat handlers that spawn detached goroutines (the
+// ReAct loop that survives client disconnect) so that graceful shutdown
+// waits for them. Returns immediately if fn is nil.
+func (s *Server) trackInflight(fn func()) {
+	if fn == nil {
+		return
+	}
+	s.inflight.Add(1)
+	go func() {
+		defer s.inflight.Done()
+		fn()
+	}()
+}
+
+// Drain blocks until all in-flight chat goroutines started via trackInflight
+// have returned, or ctx is cancelled.
+//
+// Intended to run after http.Server.Shutdown so the HTTP layer has already
+// stopped accepting new requests, while the detached ReAct loops (started by
+// handleChat after a client disconnect) get a chance to finish writing their
+// final answer to the session.
+func (s *Server) Drain(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // setupMiddleware configures global middleware with observability and security.

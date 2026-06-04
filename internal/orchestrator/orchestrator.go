@@ -445,15 +445,8 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 	defer o.unregisterInterrupt(task.SessionID)
 
 	// [P2-E2] Register tool transaction for rollback support
-	tx := NewToolTransaction(task.SessionID, o.logger)
-	o.txMu.Lock()
-	o.txMap[task.SessionID] = tx
-	o.txMu.Unlock()
-	defer func() {
-		o.txMu.Lock()
-		delete(o.txMap, task.SessionID)
-		o.txMu.Unlock()
-	}()
+	tx, releaseTx := o.registerTx(task.SessionID)
+	defer releaseTx()
 
 	// Build prompt via PromptBuilder
 	sess, _ := o.sessionMgr.Get(ctx, task.SessionID)
@@ -503,6 +496,7 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		startStep:      0,
 		interruptCh:    interruptCh,
 		responseFormat: task.OutputFormat,
+		tx:             tx,
 	}, noopSink{})
 
 	if result.done {
@@ -843,6 +837,14 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 		interruptCh := o.registerInterrupt(sessionID)
 		defer o.unregisterInterrupt(sessionID)
 
+		// Register a ToolTransaction for the streaming path. Without this,
+		// the o.txMap iteration in CaptureBeforeWrite (orchestrator.go,
+		// preWriteCapture) skipped streaming-path writes entirely, so file
+		// edits from /chat/react-stream could not be rolled back on
+		// interrupt. Mirrors the registration in reactLoop.
+		streamTx, releaseStreamTx := o.registerTx(sessionID)
+		defer releaseStreamTx()
+
 		intent, err := o.parseIntent(ctx, sessionID, userMessage)
 		if err != nil {
 			eventCh <- models.ReactStreamEvent{Type: "error", Content: "Failed to parse intent: " + err.Error()}
@@ -941,6 +943,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 				startStep:      globalStep,
 				interruptCh:    interruptCh,
 				responseFormat: task.OutputFormat,
+				tx:             streamTx,
 			}, sink)
 
 			messages = result.messages
@@ -1402,6 +1405,20 @@ func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*mo
 	// safety check still trips.
 	if !skipHITL(ctx) {
 		if def, ok := o.getToolRiskLevel(tc.Name); ok && def.RiskLevel >= 2 {
+			// Fail-fast if the parent SSE stream is already gone — otherwise
+			// waitToolApproval would block until the user clicks Approve, the
+			// approval would land on an abandoned channel slot, and the ReAct
+			// loop would silently terminate. Returning IsError=true gives the
+			// upper layer a clean cancellation path.
+			if err := ctx.Err(); err != nil {
+				o.logger.Info("high-risk tool aborted: caller cancelled before approval",
+					zap.String("tool", tc.Name), zap.Int("risk_level", def.RiskLevel), zap.Error(err))
+				return &models.ToolResult{
+					ToolCallID: tc.ID,
+					Content:    fmt.Sprintf("⚠️ Tool '%s' aborted: request cancelled (%v) before approval", tc.Name, err),
+					IsError:    true,
+				}, nil
+			}
 			task := taskFromCtx(ctx)
 			sink := sinkFromCtx(ctx)
 			if task != nil && sink != nil {

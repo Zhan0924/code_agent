@@ -41,6 +41,8 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 
 **不变量**：核心 ReAct 循环不走 `tools.Registry.Execute()`，而是走 orchestrator 自己的 switch。修改工具分发时需同时考虑两套机制。
 
+**工具名常量化（2026-06-04 PR 8）**：orchestrator 包内的硬编码工具名字符串（原散落 18 个文件）已收敛到 `internal/orchestrator/tool_names.go::Tool*` 常量，新增内置工具应在该文件登记。跨包硬编码（multiagent / agentloop / planner）仍待迁移，见 `llmdoc/memory/doc-gaps.md::TOOL-NAMES`。
+
 ### 工具元数据中心化（2026-06 重构）
 
 新增内置工具时，**在工具定义上声明行为 metadata bit 即可**，无需手动同步多处白名单。`models.ToolDefinition` 携带四个行为位：

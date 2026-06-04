@@ -6,6 +6,7 @@ package rag
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/agent/code_agent/internal/config"
 	openai "github.com/sashabaranov/go-openai"
@@ -23,7 +24,12 @@ type OpenAIEmbedder struct {
 // NewOpenAIEmbedder creates a new embedder using dedicated RAG embedding credentials.
 // It reads embedding_base_url and embedding_api_key from RAGConfig, falling back
 // to LLM primary config if RAG-specific credentials are not set.
-func NewOpenAIEmbedder(ragCfg *config.RAGConfig, llmFallback *config.LLMProviderConfig, logger *zap.Logger) *OpenAIEmbedder {
+//
+// httpClient should be the process-wide egress-protected client built by
+// security.NewEgressHTTPClient so that embedding traffic is subject to the same
+// SSRF / allow-list policy as LLM and MCP traffic. Passing nil leaves the
+// go-openai SDK on its default transport (kept for tests and backward-compat).
+func NewOpenAIEmbedder(ragCfg *config.RAGConfig, llmFallback *config.LLMProviderConfig, httpClient *http.Client, logger *zap.Logger) *OpenAIEmbedder {
 	// Determine API key: prefer RAG-specific, fallback to LLM primary
 	apiKey := ragCfg.EmbeddingAPIKey
 	if apiKey == "" && llmFallback != nil {
@@ -40,6 +46,9 @@ func NewOpenAIEmbedder(ragCfg *config.RAGConfig, llmFallback *config.LLMProvider
 	if baseURL != "" {
 		clientCfg.BaseURL = baseURL
 	}
+	if httpClient != nil {
+		clientCfg.HTTPClient = httpClient
+	}
 
 	model := ragCfg.EmbeddingModel
 	if model == "" {
@@ -51,6 +60,7 @@ func NewOpenAIEmbedder(ragCfg *config.RAGConfig, llmFallback *config.LLMProvider
 		zap.String("base_url", baseURL),
 		zap.Bool("has_api_key", apiKey != ""),
 		zap.Bool("using_rag_credentials", ragCfg.EmbeddingAPIKey != ""),
+		zap.Bool("egress_client", httpClient != nil),
 	)
 
 	return &OpenAIEmbedder{

@@ -41,10 +41,11 @@ func sinkFromCtx(ctx context.Context) reactEventSink {
 	return v
 }
 
-// toolApprovalTimeout caps how long executeTool blocks waiting for the user.
-// Shorter than the task-level 30 min — tool-level prompts are inline in the
-// chat and the user is usually right there.
-const toolApprovalTimeout = 5 * time.Minute
+// toolApprovalTimeoutDefault caps how long executeTool blocks waiting for the
+// user when no override is configured. Shorter than the task-level 30 min —
+// tool-level prompts are inline in the chat and the user is usually right there.
+// Overridable via security.tool_approval_timeout in config.
+const toolApprovalTimeoutDefault = 5 * time.Minute
 
 // riskLabel maps numeric RiskLevel to the string the frontend already renders.
 func riskLabel(level int) string {
@@ -126,7 +127,12 @@ func (o *Orchestrator) waitToolApproval(
 		zap.String("tool", tc.Name),
 		zap.Int("risk_level", rl))
 
-	waitCtx, cancel := context.WithTimeout(ctx, toolApprovalTimeout)
+	timeout := o.toolApprovalTimeout()
+	// Use a fresh background-derived timeout context so we can distinguish
+	// "user took too long" (timeoutCtx.Done()) from "the request stream went
+	// away" (ctx.Done()) — the two cases want different telemetry and a
+	// different message back to the LLM.
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	select {
@@ -137,8 +143,30 @@ func (o *Orchestrator) waitToolApproval(
 			metrics.HITLApprovalTotal.WithLabelValues("rejected").Inc()
 		}
 		return resp.Approved, nil
-	case <-waitCtx.Done():
+	case <-ctx.Done():
+		// Caller (SSE handler) cancelled — bail out fast instead of holding
+		// the slot until timeout. Mark the request as cancelled in telemetry
+		// and tell the front-end the approval prompt is no longer actionable.
+		metrics.HITLApprovalTotal.WithLabelValues("cancelled").Inc()
+		sink.Emit(models.ReactStreamEvent{
+			Type:       "approval_cancelled",
+			Content:    fmt.Sprintf("Approval for '%s' cancelled: %v", tc.Name, ctx.Err()),
+			ToolName:   tc.Name,
+			ToolCallID: tc.ID,
+			TaskID:     task.ID,
+		})
+		return false, fmt.Errorf("approval cancelled: %w", ctx.Err())
+	case <-timeoutCtx.Done():
 		metrics.HITLApprovalTotal.WithLabelValues("timeout").Inc()
-		return false, fmt.Errorf("approval timed out after %s", toolApprovalTimeout)
+		return false, fmt.Errorf("approval timed out after %s", timeout)
 	}
+}
+
+// toolApprovalTimeout returns the configured approval timeout, falling back to
+// the historical 5-minute default when unset (security.tool_approval_timeout).
+func (o *Orchestrator) toolApprovalTimeout() time.Duration {
+	if o.securityCfg != nil && o.securityCfg.ToolApprovalTimeout > 0 {
+		return o.securityCfg.ToolApprovalTimeout
+	}
+	return toolApprovalTimeoutDefault
 }

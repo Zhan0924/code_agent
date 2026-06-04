@@ -24,7 +24,7 @@ import (
 func gitToolDefinitions() []models.ToolDefinition {
 	return []models.ToolDefinition{
 		{
-			Name:        "git_status",
+			Name:        ToolGitStatus,
 			Description: "Show the working tree status of the workspace (staged, unstaged, untracked files).",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -37,7 +37,7 @@ func gitToolDefinitions() []models.ToolDefinition {
 			IsIdempotentRead: true,
 		},
 		{
-			Name:        "git_diff",
+			Name:        ToolGitDiff,
 			Description: "Show changes between the working tree and the index (unstaged changes), or between commits.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -52,7 +52,7 @@ func gitToolDefinitions() []models.ToolDefinition {
 			IsIdempotentRead: true,
 		},
 		{
-			Name:        "git_commit",
+			Name:        ToolGitCommit,
 			Description: "Stage all changes and create a git commit with the given message. Use this after making code changes to save progress.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -68,7 +68,7 @@ func gitToolDefinitions() []models.ToolDefinition {
 			InvalidatesCache: true,
 		},
 		{
-			Name:        "git_log",
+			Name:        ToolGitLog,
 			Description: "Show recent git commit history.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -82,7 +82,7 @@ func gitToolDefinitions() []models.ToolDefinition {
 			IsIdempotentRead: true,
 		},
 		{
-			Name:        "git_branch",
+			Name:        ToolGitBranch,
 			Description: "Create or switch to a git branch.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -299,15 +299,15 @@ func (o *Orchestrator) executeGitTool(ctx context.Context, tc models.ToolCall) (
 	var err error
 
 	switch tc.Name {
-	case "git_status":
+	case ToolGitStatus:
 		output, err = o.toolGitStatus(ctx, ws, tc.Args)
-	case "git_diff":
+	case ToolGitDiff:
 		output, err = o.toolGitDiff(ctx, ws, tc.Args)
-	case "git_commit":
+	case ToolGitCommit:
 		output, err = o.toolGitCommit(ctx, ws, tc.Args)
-	case "git_log":
+	case ToolGitLog:
 		output, err = o.toolGitLog(ctx, ws, tc.Args)
-	case "git_branch":
+	case ToolGitBranch:
 		output, err = o.toolGitBranch(ctx, ws, tc.Args)
 	default:
 		return &models.ToolResult{Content: fmt.Sprintf("Unknown git tool: %s", tc.Name), IsError: true}, nil

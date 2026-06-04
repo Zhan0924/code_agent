@@ -160,6 +160,13 @@ func (m *Manager) WriteFile(ws *Workspace, relPath, content string) error {
 	if err != nil {
 		return err
 	}
+	// Defense-in-depth: refuse to overwrite an existing directory. safePath
+	// already rejects "" and ".", but a relative path like "subdir" pointing
+	// at an existing directory would still slip through and fail with EISDIR
+	// deep inside os.WriteFile.
+	if info, statErr := os.Stat(absPath); statErr == nil && info.IsDir() {
+		return fmt.Errorf("refusing to write: %q is an existing directory", relPath)
+	}
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return fmt.Errorf("create parent dirs for %s: %w", relPath, err)
@@ -320,10 +327,24 @@ func (m *Manager) Cleanup(id string) error {
 
 // safePath resolves a relative path within the workspace and prevents path traversal.
 func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
+	// Reject empty or whitespace-only paths. filepath.Clean("") returns ".",
+	// which would resolve to ws.RootDir itself — callers like WriteFile would
+	// then try to open the workspace directory as a file (EISDIR).
+	if strings.TrimSpace(relPath) == "" {
+		return "", fmt.Errorf("empty path not allowed")
+	}
+
 	// Clean and normalize
 	cleaned := filepath.Clean(relPath)
 	if filepath.IsAbs(cleaned) {
 		return "", fmt.Errorf("absolute paths not allowed: %s", relPath)
+	}
+
+	// Reject paths that resolve to the workspace root itself (e.g. ".", "./",
+	// "foo/.."). These would let WriteFile/ReadFile target the directory node
+	// rather than a file inside it.
+	if cleaned == "." {
+		return "", fmt.Errorf("path must reference a file inside the workspace, not the workspace root: %q", relPath)
 	}
 
 	// Construct initial path

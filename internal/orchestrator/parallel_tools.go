@@ -29,6 +29,14 @@ func canParallelExecute(toolCalls []models.ToolCall) bool {
 }
 
 // parallelExecuteTools runs all tool calls concurrently and returns results in original order.
+//
+// Cancellation: previously wg.Wait was bare, so a hung worker (e.g., a slow
+// RAG retrieval inside a read_file call) would pin the loop even after the
+// caller's ctx was cancelled. Now wg.Wait races against ctx.Done — when ctx
+// is cancelled we return immediately with whatever results already landed.
+// Late-arriving goroutines still write into their own index slot (per-index
+// slot isolation makes the late write race-free), but the caller has already
+// taken its copy of `results` and moved on.
 func (o *Orchestrator) parallelExecuteTools(ctx context.Context, toolCalls []models.ToolCall) []toolExecResult {
 	results := make([]toolExecResult, len(toolCalls))
 	var wg sync.WaitGroup
@@ -47,6 +55,18 @@ func (o *Orchestrator) parallelExecuteTools(ctx context.Context, toolCalls []mod
 		}(i, tc)
 	}
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Caller cancelled; surface whatever has already completed. Empty
+		// slots stay zero-valued (ToolCall name empty), and the calling
+		// loop in react_core treats those as a no-op rather than feeding
+		// half-finished tool output back to the LLM.
+	}
 	return results
 }

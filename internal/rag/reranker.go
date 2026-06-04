@@ -52,16 +52,26 @@ type APIReranker struct {
 }
 
 // NewAPIReranker creates a reranker backed by an HTTP API.
-func NewAPIReranker(cfg *config.RAGConfig, logger *zap.Logger) *APIReranker {
+//
+// httpClient should be the process-wide egress-protected client built by
+// security.NewEgressHTTPClient so that rerank traffic is subject to the same
+// SSRF / allow-list policy as LLM and MCP traffic. Passing nil falls back to a
+// plain client with a 30s timeout (kept for tests and backward-compat callers).
+func NewAPIReranker(cfg *config.RAGConfig, httpClient *http.Client, logger *zap.Logger) *APIReranker {
 	logger.Info("reranker initialized",
 		zap.String("model", cfg.RerankModel),
 		zap.String("base_url", cfg.RerankBaseURL),
+		zap.Bool("egress_client", httpClient != nil),
 	)
+	client := httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
 	return &APIReranker{
 		baseURL: cfg.RerankBaseURL,
 		apiKey:  cfg.RerankAPIKey,
 		model:   cfg.RerankModel,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  client,
 		logger:  logger.With(zap.String("component", "reranker")),
 	}
 }

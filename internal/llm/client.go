@@ -321,6 +321,15 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req *ChatRequest) (<-
 		return result.(<-chan StreamChunk), nil
 	}
 
+	// Symmetric with the non-streaming path at :238-239: a streaming setup
+	// failure (primary.ChatCompletionStream returning an error before any
+	// chunk is delivered) must increment the shared counter so siblings can
+	// also trip. Without this, streaming traffic silently absorbed all
+	// failures while only non-streaming traffic ever opened the breaker.
+	if c.sharedBreaker != nil {
+		c.sharedBreaker.RecordFailure(ctx, provider)
+	}
+
 	c.logger.Warn("primary LLM stream failed, attempting fallback",
 		zap.String("primary", c.primary.Name()),
 		zap.Error(err),

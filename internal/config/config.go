@@ -47,6 +47,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -262,10 +263,11 @@ type SessionConfig struct {
 
 // SecurityConfig holds security rule settings.
 type SecurityConfig struct {
-	SensitivePatterns       []string `mapstructure:"sensitive_patterns"`
-	RequireApprovalCommands []string `mapstructure:"require_approval_commands"`
-	EgressEnabled           bool     `mapstructure:"egress_enabled"`
-	EgressAllowedHosts      []string `mapstructure:"egress_allowed_hosts"`
+	SensitivePatterns       []string      `mapstructure:"sensitive_patterns"`
+	RequireApprovalCommands []string      `mapstructure:"require_approval_commands"`
+	EgressEnabled           bool          `mapstructure:"egress_enabled"`
+	EgressAllowedHosts      []string      `mapstructure:"egress_allowed_hosts"`
+	ToolApprovalTimeout     time.Duration `mapstructure:"tool_approval_timeout"` // 0 = use default (5 min)
 }
 
 // LoggingConfig holds logging settings.
@@ -368,40 +370,67 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// Expand environment variables in fields that commonly reference
-	// secrets via ${VAR}. The list must cover every string field whose YAML
-	// value may contain ${...} — forgetting one means the literal ${VAR}
-	// string is silently passed downstream (we hit this once with
-	// RAG.EmbeddingBaseURL: the embedder tried to POST to the literal
-	// unexpanded URL and the index failed for every file).
-	cfg.LLM.Primary.APIKey = expandEnv(cfg.LLM.Primary.APIKey)
-	cfg.LLM.Primary.BaseURL = expandEnv(cfg.LLM.Primary.BaseURL)
-	cfg.LLM.Fallback.APIKey = expandEnv(cfg.LLM.Fallback.APIKey)
-	cfg.LLM.Fallback.BaseURL = expandEnv(cfg.LLM.Fallback.BaseURL)
-	cfg.RAG.EmbeddingBaseURL = expandEnv(cfg.RAG.EmbeddingBaseURL)
-	cfg.RAG.EmbeddingAPIKey = expandEnv(cfg.RAG.EmbeddingAPIKey)
-	cfg.RAG.RerankBaseURL = expandEnv(cfg.RAG.RerankBaseURL)
-	cfg.RAG.RerankAPIKey = expandEnv(cfg.RAG.RerankAPIKey)
-	cfg.Redis.Addr = expandEnv(cfg.Redis.Addr)
-	cfg.Redis.Password = expandEnv(cfg.Redis.Password)
-	cfg.Postgres.DSN = expandEnv(cfg.Postgres.DSN)
-	cfg.Qdrant.Addr = expandEnv(cfg.Qdrant.Addr)
-	cfg.Temporal.Host = expandEnv(cfg.Temporal.Host)
-	cfg.Auth.JWTSecret = expandEnv(cfg.Auth.JWTSecret)
-	cfg.Tracing.Endpoint = expandEnv(cfg.Tracing.Endpoint)
-
-	for i := range cfg.MCP.Servers {
-		cfg.MCP.Servers[i].URL = expandEnv(cfg.MCP.Servers[i].URL)
-		cfg.MCP.Servers[i].Command = expandEnv(cfg.MCP.Servers[i].Command)
-		for j, arg := range cfg.MCP.Servers[i].Args {
-			cfg.MCP.Servers[i].Args[j] = expandEnv(arg)
-		}
-		for k, val := range cfg.MCP.Servers[i].Env {
-			cfg.MCP.Servers[i].Env[k] = expandEnv(val)
-		}
-	}
+	// Recursively walk the config tree and expand ${VAR} in every string
+	// field — replaces the prior 18-line manual list that silently dropped
+	// any field a contributor forgot to add (we hit this once with
+	// RAG.EmbeddingBaseURL: the embedder POSTed to the literal unexpanded
+	// URL and the index failed for every file). Opt-out per field via
+	// `env_expand:"false"` struct tag.
+	walkExpandEnv(reflect.ValueOf(&cfg).Elem())
 
 	return &cfg, nil
+}
+
+// walkExpandEnv recursively applies expandEnv to every string field of v.
+// It descends into struct values, slices of structs, and string maps, and
+// honours the `env_expand:"false"` struct tag as an opt-out so a field that
+// happens to contain a literal "${...}" stays unexpanded.
+//
+// Implementation notes:
+//   - Only handles the kinds the config tree actually uses (struct, slice,
+//     map[string]string, string). Anything else is left alone.
+//   - Maps are mutated via SetMapIndex because map values are not
+//     addressable in reflect.
+//   - Slices of strings get each element expanded; slices of struct elements
+//     are recursed into per-index so MCP.Servers[i].Args[] works.
+func walkExpandEnv(v reflect.Value) {
+	switch v.Kind() {
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			field := t.Field(i)
+			if !field.IsExported() {
+				continue
+			}
+			if tag := field.Tag.Get("env_expand"); tag == "false" {
+				continue
+			}
+			walkExpandEnv(v.Field(i))
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			walkExpandEnv(v.Index(i))
+		}
+	case reflect.Map:
+		// Only handle string-keyed string maps (e.g. MCPServerConfig.Env).
+		// Other map kinds are not used in the config tree.
+		if v.Type().Key().Kind() == reflect.String && v.Type().Elem().Kind() == reflect.String {
+			for _, key := range v.MapKeys() {
+				val := v.MapIndex(key).String()
+				v.SetMapIndex(key, reflect.ValueOf(expandEnv(val)))
+			}
+		}
+	case reflect.Ptr:
+		if !v.IsNil() {
+			walkExpandEnv(v.Elem())
+		}
+	case reflect.String:
+		if v.CanSet() {
+			v.SetString(expandEnv(v.String()))
+		}
+	default:
+		// Other kinds (bool, int, float, etc.) are not expansion targets.
+	}
 }
 
 // expandEnv expands ${VAR} patterns via os.ExpandEnv. When the referenced

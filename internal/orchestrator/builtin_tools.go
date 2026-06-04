@@ -35,7 +35,7 @@ func (o *Orchestrator) RegisterBuiltinTools(reg *tools.Registry) error {
 		handler     func(context.Context, json.RawMessage) (*models.ToolResult, error)
 	}{
 		{
-			name:        "execute_code",
+			name:        ToolExecuteCode,
 			description: "Execute code in a sandboxed Docker container. Returns stdout, stderr, and exit code.",
 			params:      json.RawMessage(`{"type":"object","properties":{"language":{"type":"string","enum":["python","go","bash","node"],"description":"Programming language"},"code":{"type":"string","description":"Code to execute"}},"required":["language","code"]}`),
 			handler:     o.toolExecuteCode,
@@ -74,15 +74,15 @@ func (o *Orchestrator) RegisterFileTools(reg *tools.Registry) error {
 	// File tools
 	fileDefs := fileToolDefinitions()
 	fileHandlers := map[string]func(context.Context, json.RawMessage) (*models.ToolResult, error){
-		"read_file":         o.toolReadFile,
-		"write_file":        o.toolWriteFile,
-		"patch_file":        o.toolPatchFile,
-		"edit_file":         o.toolEditFile,
-		"apply_diff":        o.toolApplyDiff,
-		"list_files":        o.toolListFiles,
-		"create_directory":  o.toolCreateDirectory,
-		"run_tests":         o.toolRunTests,
-		"run_workspace_cmd": o.toolRunWorkspaceCmd,
+		ToolReadFile:        o.toolReadFile,
+		ToolWriteFile:       o.toolWriteFile,
+		ToolPatchFile:       o.toolPatchFile,
+		ToolEditFile:        o.toolEditFile,
+		ToolApplyDiff:       o.toolApplyDiff,
+		ToolListFiles:       o.toolListFiles,
+		ToolCreateDirectory: o.toolCreateDirectory,
+		ToolRunTests:        o.toolRunTests,
+		ToolRunWorkspaceCmd: o.toolRunWorkspaceCmd,
 	}
 
 	for _, def := range fileDefs {

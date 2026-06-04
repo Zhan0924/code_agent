@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/agent/code_agent/internal/models"
@@ -164,6 +165,41 @@ func TestRegistry_Execute_NotFound(t *testing.T) {
 	_, err := r.Execute(context.Background(), "missing", nil)
 	if !errors.Is(err, ErrToolNotFound) {
 		t.Errorf("err = %v, want ErrToolNotFound", err)
+	}
+}
+
+// TestRegistry_Execute_NotFound_SuggestsAlternatives guards the LLM-self-correct
+// path: when the model hallucinates a tool name, the error must include the
+// closest registered names so the next turn can recover instead of looping.
+func TestRegistry_Execute_NotFound_SuggestsAlternatives(t *testing.T) {
+	r := NewRegistry()
+	for _, name := range []string{"run_workspace_cmd", "run_tests", "read_file", "write_file", "git_diff"} {
+		_ = r.Register(newStub(name, "builtin"))
+	}
+
+	// Hallucinated `shell_exec` — should surface run_workspace_cmd / run_tests
+	// (both share the "exec/run" semantic via the substring/token match).
+	_, err := r.Execute(context.Background(), "shell_exec", nil)
+	if !errors.Is(err, ErrToolNotFound) {
+		t.Fatalf("err = %v, want ErrToolNotFound", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Did you mean") {
+		t.Errorf("error should hint at alternatives, got: %s", msg)
+	}
+	if !strings.Contains(msg, "5 tools registered total") {
+		t.Errorf("error should advertise the total registered count, got: %s", msg)
+	}
+	// Semantic aliases must rank run_workspace_cmd / run_tests ahead of unrelated
+	// alphabetical neighbours like git_diff / read_file when the query is shell_exec.
+	if !strings.Contains(msg, "run_workspace_cmd") {
+		t.Errorf("expected run_workspace_cmd in suggestions for shell_exec, got: %s", msg)
+	}
+	// And the ordering inside the bracket: run_workspace_cmd must appear before git_diff.
+	rwc := strings.Index(msg, "run_workspace_cmd")
+	gd := strings.Index(msg, "git_diff")
+	if rwc < 0 || (gd >= 0 && rwc > gd) {
+		t.Errorf("run_workspace_cmd must rank ahead of git_diff for shell_exec, got: %s", msg)
 	}
 }
 

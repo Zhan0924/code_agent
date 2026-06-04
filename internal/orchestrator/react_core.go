@@ -41,6 +41,11 @@ type reactCoreOpts struct {
 	startStep      int // for auto-continue: the global step offset
 	interruptCh    chan InterruptSignal
 	responseFormat *models.ResponseFormat
+	// tx is the per-session ToolTransaction that captures file
+	// modifications. When an interrupt arrives at a step boundary, the loop
+	// calls tx.Rollback() to restore dirty files to their pre-step state.
+	// nil disables rollback (used by callers that don't write files).
+	tx *ToolTransaction
 }
 
 // reactCoreResult holds the outcome of a single batch of ReAct steps.
@@ -64,6 +69,36 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	// (multiagent / planner) build their own ctx and won't pick it up.
 	ctx = withToolApprovalContext(ctx, opts.task, sink)
 	messages := opts.messages
+
+	// execCtx is a tool-execution context derived from ctx that the interrupt
+	// watchdog can cancel mid-tool. Previously the interrupt signal was only
+	// observed at step boundaries, so a long-running shell_exec / sandbox.Run
+	// continued until natural completion even after the user cancelled.
+	//
+	// Wire: watchdog reads one signal from opts.interruptCh, cancels execCtx
+	// on Cancel/Pause, then re-injects the signal so the step-boundary select
+	// at line ~114 also sees it (and can roll the ToolTransaction back). The
+	// re-inject is non-blocking — the channel is buffered=1 and the boundary
+	// reader either already consumed it (success) or is about to (we lose the
+	// race but execCtx is cancelled so the next boundary check still trips on
+	// ctx.Done via the toolCtx of executeTool).
+	execCtx, execCancel := context.WithCancel(ctx)
+	defer execCancel()
+	if opts.interruptCh != nil {
+		go func() {
+			select {
+			case sig := <-opts.interruptCh:
+				if sig.Type == InterruptCancel || sig.Type == InterruptPause {
+					execCancel()
+				}
+				select {
+				case opts.interruptCh <- sig:
+				default:
+				}
+			case <-execCtx.Done():
+			}
+		}()
+	}
 
 	failTracker := &consecutiveFailureTracker{}
 	adaptiveFB := &agentloop.AdaptiveFeedback{}
@@ -102,12 +137,25 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		default:
 		}
 
-		// Check interrupt
+		// Check interrupt. Cancel and Pause both terminate the current step
+		// run; on either, roll back any files touched during this step batch
+		// so the user sees a clean tree. Redirect signals are not handled at
+		// this layer yet (handlers pass them through, no Rollback semantics).
 		if opts.interruptCh != nil {
 			select {
 			case sig := <-opts.interruptCh:
-				sink.Emit(models.ReactStreamEvent{Type: "message", Content: fmt.Sprintf("Task interrupted (%s).", sig.Type)})
-				return reactCoreResult{content: fmt.Sprintf("Task interrupted (%s).", sig.Type), messages: messages, stepsUsed: step, done: true}
+				content := fmt.Sprintf("Task interrupted (%s).", sig.Type)
+				if (sig.Type == InterruptCancel || sig.Type == InterruptPause) && opts.tx != nil && opts.tx.HasDirtyFiles() {
+					n, errs := opts.tx.Rollback()
+					o.logger.Info("rolled back tool transaction on interrupt",
+						zap.String("session_id", opts.task.SessionID),
+						zap.String("interrupt_type", string(sig.Type)),
+						zap.Int("files_rolled", n),
+						zap.Int("rollback_errors", len(errs)))
+					content = fmt.Sprintf("Task %s by user. Rolled back %d file(s).", sig.Type, n)
+				}
+				sink.Emit(models.ReactStreamEvent{Type: "message", Content: content})
+				return reactCoreResult{content: content, messages: messages, stepsUsed: step, done: true}
 			default:
 			}
 		}
@@ -178,6 +226,15 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			if llmErr == nil {
 				break
 			}
+			// Skip the backoff loop on deterministic errors (auth, malformed
+			// request, hard quota). Retrying them only wastes the 2^n backoff
+			// budget without any chance of success. See internal/llm/retryable.go
+			// for the full classification matrix.
+			if !llm.IsRetryable(llmErr) {
+				o.logger.Warn("LLM call failed (non-retryable), giving up",
+					zap.Int("attempt", attempt+1), zap.Error(llmErr))
+				break
+			}
 			o.logger.Warn("LLM call failed, retrying", zap.Int("attempt", attempt+1), zap.Error(llmErr))
 			if attempt < 2 {
 				select {
@@ -244,10 +301,20 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		var processed []processedResult
 
 		if canParallelExecute(resp.ToolCalls) {
-			// All tools are idempotent — execute concurrently
-			parallelResults := o.parallelExecuteTools(ctx, resp.ToolCalls)
+			// All tools are idempotent — execute concurrently. Pass execCtx
+			// so cancel/pause cuts hung workers, not just step boundaries.
+			parallelResults := o.parallelExecuteTools(execCtx, resp.ToolCalls)
 			for _, pr := range parallelResults {
-				content := pr.result.Content
+				// parallelExecuteTools may return zero-valued slots if execCtx
+				// was cancelled before that worker finished. Skip those —
+				// feeding empty tool results back to the LLM would confuse it.
+				if pr.tc.Name == "" {
+					continue
+				}
+				var content string
+				if pr.result != nil {
+					content = pr.result.Content
+				}
 				if pr.execErr != nil {
 					content = fmt.Sprintf("Error: %v", pr.execErr)
 				}
@@ -257,8 +324,21 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		} else {
 			// Sequential execution for write tools or single calls
 			for _, tc := range resp.ToolCalls {
+				// Step-internal interrupt gate: when a step has N tool calls
+				// and a cancel arrives between call 1 and call 2, we want to
+				// stop without firing call 2. Before this check, the for loop
+				// ran to completion and only the next step-boundary select
+				// noticed the cancellation.
+				select {
+				case <-execCtx.Done():
+					o.logger.Info("tool batch cancelled mid-sequence", zap.String("session_id", opts.task.SessionID))
+				default:
+				}
+				if execCtx.Err() != nil {
+					break
+				}
 				// Inject progress callback so long-running tools can stream output
-				toolCtx := WithProgressCallback(ctx, func(chunk string) {
+				toolCtx := WithProgressCallback(execCtx, func(chunk string) {
 					sink.Emit(models.ReactStreamEvent{
 						Type:       "tool_progress",
 						Step:       globalStep,
@@ -345,6 +425,24 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			}
 			lastToolName = pr.tc.Name
 			toolSequence = append(toolSequence, pr.tc.Name)
+
+			// Hard abort: the step-back prompt was already injected at the
+			// warn threshold; if the tool keeps failing past the abort
+			// threshold the LLM is clearly stuck (hallucinated tool name,
+			// non-existent file, broken env) — bail out instead of letting
+			// max_steps auto-expand and burn the whole budget.
+			if failTracker.shouldAbort() {
+				o.logger.Warn("fix loop hard abort",
+					zap.String("tool", pr.tc.Name),
+					zap.Int("failures", failTracker.failCount),
+					zap.Int("step", globalStep))
+				sink.Emit(models.ReactStreamEvent{
+					Type:    "fix_loop_abort",
+					Step:    globalStep,
+					Content: fmt.Sprintf("ReAct loop aborted: tool '%s' failed %d times in a row.", pr.tc.Name, failTracker.failCount),
+				})
+				return reactCoreResult{messages: messages, stepsUsed: step + 1, hitStepLimit: false}
+			}
 		}
 
 		// Auto-test after file edits

@@ -27,3 +27,9 @@ func (t *consecutiveFailureTracker) stepBackMessage() models.Message {
 	}
 	return tracker.StepBackMessage()
 }
+
+// shouldAbort reports whether the same tool has failed past the hard-stop
+// threshold and the ReAct loop must bail out (see agentloop.FixLoopAbortThreshold).
+func (t *consecutiveFailureTracker) shouldAbort() bool {
+	return t.failCount >= agentloop.FixLoopAbortThreshold
+}

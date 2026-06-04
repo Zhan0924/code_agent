@@ -142,10 +142,14 @@ func (s *Server) handleChat(c *gin.Context) {
 	}
 	resultCh := make(chan chatResult, 1)
 
-	go func() {
+	// trackInflight registers this goroutine with the Server's shutdown
+	// barrier. Without this, a SIGTERM mid-chat would tear the process down
+	// while the goroutine was still talking to the LLM, abandoning the
+	// session write.
+	s.trackInflight(func() {
 		resp, err := s.orchestrator.ProcessMessage(agentCtx, sessionID, req.Message, orchestrator.ProcessOptions{OutputFormat: req.OutputFormat})
 		resultCh <- chatResult{resp: resp, err: err}
-	}()
+	})
 
 	// Wait for either: agent completes, or client disconnects
 	select {

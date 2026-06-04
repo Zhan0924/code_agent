@@ -155,6 +155,47 @@ func TestSafePath_TraversalBlocked(t *testing.T) {
 	}
 }
 
+// TestSafePath_EmptyOrRootRejected guards against the EISDIR bug where an
+// empty or "." path resolved to ws.RootDir itself, causing os.WriteFile to
+// fail with "is a directory" deep in the stack with an unhelpful message.
+func TestSafePath_EmptyOrRootRejected(t *testing.T) {
+	m := newTestManager(t)
+	ws, err := m.CreateForSession("ws-empty", "sess-empty", "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []string{"", " ", ".", "./", "foo/.."}
+	for _, p := range cases {
+		if err := m.WriteFile(ws, p, "x"); err == nil {
+			t.Errorf("WriteFile(%q) expected error, got nil", p)
+		}
+		if _, err := m.ReadFile(ws, p); err == nil {
+			t.Errorf("ReadFile(%q) expected error, got nil", p)
+		}
+	}
+}
+
+// TestWriteFile_RejectExistingDir verifies the defense-in-depth check that
+// refuses to overwrite an existing directory with file contents.
+func TestWriteFile_RejectExistingDir(t *testing.T) {
+	m := newTestManager(t)
+	ws, err := m.CreateForSession("ws-dir", "sess-dir", "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MkdirAll(ws, "subdir"); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	err = m.WriteFile(ws, "subdir", "content")
+	if err == nil {
+		t.Fatal("expected error when writing to a path that is an existing directory")
+	}
+	if !strings.Contains(err.Error(), "existing directory") {
+		t.Errorf("expected 'existing directory' in error, got: %v", err)
+	}
+}
+
 func TestDeleteFile(t *testing.T) {
 	m := newTestManager(t)
 	ws, err := m.CreateForSession("ws-del", "sess-del", "proj")

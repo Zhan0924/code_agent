@@ -3,6 +3,8 @@
 已知的文档不足和需要未来调查的领域。
 
 > **2026-06-01 边界澄清**：本文同时记录**跨包缺口**与**死代码 / 接线缺失**两类条目。`docs/architecture/NN_*.md` 各篇的"已知缺陷一览"自 2026-06-01 起按包独立维护并带 file:line。**两份清单暂时并存**，当包级缺陷一览覆盖某项后，应回头清理这里对应条目，避免双源不同步。下方表格的"包级文档"列指明最新权威来源。
+>
+> **2026-06-03 二次复核**：对 `30_recent_improvements.md::F 节 P1 待办` 与本文跨包缺口做了**逐项代码核查**，确认 4 项已修复未同步、2 项半接线、6 项仍属实。详见文末"## 2026-06-03 二次复核摘要"。
 
 ## 死代码 — 已实现未接线（与包级文档双源）
 
@@ -50,14 +52,14 @@
 | `testing.Short()` 未实现 | `make test-short` 存在但零个测试文件检查该标志 |
 | 配置验证缺口 | 不验证：RAG 嵌入 URL（当 provider=openai）、Temporal.Host 格式、敏感模式正则可编译性、Tracing.Endpoint 格式 |
 
-## Token 估算不一致
+## Token 估算（2026-06-03 已统一）
 
-两个不同精度的估算器：
+历史上存在双估算器（`session` 用 `len/4+1`，`llm` 用 rune 分类）。**当前代码两者已收敛**：
 
-- `internal/llm/client.go` (`EstimateTokens`) — rune 分类，CJK 准确
-- `internal/session/manager.go` (`estimateTokens`) — `len/4+1`，CJK 低估 ~3x
-
-Session 层使用低精度版本，可能导致上下文窗口管理偏差。
+- `internal/llm/client.go:337` `EstimateTokens` → `llm.FastEstimate`
+- `internal/session/manager.go:540` `estimateTokens` → `llm.FastEstimate`
+- 精确路径：`internal/llm/tokenizer.go:71` `ExactTokenCount` 用 tiktoken-go（`pkoukk/tiktoken-go`），`orchestrator/react_core.go:155` 已使用
+- 原 `30_recent_improvements.md::F 节` "P1-tiktoken 用 tiktoken-go 替换启发式 EstimateTokens" 待办**已完成**，需从该清单移除
 
 ## 流程缺口
 
@@ -90,6 +92,54 @@ Session 层使用低精度版本，可能导致上下文窗口管理偏差。
 ## 与 `docs/architecture/` 的协同
 
 `docs/architecture/NN_*.md` 中 00–28（29 篇）含"已知缺陷一览"，按文档分别维护 P0/P1/P2 条目，带 file:line。修改单个包前应**优先看包级缺陷一览**；本文件用于：
-1. **跨包缺口**（如 macOS CI matrix、双估算器 token 不一致）—— 不归任何单包
+1. **跨包缺口**（如 macOS CI matrix、工具名清单分散在 18 文件）—— 不归任何单包
 2. **前端缺口** —— `docs/architecture/` 仅覆盖后端
 3. **过渡期双源**：上方"死代码"表中条目同时存在于本文件与包级文档；两者一致前以**代码 + 包级文档**为准
+
+---
+
+## 2026-06-03 二次复核摘要
+
+对 `30_recent_improvements.md::F 节 P1 待办` 与跨包缺口逐项 grep+Read 核查。**`30_recent_improvements.md` 自身 F 节需同步删除已完成项**。
+
+### A. 已完成、文档需移除
+
+| 原待办 | 实际接线点 |
+|---|---|
+| P1-Redis-RL-wire | `internal/api/router.go:188-195` Redis 可用时走 `auth.NewRedisRateLimiter`，否则 fallback in-memory；生产 Redis 强依赖 |
+| P1-tiktoken | `internal/llm/tokenizer.go:39` import `pkoukk/tiktoken-go`，`ExactTokenCount` 已被 `react_core.go:155` 使用 |
+| 双 Token 估算器 | `session/manager.go:540` 与 `llm/client.go:337` 均委托 `llm.FastEstimate`，`len/4+1` 在 session 中已不存在 |
+
+### B. 部分完成、需更新表述
+
+| 原待办 | 实际状态 | 剩余工作 |
+|---|---|---|
+| P1-Egress-wire | LLM ✅ `main.go:165`；MCP ✅ `main.go:337-341`；Reranker ❌ `rag/reranker.go:64` 仍裸 `http.Client`；Embedder ❌ `rag/embedder.go:57` 用默认 openai client | 把 egress transport 注入 reranker / embedder |
+| P1-Streaming-breaker | `client.go:302` 流式入口已 `sharedBreaker.Allow()`，但**未在流式失败路径调 `RecordFailure`**（非流式在 `client.go:238-239` 有调）| 流式错误路径补 `sharedBreaker.RecordFailure` |
+
+### C. 仍属实、待修复（带 file:line）
+
+| 编号 | 现象 | 位置 |
+|---|---|---|
+| ORC-1 | `ToolTransaction.Rollback` 定义但零生产调用方；`checkInterrupt` cancel 分支只返回字符串，未触达 `tx.Rollback()` | `orchestrator/tool_transaction.go:67-69`、`orchestrator/interrupt.go:62-89` |
+| ORC-2 | `parallelExecuteTools` 裸 `wg.Wait()` 不 select ctx。**但**：`canParallelExecute` 仅允许 `IsIdempotentTool`，`shell_exec`/`run_tests` 走顺序 `executeTool`，cancel 失灵的根因是工具内部不 select ctx | `orchestrator/parallel_tools.go:50` + `executeTool` 各分支 |
+| ORC-3 | `react_core.go:171-184` 3 次 `2^n` 退避，无 `IsRetryable` 判断；401/400/quota 一律重试 | `orchestrator/react_core.go:171-184` |
+| P1-shutdown-drain | `handlers.go:135` `agentCtx = context.Background()`，client disconnect 分支显式不 cancel；`main.go:748-767` shutdown 仅 `httpServer.Shutdown`，无 `sync.WaitGroup` 等 detached goroutine | `api/handlers.go:130-168` + `cmd/agent/main.go:748-767` |
+| CFG-EXPAND | `config.go:377-397` 手工逐字段 `expandEnv`（18 字段 + MCP 循环），新字段需人工登记，无反射/编译期检查 | `internal/config/config.go:377-397` |
+| TOOL-NAMES | 硬编码工具名字符串散落 **18 个 .go 文件**（远超 working-agreement.md 记录的 9 处），`tool_metadata` 只统一行为 bit、未统一名称清单 | 详见 `rg --count 'apply_diff\|read_file\|write_file' --type go -g '!*_test.go' -g '!_principles.go'` |
+| HITL-INPROC-LOSS | In-process HITL 回退通道在以下任一场景下导致 approval 返回 `404 no pending approval`：(a) 进程在 suspend 与 approve 之间重启；(b) `approvalCh[taskID]` 30 分钟超时清理后；(c) 前端用过期 taskID。Temporal 路径不受影响。修复方向待定（Redis 持久化 / 状态机恢复 / 强制 Temporal） | `orchestrator/orchestrator.go:659-718`（suspend + 30min cleanup）+ `orchestrator/orchestrator.go:751-757`（404 lookup） |
+
+### D. 论述偏差（举例不准确，底层问题仍在）
+
+| 论述 | 修正 |
+|---|---|
+| "long-running shell_exec / run_tests 无视 parallel cancel" | `shell_exec`/`run_tests` 非幂等，**不走 parallel 路径**；cancel 失灵的真正根因是这些工具内部不 select ctx |
+| "go.mod 1.25 vs golangci 1.22 vs CI 1.22 三处分歧" | `.golangci.yml:3 go: "1.22"` 确实落后；但**没有标准 CI workflow**（`.github/workflows/` 只有 `pr-review.yml`），属 DEP-2 范畴。"CI Go 1.22" 是 CLAUDE.md 旧描述 |
+
+### E. 同步动作
+
+- [ ] `30_recent_improvements.md::F 节 P1 待办` 删除：P1-Redis-RL-wire / P1-tiktoken
+- [ ] `30_recent_improvements.md::F 节 P1 待办` 改写：P1-Egress-wire（仅剩 rerank/embedder）/ P1-Streaming-breaker（仅缺 RecordFailure）
+- [ ] `must/working-agreement.md::已接线` 表 RedisRateLimiter / tiktoken / 双估算器 三项可下沉为"历史回溯"
+- [ ] `must/working-agreement.md::工具分发拆分` 把 "9 处" 修订为 "18+ 文件含硬编码工具名"
+- [ ] 在 `docs/architecture/09_orchestrator.md::§11 P0` 把 ORC-1 / ORC-3 / shutdown-drain 标 file:line 并保留

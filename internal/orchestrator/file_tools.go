@@ -167,7 +167,7 @@ func (o *Orchestrator) SetWorkspaceManager(wm *workspace.Manager) {
 func fileToolDefinitions() []models.ToolDefinition {
 	return []models.ToolDefinition{
 		{
-			Name:        "read_file",
+			Name:        ToolReadFile,
 			Description: "Read the contents of a file from the workspace. Use this to inspect code, configs, logs, or any text file before deciding on next actions.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -183,7 +183,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			IsIdempotentRead: true,
 		},
 		{
-			Name:        "write_file",
+			Name:        ToolWriteFile,
 			Description: "Create or overwrite a file in the workspace. For files > 100 lines that already exist, PREFER patch_file instead to minimize token usage. Use write_file only for new files or complete rewrites.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -201,7 +201,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			InvalidatesCache: true,
 		},
 		{
-			Name:        "patch_file",
+			Name:        ToolPatchFile,
 			Description: "Apply a targeted edit to an existing file by replacing a specific text section. Use this to fix bugs or modify specific functions without rewriting the entire file.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -220,7 +220,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			InvalidatesCache: true,
 		},
 		{
-			Name:        "list_files",
+			Name:        ToolListFiles,
 			Description: "List files and directories in a workspace path. Use this to understand project structure before reading or modifying files.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -235,7 +235,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			IsIdempotentRead: true,
 		},
 		{
-			Name:        "create_directory",
+			Name:        ToolCreateDirectory,
 			Description: "Create a directory (and any parent directories) in the workspace.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -248,7 +248,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			Source: "builtin",
 		},
 		{
-			Name:        "run_tests",
+			Name:        ToolRunTests,
 			Description: "Execute a test or build command in a Docker sandbox with the workspace files mounted. Use this to validate code changes, run unit tests, or check for compilation errors. The command runs inside the workspace directory. Returns stdout, stderr, and exit code.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -262,7 +262,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			Source: "builtin",
 		},
 		{
-			Name:        "run_workspace_cmd",
+			Name:        ToolRunWorkspaceCmd,
 			Description: "Execute a shell command directly in the workspace directory WITHOUT Docker. This is the PREFERRED way to run 'go test', 'go build', 'go vet', 'python -m pytest', 'npm test', etc. It uses the host's installed toolchain directly, so it's fast and doesn't require pulling Docker images. Use this instead of run_tests for all compilation and test execution. Returns stdout, stderr, exit code, and duration.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -276,7 +276,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			RiskLevel: 2, // High risk: arbitrary command execution on host
 		},
 		{
-			Name:        "edit_file",
+			Name:        ToolEditFile,
 			Description: "Precision edit: replace a specific text section in a file. The old_text MUST match exactly once in the file (not 0, not 2+). After editing, the file is automatically lint/compile-checked — if the check fails, the edit is rolled back and you'll see the errors. This is SAFER than patch_file and should be preferred for all code modifications.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -295,7 +295,7 @@ func fileToolDefinitions() []models.ToolDefinition {
 			InvalidatesCache: true,
 		},
 		{
-			Name:        "apply_diff",
+			Name:        ToolApplyDiff,
 			Description: "Apply a unified diff patch to a file. The diff must be in standard unified diff format (output of 'diff -u'). After applying, the file is automatically lint/compile-checked — if the check fails, the edit is rolled back. Use this for large multi-line edits or when you have a diff from another source.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
@@ -328,6 +328,13 @@ func (o *Orchestrator) toolReadFile(ctx context.Context, args json.RawMessage) (
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+
+	if strings.TrimSpace(req.Path) == "" {
+		return &models.ToolResult{
+			Content: "Invalid arguments: 'path' must be a non-empty relative file path. Use list_files to discover available files first.",
+			IsError: true,
+		}, nil
 	}
 
 	ws := o.resolveWorkspace(req.WorkspaceID)
@@ -384,6 +391,13 @@ func (o *Orchestrator) toolWriteFile(ctx context.Context, args json.RawMessage) 
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
 	}
 
+	if strings.TrimSpace(req.Path) == "" {
+		return &models.ToolResult{
+			Content: "Invalid arguments: 'path' must be a non-empty relative file path (e.g. \"main.go\", \"pkg/util/helper.go\"). Use list_files to discover existing paths first.",
+			IsError: true,
+		}, nil
+	}
+
 	ws := o.resolveWorkspace(req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
@@ -413,6 +427,13 @@ func (o *Orchestrator) toolPatchFile(ctx context.Context, args json.RawMessage) 
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+
+	if strings.TrimSpace(req.Path) == "" {
+		return &models.ToolResult{
+			Content: "Invalid arguments: 'path' must be a non-empty relative file path. Use list_files to find the target file first.",
+			IsError: true,
+		}, nil
 	}
 
 	ws := o.resolveWorkspace(req.WorkspaceID)

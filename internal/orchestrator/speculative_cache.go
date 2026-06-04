@@ -52,15 +52,15 @@ import (
 //	② 相同输入在 30s 内输出稳定；
 //	③ 输出大小有上限（防止缓存撑爆内存）。
 var idempotentTools = map[string]struct{}{
-	"read_file":   {},
-	"list_dir":    {},
-	"grep":        {},
-	"git_status":  {},
-	"git_diff":    {},
-	"rag_search":  {},
-	"rag_query":   {},
-	"repomap":     {},
-	"ast_outline": {},
+	ToolReadFile:  {},
+	"list_dir":    {}, // alias-only: no backing definition in this package
+	"grep":        {}, // alias-only: no backing definition in this package
+	ToolGitStatus: {},
+	ToolGitDiff:   {},
+	"rag_search":  {}, // alias-only
+	"rag_query":   {}, // alias-only
+	"repomap":     {}, // alias-only
+	"ast_outline": {}, // alias-only
 }
 
 // IsIdempotentTool 返回某工具名是否属于幂等只读工具。

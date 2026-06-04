@@ -228,7 +228,7 @@ func main() {
 	}
 	switch embeddingProvider {
 	case "openai":
-		embedder = rag.NewOpenAIEmbedder(&cfg.RAG, &cfg.LLM.Primary, logger)
+		embedder = rag.NewOpenAIEmbedder(&cfg.RAG, &cfg.LLM.Primary, egressHTTPClient, logger)
 	case "local":
 		embedder = rag.NewLocalHashEmbedder(cfg.Qdrant.VectorSize, logger)
 	default:
@@ -274,7 +274,7 @@ func main() {
 		// Initialize reranker if configured
 		var reranker rag.Reranker
 		if cfg.RAG.RerankEnabled && cfg.RAG.RerankModel != "" && cfg.RAG.RerankBaseURL != "" {
-			reranker = rag.NewAPIReranker(&cfg.RAG, logger)
+			reranker = rag.NewAPIReranker(&cfg.RAG, egressHTTPClient, logger)
 		}
 
 		ragEngine = rag.NewEngine(embedder, qdrantStore, reranker, &cfg.RAG, logger)
@@ -757,6 +757,16 @@ func main() {
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown error", zap.Error(err))
+	}
+
+	// After http.Server.Shutdown returns, no new HTTP handlers will start,
+	// but detached ReAct goroutines spawned by handleChat (which use a
+	// background-derived agentCtx so client disconnect doesn't kill them)
+	// may still be mid-tool-call. Drain blocks until they finish — bounded
+	// by shutdownCtx so a stuck agent can't pin the process forever.
+	logger.Info("draining in-flight chat goroutines")
+	if err := apiServer.Drain(shutdownCtx); err != nil {
+		logger.Warn("drain timed out, exiting with detached agents still running", zap.Error(err))
 	}
 
 	// Close Redis

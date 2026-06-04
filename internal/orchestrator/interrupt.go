@@ -1,10 +1,6 @@
 package orchestrator
 
 import (
-	"context"
-	"fmt"
-
-	"github.com/agent/code_agent/internal/models"
 	"go.uber.org/zap"
 )
 
@@ -59,52 +55,7 @@ func (o *Orchestrator) unregisterInterrupt(sessionID string) {
 	o.interruptMu.Unlock()
 }
 
-// checkInterrupt is called between tool executions in the ReAct loop.
-// Returns a non-nil response if the loop should exit early.
-func (o *Orchestrator) checkInterrupt(ctx context.Context, ch chan InterruptSignal, task *models.Task) (*interruptAction, bool) {
-	select {
-	case sig := <-ch:
-		switch sig.Type {
-		case InterruptCancel:
-			return &interruptAction{
-				response: "Task cancelled by user.",
-				cancel:   true,
-			}, true
-		case InterruptRedirect:
-			return &interruptAction{
-				response:   "",
-				redirect:   true,
-				newMessage: sig.NewMessage,
-			}, true
-		case InterruptPause:
-			return &interruptAction{
-				response: "Task paused by user. Send 'continue' to resume.",
-				cancel:   true,
-			}, true
-		}
-	default:
-	}
-	_ = ctx
-	return nil, false
-}
-
-type interruptAction struct {
-	response   string
-	cancel     bool
-	redirect   bool
-	newMessage string
-}
-
-// formatInterruptResponse builds the ChatResponse for an interrupted task.
-func (o *Orchestrator) formatInterruptResponse(task *models.Task, action *interruptAction) *models.ChatResponse {
-	msg := action.response
-	if action.redirect {
-		msg = fmt.Sprintf("Task redirected. Processing new request: %s", action.newMessage)
-	}
-	return &models.ChatResponse{
-		SessionID: task.SessionID,
-		TaskID:    task.ID,
-		Message:   msg,
-		State:     models.TaskStateFailed,
-	}
-}
+// Note: the former checkInterrupt / formatInterruptResponse / interruptAction
+// were dead code. The real interrupt handling happens inline in
+// react_core.go's step-boundary select (see reactLoopCore "Check interrupt"),
+// where the ToolTransaction Rollback is also triggered.

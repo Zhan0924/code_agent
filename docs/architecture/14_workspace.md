@@ -71,7 +71,7 @@ ws := &Workspace{RootDir: realDir, ...}
 
 为什么不直接存 `filepath.Join(baseDir, id)` 这个理论路径？
 
-因为 `safePath` 的安全检查（L347）用 `strings.HasPrefix(realPath, ws.RootDir+sep)` 判断越界：
+因为 `safePath` 的安全检查（L368）用 `strings.HasPrefix(realPath, ws.RootDir+sep)` 判断越界：
 - 如果 `ws.RootDir` 是含 symlink 的逻辑路径（如 `/tmp/agent-workspaces/ws-1`）
 - 而 `realPath` 是 EvalSymlinks 解析过的真实路径（如 `/private/tmp/agent-workspaces/ws-1/file.go`，macOS 下 `/tmp → /private/tmp`）
 - HasPrefix 就**永远不匹配**，所有正常文件都被判为越界 → 拒绝写入
@@ -103,7 +103,7 @@ Workspace 的读写模式正好命中：
 
 ### Q4 — `safePath` 为什么有 "parent dir EvalSymlinks fallback"？
 
-L334-344：
+L354-361：
 ```go
 realPath, err := filepath.EvalSymlinks(absPath)
 if err != nil {
@@ -206,7 +206,7 @@ orchestrator.handleFileWrite                           [file_tools.go:392]
 workspaceMgr.WriteFile(ws, relPath, content)           [manager.go:158]
        │
        ▼
-safePath(ws, relPath)                                  [manager.go:322]
+safePath(ws, relPath)                                  [manager.go:329]
        │
        │ 1. cleaned := filepath.Clean(relPath)
        │ 2. if IsAbs(cleaned) → reject
@@ -291,16 +291,30 @@ manifest 内容就是 `json.Marshal(ws)`，即上面 `Workspace` 结构体的字
 
 ---
 
-## 4. ★ `safePath` —— 三层路径沙箱（manager.go:322-352）
+## 4. ★ `safePath` —— 四层路径沙箱（manager.go:329-372）
 
 ### 4.1 完整算法
 
 ```go
 func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
+    // L0: 拒绝空 / 仅空白路径
+    // filepath.Clean("") == "." → filepath.Join(RootDir, ".") == RootDir，
+    // 调用方拿到 RootDir 当 file path，WriteFile 会以 EISDIR 失败，且错误链路
+    // 里只剩 "is a directory"，对 Agent 不友好。在这里显式 reject。
+    if strings.TrimSpace(relPath) == "" {
+        return "", fmt.Errorf("empty path not allowed")
+    }
+
     // L1: 规范化
     cleaned := filepath.Clean(relPath)
     if filepath.IsAbs(cleaned) {
         return "", fmt.Errorf("absolute paths not allowed: %s", relPath)
+    }
+
+    // L1.5: 拒绝指向 workspace 根目录本身（cleaned == "."），
+    // 等价于 L0 的语义兜底——例如 "./"、"foo/.." 这种 Clean 后为 "." 的输入。
+    if cleaned == "." {
+        return "", fmt.Errorf("path must reference a file inside the workspace, not the workspace root: %q", relPath)
     }
 
     // L2: 拼接 + 解析 symlink
@@ -329,6 +343,8 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 
 | 攻击 | 输入 | 防御层 | 结果 |
 |---|---|---|---|
+| 空路径（EISDIR 触发器） | `""` 或 `" "` | L0 `TrimSpace == ""` | reject — 否则 Clean 后为 `"."`，会让 WriteFile 把 ws.RootDir 当 file 写入 |
+| 指向根目录 | `"."`、`"./"`、`"foo/.."` | L1.5 `cleaned == "."` | reject — 同上原因，明确语义 |
 | 绝对路径 | `/etc/passwd` | L1 IsAbs | reject |
 | 父级穿越 | `../../etc/passwd` | L1 Clean → `etc/passwd`, L3 HasPrefix | reject |
 | 隐式当前目录 | `./../../etc/passwd` | L1 Clean 归一 → `../../etc/passwd` → L3 | reject |
@@ -336,12 +352,12 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 | 相对 symlink | `ln -s ../../etc/passwd ws/evil` | 同上 | reject |
 | dir 是 symlink | `ln -s /etc ws/etc`, path=`etc/passwd` | L2 EvalSymlinks 解出真实 `/etc/passwd`, L3 失败 | reject |
 | 新文件 | path=`new.go`（不存在） | L2 fallback: 解析父目录 = ws root, 拼回 → 真实路径 | accept |
-| 嵌套新文件 | path=`a/b/new.go`（a 已存在，b 是新目录） | L2 fallback: parentDir=`ws/a/b`, EvalSymlinks 失败 | **reject** — 走 WriteFile 时 L164 已先 MkdirAll；走 MkdirAll 自身则 accept（见下） |
+| 嵌套新文件 | path=`a/b/new.go`（a 已存在，b 是新目录） | L2 fallback: parentDir=`ws/a/b`, EvalSymlinks 失败 | **reject** — 走 WriteFile 时 L171 已先 MkdirAll；走 MkdirAll 自身则 accept（见下） |
 | 嵌套新目录 | path=`internal/shortcode`（两层都不存在） | MkdirAll 走逐段 lstat：existing 段做 EvalSymlinks 边界校验，missing 段交给 os.MkdirAll | accept |
 | symlink 父级 | `ln -s /etc ws/foo` 已存在，path=`foo/bar` | MkdirAll 第一段 lstat `foo` 是 symlink → EvalSymlinks → realCurr=/etc，HasPrefix(RootDir) 失败 | **reject** |
 
-**WriteFile 的 nested 限制**：WriteFile 的实际顺序是 `safePath` **先**跑（L159），然后才是 `os.MkdirAll(Dir(absPath))`（L164）—— 也就是说 nested-and-missing parents 在 `safePath` 阶段就会 reject（父目录与祖父都不存在时，L2 fallback 的 `EvalSymlinks(parentDir)` 会失败）。换句话说 **WriteFile 不会自动递归创建多层 missing parents**，调用方必须先 `MkdirAll` 把父链建出来，再 WriteFile。
-`safePath` 单独被调时（如 ListDir 一个不存在的子目录），同样可能在父目录链不完整时报错——见 ListDir L369-L375 的 fallback 处理（root 用 `ws.RootDir`，其他相对路径直接 return err）。
+**WriteFile 的 nested 限制**：WriteFile 的实际顺序是 `safePath` **先**跑（L159），然后才是 `os.MkdirAll(Dir(absPath))`（L171）—— 也就是说 nested-and-missing parents 在 `safePath` 阶段就会 reject（父目录与祖父都不存在时，L2 fallback 的 `EvalSymlinks(parentDir)` 会失败）。换句话说 **WriteFile 不会自动递归创建多层 missing parents**，调用方必须先 `MkdirAll` 把父链建出来，再 WriteFile。
+`safePath` 单独被调时（如 ListDir 一个不存在的子目录），同样可能在父目录链不完整时报错——见 ListDir L390-L396 的 fallback 处理（root 用 `ws.RootDir`，其他相对路径直接 return err）。**注意**：ListDir 自己在 L387-L389 把空串归一为 `"."`，再传给 safePath，会被 L1.5 reject 然后由 L392 的 `relPath == "."` 兜底改用 RootDir——这是 ListDir 故意保留 root 浏览能力的唯一例外。
 
 **MkdirAll 的 symlink 防御**（2026-06-03 引入）：`MkdirAll` 早期版本直接走 `safePath`，对 `internal/shortcode` 这种 missing-ancestor 直接 reject；后来去掉 safePath 改成"path 字符串校验 + `os.MkdirAll`"——但这样如果 `internal/` 是已存在的 symlink 指向 `/etc`，`os.MkdirAll` 会跟随 symlink 在 `/etc/shortcode` 创建。所以现在的实现是：
 1. 字符串层防 `..` 与 RootDir prefix
@@ -351,9 +367,9 @@ func (m *Manager) safePath(ws *Workspace, relPath string) (string, error) {
 ### 4.3 与旧文档的差异（**重要纠正**）
 
 ⚠️ **旧 doc 在改进建议里列 "P1: `safePath` 缺少 symlink 防护"——这是错误**：
-- 代码 L333 明确调用 `filepath.EvalSymlinks(absPath)`
-- 代码 L338 在父目录 EvalSymlinks fallback 路径也做了 symlink 解析
-- 代码 L347 用 `HasPrefix(realPath, ws.RootDir+sep)` 边界检查（`ws.RootDir` 本身就是 EvalSymlinks 之后的真实路径，见 §1.5 Q2）
+- 代码 L354 明确调用 `filepath.EvalSymlinks(absPath)`
+- 代码 L361 在父目录 EvalSymlinks fallback 路径也做了 symlink 解析
+- 代码 L368 用 `HasPrefix(realPath, ws.RootDir+sep)` 边界检查（`ws.RootDir` 本身就是 EvalSymlinks 之后的真实路径，见 §1.5 Q2）
 
 **实际状态**：symlink 防护已完整实现。如果有遗留怀疑，跑 `manager_test.go` 看 `TestSafePath_SymlinkAttack` 系列即可验证。
 
@@ -414,16 +430,16 @@ manifest 是 JSON，向后兼容：
 | `CreateForSession(id, sessionID, projectName)` | L58 | idempotent；存在直接 return；写 manifest；EvalSymlinks RootDir |
 | `Get(id)` | L149 | sync.Map.Load |
 | `GetBySession(sessionID)` | L85 | sync.Map.Range 线性扫描——O(n)，**低频路径** |
-| `WriteFile(ws, relPath, content)` | L158 | safePath + MkdirAll 父目录 + os.WriteFile |
-| `DeleteFile(ws, relPath)` | L175 | safePath + os.Remove（IsNotExist 不报错） |
-| `ReadFile(ws, relPath)` | L188 | safePath + os.ReadFile |
-| `ListFiles(ws)` | L201 | Walk 收集相对路径（不过滤 hidden / `.workspace.json`） |
-| `MkdirAll(ws, relPath)` | L227 | 逐段 lstat（已存在祖先做 EvalSymlinks 校验仍在 RootDir 内）+ os.MkdirAll(0o755)。**不再走 safePath**，2026-06-03 起 |
-| `Archive(ws, w io.Writer)` | L275 | tar+gzip 流式写；header.Name = `<project>/<rel>` |
-| `Cleanup(id)` | L311 | workspaces.Delete + os.RemoveAll —— **不写 manifest 删除日志** |
-| `ListWorkspaces()` | L355 | Range → []*Workspace |
-| `ListDir(ws, relPath)` | L365 | safePath + os.ReadDir + 给目录加 `/` 后缀 |
-| `TreeString(ws)` | L394 | Walk + 缩进字符串（用于 prompt 注入） |
+| `WriteFile(ws, relPath, content)` | L158 | safePath + 拒绝写入已存在目录（`os.Stat` + `IsDir`，防 EISDIR）+ MkdirAll 父目录 + os.WriteFile |
+| `DeleteFile(ws, relPath)` | L182 | safePath + os.Remove（IsNotExist 不报错） |
+| `ReadFile(ws, relPath)` | L195 | safePath + os.ReadFile |
+| `ListFiles(ws)` | L208 | Walk 收集相对路径（不过滤 hidden / `.workspace.json`） |
+| `MkdirAll(ws, relPath)` | L234 | 逐段 lstat（已存在祖先做 EvalSymlinks 校验仍在 RootDir 内）+ os.MkdirAll(0o755)。**不再走 safePath**，2026-06-03 起 |
+| `Archive(ws, w io.Writer)` | L282 | tar+gzip 流式写；header.Name = `<project>/<rel>` |
+| `Cleanup(id)` | L318 | workspaces.Delete + os.RemoveAll —— **不写 manifest 删除日志** |
+| `ListWorkspaces()` | L376 | Range → []*Workspace |
+| `ListDir(ws, relPath)` | L386 | safePath + os.ReadDir + 给目录加 `/` 后缀 |
+| `TreeString(ws)` | L415 | Walk + 缩进字符串（用于 prompt 注入） |
 
 ⚠️ **`Cleanup` 不删除 manifest**：实际上 `os.RemoveAll(ws.RootDir)` 把整个目录连同 `.workspace.json` 一起删了，所以 manifest 跟着没了。代码注释没明说这点，但语义是对的。
 
