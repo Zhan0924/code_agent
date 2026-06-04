@@ -26,11 +26,26 @@ type noopSink struct{}
 func (noopSink) Emit(models.ReactStreamEvent) {}
 
 // channelSink sends events to a buffered channel (used by streaming).
+//
+// droppedCtx 可选；当它被 cancel（典型场景：SSE 客户端断连）后，Emit 静默丢弃事件。
+// 这样上游业务 goroutine 可以继续推进而不会因 buffered channel 满（cap=64）而阻塞挂死。
+// 业务的终态结果由调用方在 sink 之外保留（写 session）。
 type channelSink struct {
-	ch chan<- models.ReactStreamEvent
+	ch         chan<- models.ReactStreamEvent
+	droppedCtx context.Context // nil → 永远阻塞写入（同步路径或希望事件不丢的场景）
 }
 
-func (s *channelSink) Emit(e models.ReactStreamEvent) { s.ch <- e }
+func (s *channelSink) Emit(e models.ReactStreamEvent) {
+	if s.droppedCtx == nil {
+		s.ch <- e
+		return
+	}
+	select {
+	case <-s.droppedCtx.Done():
+		// 客户端已断；丢弃事件让业务继续推进。
+	case s.ch <- e:
+	}
+}
 
 // reactCoreOpts configures the shared ReAct loop.
 type reactCoreOpts struct {
@@ -130,9 +145,19 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	for step := range opts.maxSteps {
 		globalStep++
 
-		// Check context cancellation
+		// Check context cancellation.
+		//
+		// 终态事件契约（2026-06-04）：之前这里静默 return，前端永远收不到收尾信号，
+		// SSE 流挂死直到 write_timeout 撕掉。现在补 emit 一条 error，让 handler 与
+		// 前端都能感知到 task 已结束（loading=false / 重试入口）。
 		select {
 		case <-ctx.Done():
+			sink.Emit(models.ReactStreamEvent{
+				Type:    "error",
+				TaskID:  opts.task.ID,
+				Step:    globalStep,
+				Content: "Task cancelled: " + ctx.Err().Error(),
+			})
 			return reactCoreResult{content: "Request cancelled", messages: messages, stepsUsed: step, done: true}
 		default:
 		}
@@ -240,6 +265,13 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				select {
 				case <-time.After(time.Duration(2<<attempt) * time.Second):
 				case <-ctx.Done():
+					// 终态契约：补 emit error，避免 SSE 静默挂死
+					sink.Emit(models.ReactStreamEvent{
+						Type:    "error",
+						TaskID:  opts.task.ID,
+						Step:    globalStep,
+						Content: "Context cancelled during LLM retry: " + ctx.Err().Error(),
+					})
 					return reactCoreResult{content: "Context cancelled during LLM retry", messages: messages, stepsUsed: step, done: true}
 				}
 			}

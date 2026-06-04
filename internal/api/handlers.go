@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agent/code_agent/internal/models"
@@ -250,6 +251,16 @@ func (s *Server) sendSSEEvent(c *gin.Context, event models.StreamEvent) {
 // handleChatReactStream processes a chat request using the full ReAct loop with SSE streaming.
 // It emits structured events for each step: intent parsing, thinking, tool calls, tool results, and final answer.
 // This gives the frontend complete visibility into the agent's reasoning process.
+//
+// 心跳设计（2026-06-04）：
+//
+//	server.write_timeout=600s 是兜底硬上限，任何 ≥600s 无写出的 SSE 连接都会被 net/http 撕掉。
+//	长 ReAct 任务（大型 run_tests / sandbox 编译）可能合法地 60+s 无业务事件，此前会被
+//	write_timeout 误杀。本处加入 25s 心跳 ping —— 用 SSE 注释行 `: ping\n\n`（标准格式，
+//	EventSource 与 fetch reader 都不会把它当 data 投递给上层），让 idle 期间也保证每 25s
+//	至少一次写入；如此 write_timeout 在合法长任务中永远不可能触发。
+//	与业务事件共享 writeMu 串行写入，避免与 c.SSEvent 的内部多次 Write 交错。
+//	参考前例：internal/mcp/transport_sse.go:257-259 用 90s 心跳节奏。
 func (s *Server) handleChatReactStream(c *gin.Context) {
 	var req models.ChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -273,17 +284,33 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 	c.Header("Connection", "keep-alive")
 	c.Header("Transfer-Encoding", "chunked")
 
+	var writeMu sync.Mutex
+	sendEvent := func(event models.StreamEvent) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		s.sendSSEEvent(c, event)
+	}
+
 	// Send session ID event
 	sessData, _ := json.Marshal(map[string]string{"session_id": sessionID})
-	s.sendSSEEvent(c, models.StreamEvent{Type: "session", Data: sessData})
+	sendEvent(models.StreamEvent{Type: "session", Data: sessData})
 
 	// Use full ReAct streaming
 	eventCh, err := s.orchestrator.ProcessMessageStreamFull(c.Request.Context(), sessionID, req.Message, orchestrator.ProcessOptions{OutputFormat: req.OutputFormat})
 	if err != nil {
 		errData, _ := json.Marshal(map[string]string{"error": err.Error()})
-		s.sendSSEEvent(c, models.StreamEvent{Type: "error", Data: errData})
+		sendEvent(models.StreamEvent{Type: "error", Data: errData})
 		return
 	}
+
+	// Heartbeat goroutine: writes SSE comment line every sseHeartbeatInterval while the stream is alive.
+	pingCtx, pingCancel := context.WithCancel(c.Request.Context())
+	defer pingCancel()
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		runSSEHeartbeat(pingCtx, c.Writer, &writeMu, sseHeartbeatInterval)
+	}()
 
 	// Stream each ReAct event as an SSE event
 	for event := range eventCh {
@@ -291,11 +318,51 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		s.sendSSEEvent(c, models.StreamEvent{
+		sendEvent(models.StreamEvent{
 			Type:   event.Type,
 			Data:   eventData,
 			TaskID: event.TaskID,
 		})
+	}
+
+	// 关闭心跳并等待其退出，避免在 handler 返回后 ticker goroutine 还在写已被 gin 释放的 writer。
+	pingCancel()
+	<-pingDone
+}
+
+// sseHeartbeatInterval 控制 /chat/react-stream 心跳周期。write_timeout=600s 提供 24x 余量。
+// 与 internal/mcp/transport_sse.go 的 90s 心跳节奏对齐风格但更短，因为业务 SSE 直连前端，
+// 我们对网络空闲的容忍要远低于 MCP 内部传输。
+const sseHeartbeatInterval = 25 * time.Second
+
+// sseFlushWriter 是 runSSEHeartbeat 需要的最小写入接口：能写字节并能 flush。
+// gin.ResponseWriter 天然满足；测试里可以传入任意实现该接口的 ResponseRecorder 包装。
+type sseFlushWriter interface {
+	Write(p []byte) (int, error)
+	Flush()
+}
+
+// runSSEHeartbeat 周期性地向 w 写出 SSE 注释行 `: ping\n\n`，
+// 直至 ctx 取消。每次写入通过 mu 与业务事件串行化，避免与 c.SSEvent 的多次 Write 交错。
+// `: ` 前缀加空行是 SSE 标准注释格式：EventSource / 兼容的 fetch reader 都不会把它
+// 投递给上层（前端 ChatPage.tsx 仅识别 `data:` 前缀），仅消耗一次链路 IO 字节，
+// 足以让 net/http 的 write_timeout 计时器复位。
+func runSSEHeartbeat(ctx context.Context, w sseFlushWriter, mu *sync.Mutex, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			mu.Lock()
+			_, _ = w.Write([]byte(": ping\n\n"))
+			w.Flush()
+			mu.Unlock()
+		}
 	}
 }
 

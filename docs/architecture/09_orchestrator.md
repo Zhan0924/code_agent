@@ -529,7 +529,7 @@ memoryExtractor *memory.Extractor
 | ------------- | --------------------------- | -------------------------------------- |
 | 调用方        | `/api/v1/chat`              | `/api/v1/chat/react-stream` (SSE)       |
 | 返回          | `*models.ChatResponse`      | `<-chan models.ReactStreamEvent`        |
-| sink          | `noopSink{}`                | `&channelSink{ch: outCh}`               |
+| sink          | `noopSink{}`                | `&channelSink{ch, droppedCtx}`          |
 | 适用场景      | 工具脚本、CI、HTTP 客户端   | 浏览器 UI、终端交互                     |
 | HITL 处理     | 同上                        | 同上（同样的 suspendForApproval）       |
 | 中断响应      | 同上                        | 同上                                    |
@@ -537,6 +537,43 @@ memoryExtractor *memory.Extractor
 `channelSink.Emit` 把每个内部事件（step_start / thinking / tool_call / tool_progress / tool_result / message / error）按 SSE 格式写入响应流。前端按 event type 分类渲染。
 
 **关键**：`noopSink` 让同步路径**无开销**地复用流式逻辑——`sink.Emit` 调用变成空函数。
+
+### 4.1 业务 ctx 与 HTTP ctx 解耦（2026-06-04）
+
+**症状**：`Processing... (step 40/200)` 永久卡死，docker 日志显示 t+619s 时 SSE 被 `server.write_timeout: 600s` 撕掉，HTTP ctx 取消并一路传播到 LLM/工具，orchestrator 静默 return 未发终态，UI 永远旋转。
+
+**根因**：`ProcessMessageStreamFull` 直接收下 `c.Request.Context()` 当业务 ctx，业务存活强绑 SSE TCP 连接活性。
+
+**拓扑（修复后）**：
+
+```
+reqCtx (HTTP)                   workCtx (background + 30min)
+    │                                │
+    │ (cancel when SSE 撕掉/客户端关页)
+    │
+    ▼
+桥接 goroutine                   ▼
+    │                       parseIntent
+    │ dropCancel()          reactLoopCore  ←─ 所有业务调用走 workCtx
+    │                       sessionMgr/RAG
+    ▼                       HITL/Temporal
+droppedCtx                       │
+    │                            │
+    └─► channelSink.Emit         ▼
+        客户端断后非阻塞丢弃事件   终态事件 + AddMessage 持久化
+```
+
+**关键设计点**：
+
+1. `workCtx` 仅在 (a) 业务自然结束 (b) 30min 兜底超时 时被 cancel；`reqCtx` 死掉不传染。
+2. `channelSink{droppedCtx}` 把客户端断连翻译为"非阻塞丢事件"，避免 cap=64 buffer 满后阻塞业务 goroutine（这是旧实现"任务挂死"的真凶之一）。
+3. `react_core.go::reactLoopCore` 步循环 `case <-ctx.Done()` 与 LLM retry `case <-ctx.Done()` 均补 `sink.Emit(error)`，保证"无论 ctx 怎么死都有终态事件可投递"——客户端能收到就收到，已断的也无所谓（业务结果由 `sessionMgr.AddMessage` 持久化，重连后可查到）。
+4. `tool_approval.go::waitToolApproval` 无需改：它通过 `reactLoopCore` 传入 ctx，新拓扑下天然就是 `workCtx`，30min 边界与 `toolApprovalTimeout` 双重保护。
+5. SSE 心跳（`internal/api/handlers.go::runSSEHeartbeat`，25s 周期，注释行 `: ping\n\n`）消除了 `write_timeout: 600s` 在合法长任务中的触发条件——只要业务 goroutine 还在 push 心跳，连接不会因 idle write 超时被撕。
+
+**契约测试**：`internal/orchestrator/stream_decouple_test.go` 四例覆盖 `channelSink` 非阻塞语义、保序投递、nil droppedCtx 退化为阻塞 send、桥接拓扑下 workCtx 不被 reqCtx 取消传染。
+
+**不做**：Redis pub/sub 任务事件流（"真断线续看"独立议题）；改 `toolApprovalCh` 的内存 map 结构。
 
 ---
 

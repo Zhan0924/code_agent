@@ -820,19 +820,66 @@ func (o *Orchestrator) ProcessMessageStream(ctx context.Context, sessionID, user
 	return outCh, nil
 }
 
+// streamWorkCtxMaxDuration 是流式 ReAct 任务的"业务运行 ctx"硬上限。
+// 与 HTTP 请求 ctx 解耦后，业务 ctx 不会因 SSE 断连而取消；30 分钟兜住极端 runaway。
+// 与 temporal.workflow_timeout (30m) 对齐，便于 HITL 工作流降级时语义一致。
+const streamWorkCtxMaxDuration = 30 * time.Minute
+
 // ProcessMessageStreamFull processes a message with the full ReAct loop,
 // emitting structured ReactStreamEvent for each step (intent, thinking, tool_call, tool_result, message).
 // This provides the frontend with complete visibility into the agent's reasoning process.
-func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, userMessage string, opts ...ProcessOptions) (<-chan models.ReactStreamEvent, error) {
+//
+// 业务 ctx 与 HTTP ctx 解耦（2026-06-04）：
+//
+//	入参 reqCtx 来自 gin handler，与 SSE TCP 连接强绑定。前一版本将 reqCtx 直接传给
+//	parseIntent / reactLoopCore，导致连接因 write_timeout(600s)、移动网络抖动、负载
+//	均衡 idle drop 而断时，整个 ReAct 链路被取消，工具调用半途撤销、HITL 审批通道
+//	孤立、终态消息从未落 session —— UI 永远旋转。
+//
+//	新设计：
+//	1. 函数级构造 workCtx (background + 30min 兜底)，所有业务调用一律走 workCtx；
+//	2. 起一个独立桥接 goroutine：reqCtx 死时仅 cancel droppedCtx —— 业务继续，
+//	   只是 channelSink 自此静默丢弃事件（防止 buffered channel 满后阻塞业务）；
+//	3. workCtx 仅在以下情况被 cancel：(a) goroutine 自然返回（业务完成）；
+//	   (b) 30min 超时（runaway 兜底）。reqCtx 死掉本身不传播到 workCtx。
+//	4. 终态事件无论 reqCtx 是否还活，都先尝试入 channel —— 客户端可能在断连前
+//	   收到，已断的则被 droppedCtx 丢弃。任务结果仍通过 sessionMgr.AddMessage
+//	   持久化，重连后 GET /sessions/:id/messages 能查到完整 assistant 终态。
+func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionID, userMessage string, opts ...ProcessOptions) (<-chan models.ReactStreamEvent, error) {
 	eventCh := make(chan models.ReactStreamEvent, 64)
 
-	// Store user message
-	_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
+	// 业务 ctx —— background + 硬上限。reqCtx 死掉不影响它。
+	workCtx, workCancel := context.WithTimeout(context.Background(), streamWorkCtxMaxDuration)
+
+	// droppedCtx 仅在 reqCtx 死后触发，让 sink 把后续事件静默丢弃避免 buffered
+	// channel 满阻塞业务。它独立于 workCtx，所以业务 goroutine 继续运行直到自然
+	// 完成 / 30min 兜底 / 业务级中断。
+	droppedCtx, dropCancel := context.WithCancel(context.Background())
+
+	// Store user message —— 业务 ctx，redis 操作毫秒级，差异微乎其微但保持一致。
+	_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
 		Role: models.RoleUser, Content: userMessage,
 	})
 
+	// 桥接 goroutine：reqCtx 死时只 drop，不 cancel workCtx。
 	go func() {
+		select {
+		case <-reqCtx.Done():
+			o.logger.Info("stream client disconnected; work context continues",
+				zap.String("session_id", sessionID),
+				zap.Error(reqCtx.Err()))
+			dropCancel()
+		case <-workCtx.Done():
+			// 业务自然结束（成功或 30min 超时）；不再需要监听 reqCtx。
+		}
+	}()
+
+	go func() {
+		defer workCancel()
+		defer dropCancel()
 		defer close(eventCh)
+
+		sink := &channelSink{ch: eventCh, droppedCtx: droppedCtx}
 
 		interruptCh := o.registerInterrupt(sessionID)
 		defer o.unregisterInterrupt(sessionID)
@@ -845,9 +892,9 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 		streamTx, releaseStreamTx := o.registerTx(sessionID)
 		defer releaseStreamTx()
 
-		intent, err := o.parseIntent(ctx, sessionID, userMessage)
+		intent, err := o.parseIntent(workCtx, sessionID, userMessage)
 		if err != nil {
-			eventCh <- models.ReactStreamEvent{Type: "error", Content: "Failed to parse intent: " + err.Error()}
+			sink.Emit(models.ReactStreamEvent{Type: "error", Content: "Failed to parse intent: " + err.Error()})
 			return
 		}
 
@@ -863,46 +910,46 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			task.OutputFormat = opts[0].OutputFormat
 		}
 
-		if !skipHITL(ctx) && (o.containsSensitiveContent(userMessage) || intent == models.IntentDeploy) {
+		if !skipHITL(workCtx) && (o.containsSensitiveContent(userMessage) || intent == models.IntentDeploy) {
 			task.State = models.TaskStateSuspended
-			o.persistTaskCreate(ctx, task)
-			o.persistTaskState(ctx, task.ID, models.TaskStateSuspended)
+			o.persistTaskCreate(workCtx, task)
+			o.persistTaskState(workCtx, task.ID, models.TaskStateSuspended)
 
 			if o.temporalClient != nil {
-				if _, err := o.temporalClient.StartHITLWorkflow(ctx, task.ID, sessionID, userMessage); err != nil {
+				if _, err := o.temporalClient.StartHITLWorkflow(workCtx, task.ID, sessionID, userMessage); err != nil {
 					o.logger.Warn("temporal HITL failed in stream, falling back to in-process",
 						zap.String("task_id", task.ID), zap.Error(err))
 				}
 			}
 
-			eventCh <- models.ReactStreamEvent{
+			sink.Emit(models.ReactStreamEvent{
 				Type:    "approval_request",
 				TaskID:  task.ID,
 				Content: fmt.Sprintf("⚠️ This operation requires approval. Risk: high. Action: %s", userMessage),
-			}
-			eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
+			})
+			sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
 			return
 		}
 
 		maxSteps := getMaxSteps(intent)
 		const absoluteMaxSteps = 200
-		eventCh <- models.ReactStreamEvent{
+		sink.Emit(models.ReactStreamEvent{
 			Type: "step_start", Intent: string(intent),
 			TaskID: task.ID, MaxSteps: absoluteMaxSteps,
-		}
+		})
 
-		sess, _ := o.sessionMgr.Get(ctx, sessionID)
+		sess, _ := o.sessionMgr.Get(workCtx, sessionID)
 		var codeChunks []models.CodeChunk
 		var relevanceScores []float64
 		if task.Intent == models.IntentCodeQuery || task.Intent == models.IntentDiagnose {
 			if o.ragEngine != nil {
-				results, ragErr := o.ragEngine.Retrieve(ctx, task.UserInput, nil)
+				results, ragErr := o.ragEngine.Retrieve(workCtx, task.UserInput, nil)
 				if ragErr == nil && len(results) > 0 {
 					for _, r := range results {
 						codeChunks = append(codeChunks, r.Chunk)
 						relevanceScores = append(relevanceScores, r.Score)
 					}
-					eventCh <- models.ReactStreamEvent{Type: "rag_context", Content: fmt.Sprintf("Retrieved %d code chunks from RAG", len(results))}
+					sink.Emit(models.ReactStreamEvent{Type: "rag_context", Content: fmt.Sprintf("Retrieved %d code chunks from RAG", len(results))})
 				}
 			}
 		}
@@ -918,7 +965,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 				userID = sess.UserID
 				projectID = sess.ProjectID
 			}
-			return o.buildLongTermMemory(ctx, summary, userID, projectID, task.UserInput)
+			return o.buildLongTermMemory(workCtx, summary, userID, projectID, task.UserInput)
 		}())
 
 		messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
@@ -926,7 +973,6 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			messages[0] = o.buildSystemMessage(task.Intent)
 		}
 		tools := o.GetAvailableTools()
-		sink := &channelSink{ch: eventCh}
 
 		globalStep := 0
 		for globalStep < absoluteMaxSteps {
@@ -935,7 +981,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 				batchLimit = absoluteMaxSteps - globalStep
 			}
 
-			result := o.reactLoopCore(ctx, reactCoreOpts{
+			result := o.reactLoopCore(workCtx, reactCoreOpts{
 				task:           task,
 				messages:       messages,
 				tools:          tools,
@@ -952,26 +998,26 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			if result.done {
 				if result.content != "" {
 					if o.shouldVerifyOutput(task.Intent, globalStep) {
-						vResult, vErr := o.verifyOutput(ctx, task.UserInput, result.content)
+						vResult, vErr := o.verifyOutput(workCtx, task.UserInput, result.content)
 						if vErr == nil && !vResult.Passed {
 							result.content += "\n\n" + formatVerificationFeedback(vResult)
 						}
 					}
-					_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
+					_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
 						Role: models.RoleAssistant, Content: result.content,
 					})
-					o.extractMemoriesAsync(ctx, sessionID, task.UserInput, result.content)
+					o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
 				}
-				eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
+				sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
 				return
 			}
 
 			if result.hitStepLimit && globalStep < absoluteMaxSteps {
-				eventCh <- models.ReactStreamEvent{
+				sink.Emit(models.ReactStreamEvent{
 					Type:    "thinking",
 					Step:    globalStep,
 					Content: fmt.Sprintf("Auto-continuing... (%d/%d steps used)", globalStep, absoluteMaxSteps),
-				}
+				})
 				messages = append(messages, models.Message{
 					Role: models.RoleUser,
 					Content: "You have used " + fmt.Sprintf("%d", globalStep) + " steps so far. " +
@@ -981,11 +1027,11 @@ func (o *Orchestrator) ProcessMessageStreamFull(ctx context.Context, sessionID, 
 			}
 		}
 
-		eventCh <- models.ReactStreamEvent{
+		sink.Emit(models.ReactStreamEvent{
 			Type:    "message",
 			Content: fmt.Sprintf("⚠️ Reached absolute maximum of %d reasoning steps. Task progress has been saved.", absoluteMaxSteps),
-		}
-		eventCh <- models.ReactStreamEvent{Type: "done", TaskID: task.ID}
+		})
+		sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
 	}()
 
 	return eventCh, nil
