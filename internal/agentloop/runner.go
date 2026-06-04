@@ -135,13 +135,19 @@ func (r *Runner) Run(ctx context.Context, opts RunOpts, sink EventSink) RunResul
 			return RunResult{Content: resp.Content, Messages: messages, StepsUsed: step + 1, Done: true}
 		}
 
+		// Dedupe identical ToolCalls within a single LLM step (see
+		// dedupe_tool_calls.go header for the why). Keep the same set in both
+		// the assistant message and the execution loop so the LLM's
+		// tool_calls→tool_results correspondence stays 1:1.
+		dedupedCalls := DedupeToolCalls(resp.ToolCalls, r.logger)
+
 		// Append assistant message
 		messages = append(messages, models.Message{
-			Role: models.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
+			Role: models.RoleAssistant, Content: resp.Content, ToolCalls: dedupedCalls,
 		})
 
 		// Execute tools
-		for _, tc := range resp.ToolCalls {
+		for _, tc := range dedupedCalls {
 			sink.Emit(models.ReactStreamEvent{
 				Type: "tool_call", Step: step + 1,
 				ToolName: tc.Name, ToolArgs: string(tc.Args), ToolCallID: tc.ID,

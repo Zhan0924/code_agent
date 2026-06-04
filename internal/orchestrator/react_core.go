@@ -285,7 +285,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		// 1:1. See PR after audit: tool_approval.toolApprovalCh is keyed by
 		// task.ID and rejects concurrent registrations, so a duplicate would
 		// previously bubble back as an error to the LLM mid-step.
-		dedupedCalls := dedupeToolCalls(resp.ToolCalls, o.logger)
+		dedupedCalls := agentloop.DedupeToolCalls(resp.ToolCalls, o.logger)
 
 		// Append assistant message using the deduped set so the LLM history
 		// shows exactly the calls we're going to execute (otherwise the model

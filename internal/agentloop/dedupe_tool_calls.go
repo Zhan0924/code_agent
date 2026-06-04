@@ -1,5 +1,10 @@
-// Package orchestrator — dedupe_tool_calls.go drops duplicate ToolCalls
+// Package agentloop — dedupe_tool_calls.go drops duplicate ToolCalls
 // emitted by the LLM within a single step's tool_calls array.
+//
+// Lives in agentloop (not orchestrator) so the standalone Runner
+// (agentloop/runner.go) and the full ReAct loop (orchestrator/react_core.go)
+// can both call the same canonical implementation without an import cycle —
+// orchestrator already imports agentloop for AdaptiveFeedback and friends.
 //
 // Why this is needed:
 //
@@ -27,7 +32,7 @@
 // with different key orderings still collapse). Keep the first call's ID so
 // the assistant message → tool result correspondence stays 1:1, log the drop
 // for observability.
-package orchestrator
+package agentloop
 
 import (
 	"crypto/sha256"
@@ -39,13 +44,13 @@ import (
 	"go.uber.org/zap"
 )
 
-// dedupeToolCalls returns a slice with duplicates removed in original order.
+// DedupeToolCalls returns a slice with duplicates removed in original order.
 // A duplicate is defined as having an identical (Name, canonical-Args-JSON)
 // key. The first occurrence wins; subsequent occurrences are dropped with an
 // info-level log entry so we can observe the rate in production.
 //
 // If logger is nil, the function still works — it just doesn't log.
-func dedupeToolCalls(calls []models.ToolCall, logger *zap.Logger) []models.ToolCall {
+func DedupeToolCalls(calls []models.ToolCall, logger *zap.Logger) []models.ToolCall {
 	if len(calls) <= 1 {
 		return calls
 	}

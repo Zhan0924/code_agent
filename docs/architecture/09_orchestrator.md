@@ -31,7 +31,7 @@ Orchestrator 是 Code Agent 的"大脑"。它的职责可以用一行话说清�
 1. **意图分类**（`parseIntent`）—— 用 LLM 给输入打标签（`code_query` / `code_execute` / `diagnose` / `mcp_call` / `deploy` / `conversation`）；
 2. **上下文装配**（`promptBuilder.BuildPrompt`）—— 拉 session 历史 + RAG 命中 + 长期记忆，按 KV-cache-friendly 顺序拼接；
 3. **可用工具枚举**（`GetAvailableTools`）—— 合并三个 Registry 的工具定义喂给 LLM；
-4. **ReAct 循环**（`reactLoopCore`）—— `LLM → tool_calls → execute → observe → repeat`；
+4. **ReAct 循环**（`reactLoopCore`）—— `LLM → tool_calls → dedupe → execute → observe → repeat`；
 5. **工具分发**（`dispatchTool`）—— MCP > internal/tools > skill 三级 fallback；
 6. **HITL 拦截**（`suspendForApproval`）—— 命中敏感模式或 `IntentDeploy` 时挂起等审批；
 7. **Speculative cache**（`toolCache.Get/Put/Invalidate`）—— 幂等工具结果按 workspace 复用；
@@ -65,6 +65,7 @@ ProcessMessage(user_msg)
          │    ├─ token budget prune
          │    ├─ LLM call（含 3 次指数退避重试）         # LLM 调用 #N
          │    ├─ if no tool_calls → 终止返回           # 正常出口
+         │    ├─ DedupeToolCalls（同步 Runner 走同一 helper）
          │    ├─ 并发/串行 executeTool × N
          │    ├─ 失败追踪 / metacognition 记录
          │    ├─ 自动测试（如果有 file_write）          # 可能 LLM 调用 #N+1
@@ -302,9 +303,14 @@ for step := 0; step < maxSteps; step++:
     │     │     注入「确认信心」system 消息，continue（不返回，再问一轮）
     │     └─ 返回 final answer
 
-    ├─ messages.append(assistant, resp.Content, resp.ToolCalls)
+    ├─ dedupedCalls = agentloop.DedupeToolCalls(resp.ToolCalls, logger)
+    │     （按 Name + 规范化 JSON Args 折叠重复——长 ReAct loop 偶发 LLM
+    │      在同一步重复输出相同工具调用；不去重的话 HITL 审批会被要求
+    │      两次、SSE UI 渲染幽灵卡片、tool_calls↔tool_results 对应错乱）
 
-    ├─ canParallelExecute(toolCalls)?
+    ├─ messages.append(assistant, resp.Content, dedupedCalls)
+
+    ├─ canParallelExecute(dedupedCalls)?
     │     ├─ Y: parallelExecuteTools → 并发跑
     │     └─ N: 串行 executeTool，注入 progress callback
 

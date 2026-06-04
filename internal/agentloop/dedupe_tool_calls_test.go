@@ -1,4 +1,4 @@
-package orchestrator
+package agentloop
 
 import (
 	"testing"
@@ -97,7 +97,7 @@ func TestDedupeToolCalls(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := dedupeToolCalls(tt.in, zap.NewNop())
+			got := DedupeToolCalls(tt.in, zap.NewNop())
 			if len(got) != len(tt.want) {
 				t.Fatalf("len mismatch: got %d (%v) want %d (%v)", len(got), got, len(tt.want), tt.want)
 			}
@@ -118,7 +118,7 @@ func TestDedupeToolCalls_NilLoggerOK(t *testing.T) {
 		{ID: "1", Name: "x", Args: []byte(`{"a":1}`)},
 		{ID: "2", Name: "x", Args: []byte(`{"a":1}`)},
 	}
-	out := dedupeToolCalls(in, nil)
+	out := DedupeToolCalls(in, nil)
 	if len(out) != 1 {
 		t.Fatalf("expected 1, got %d", len(out))
 	}
