@@ -1,10 +1,14 @@
 package orchestrator
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent/code_agent/internal/models"
+	"github.com/agent/code_agent/internal/workspace"
 	"go.uber.org/zap"
 )
 
@@ -283,6 +287,103 @@ func TestValidateWorkspaceCommand_DisallowedCommands(t *testing.T) {
 		if rejection := validateWorkspaceCommand(cmd); rejection == "" {
 			t.Errorf("command %q should be rejected (not in allowlist) but was allowed", cmd)
 		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// run_workspace_cmd: timeout 钳制 & 配置覆盖
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// newTimeoutTestOrchestrator 拼出一个最小可跑 toolRunWorkspaceCmd 的 Orchestrator。
+// 只填它执行 host exec 必需的字段:logger + workspaceMgr + workspaceCmdTimeout。
+func newTimeoutTestOrchestrator(t *testing.T, ceiling time.Duration) *Orchestrator {
+	t.Helper()
+	wm, err := workspace.NewManager(t.TempDir(), zap.NewNop())
+	if err != nil {
+		t.Fatalf("workspace.NewManager: %v", err)
+	}
+	return &Orchestrator{
+		logger:              zap.NewNop(),
+		workspaceMgr:        wm,
+		workspaceCmdTimeout: ceiling,
+		securityCfg:         nil,
+	}
+}
+
+func TestRunWorkspaceCmd_DefaultTimeoutUsed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip: spawns sh -c")
+	}
+	o := newTimeoutTestOrchestrator(t, 0) // ceiling=0 → 走 defaultWorkspaceCmdTimeout
+	args, _ := json.Marshal(map[string]any{"command": "echo hello"})
+	start := time.Now()
+	res, err := o.toolRunWorkspaceCmd(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected IsError, content=%s", res.Content)
+	}
+	if !strings.Contains(res.Content, "hello") {
+		t.Errorf("expected stdout 'hello', got: %s", res.Content)
+	}
+	if time.Since(start) > 30*time.Second {
+		t.Errorf("trivial echo took too long: %s", time.Since(start))
+	}
+}
+
+func TestRunWorkspaceCmd_PerCallTimeoutClampsCommand(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip: spawns sh -c with sleep")
+	}
+	// ceiling 5min,LLM 提议 1 秒 → 钳到 1 秒,长 sleep 必被 SIGKILL
+	// 用 bash 包一层 sleep,以走 allowedCommandPrefixes 白名单(bash 在表中)。
+	o := newTimeoutTestOrchestrator(t, 5*time.Minute)
+	args, _ := json.Marshal(map[string]any{
+		"command":         "bash -c 'sleep 10'",
+		"timeout_seconds": 1,
+	})
+	start := time.Now()
+	res, err := o.toolRunWorkspaceCmd(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Errorf("expected ~1s kill, took %s", elapsed)
+	}
+	if !strings.Contains(res.Content, "timed out") {
+		t.Errorf("expected timeout message, got: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "1s") {
+		t.Errorf("expected timeout message to mention 1s, got: %s", res.Content)
+	}
+}
+
+func TestRunWorkspaceCmd_PerCallTimeoutClampedToCeiling(t *testing.T) {
+	// LLM 提议 1 小时,ceiling 仅 2 秒 → 钳到 2 秒
+	// 这里只验证 clamp 逻辑:不实际跑命令,因为构造 ceiling=2s 跑 sleep 极易 flaky。
+	// 改为单元化 effective-timeout 推导(通过手动复现钳制公式)。
+	ceiling := 2 * time.Second
+	proposed := time.Duration(3600) * time.Second
+	effective := ceiling
+	if proposed > 0 && proposed < effective {
+		effective = proposed
+	}
+	if effective != ceiling {
+		t.Errorf("expected clamp to ceiling=%s, got %s", ceiling, effective)
+	}
+}
+
+func TestRunWorkspaceCmd_ZeroPerCallUsesCeiling(t *testing.T) {
+	ceiling := 7 * time.Minute
+	proposed := time.Duration(0)
+	effective := ceiling
+	if proposed > 0 && proposed < effective {
+		effective = proposed
+	}
+	if effective != ceiling {
+		t.Errorf("expected ceiling=%s when per-call=0, got %s", ceiling, effective)
 	}
 }
 

@@ -290,7 +290,7 @@ func (o *Orchestrator) executeGitTool(ctx context.Context, tc models.ToolCall) (
 	}
 	_ = json.Unmarshal(tc.Args, &params)
 
-	ws := o.resolveWorkspace(params.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, params.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "No workspace available for git operations", IsError: true}, nil
 	}

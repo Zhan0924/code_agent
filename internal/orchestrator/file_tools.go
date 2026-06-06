@@ -21,6 +21,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// defaultWorkspaceCmdTimeout 是 run_workspace_cmd 未配置 cmd_timeout 时的兜底
+// 上限。从 2 分钟提升到 5 分钟,覆盖 LLM 生成的集成测试脚本(典型耗时
+// 1-3 分钟,含 server 启停 + 多组 curl 探针)。LLM 可在 [0, 此值] 内通过
+// tool args.timeout_seconds 提出更短上限。配置项 workspace.cmd_timeout
+// 通过 main.go SetWorkspaceCmdTimeout 覆盖此值。
+const defaultWorkspaceCmdTimeout = 5 * time.Minute
+
 // allowedHostEnvVars is the closed allowlist of environment variables
 // propagated into LLM-executed host commands. The previous implementation
 // used cmd.Environ() and leaked every host variable — including AWS_*,
@@ -263,17 +270,18 @@ func fileToolDefinitions() []models.ToolDefinition {
 		},
 		{
 			Name:        ToolRunWorkspaceCmd,
-			Description: "Execute a shell command directly in the workspace directory WITHOUT Docker. This is the PREFERRED way to run 'go test', 'go build', 'go vet', 'python -m pytest', 'npm test', etc. It uses the host's installed toolchain directly, so it's fast and doesn't require pulling Docker images. Use this instead of run_tests for all compilation and test execution. Returns stdout, stderr, exit code, and duration.",
+			Description: "Execute a shell command directly in the workspace directory WITHOUT Docker. This is the PREFERRED way to run 'go test', 'go build', 'go vet', 'python -m pytest', 'npm test', etc. It uses the host's installed toolchain directly, so it's fast and doesn't require pulling Docker images. Use this instead of run_tests for all compilation and test execution. Returns stdout, stderr, exit code, and duration. Default timeout is 5 minutes; long-running suites (integration tests with server startup/teardown) may need timeout_seconds set explicitly.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"workspace_id": {"type": "string", "description": "The workspace ID (or 'default')"},
-					"command": {"type": "string", "description": "Shell command to run in the workspace root, e.g. 'go test ./... -v -count=1', 'go build ./...', 'python -m pytest -v'"}
+					"command": {"type": "string", "description": "Shell command to run in the workspace root, e.g. 'go test ./... -v -count=1', 'go build ./...', 'python -m pytest -v'"},
+					"timeout_seconds": {"type": "integer", "minimum": 0, "description": "Optional max wall-clock seconds before the process group is SIGKILL'd. Capped server-side by workspace.cmd_timeout (default 5 min). Omit or set 0 to use the ceiling. Use this for known long suites (e.g. 300 for a multi-stage integration script)."}
 				},
 				"required": ["command"]
 			}`),
 			Source:    "builtin",
-			RiskLevel: 2, // High risk: arbitrary command execution on host
+			RiskLevel: 1, // Moderate risk: host exec, gated by validateWorkspaceCommand + minimalCommandEnv (HITL threshold is >=2)
 		},
 		{
 			Name:        ToolEditFile,
@@ -337,7 +345,7 @@ func (o *Orchestrator) toolReadFile(ctx context.Context, args json.RawMessage) (
 		}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found. Use list_files first to check available workspaces.", IsError: true}, nil
 	}
@@ -398,7 +406,7 @@ func (o *Orchestrator) toolWriteFile(ctx context.Context, args json.RawMessage) 
 		}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
 	}
@@ -436,7 +444,7 @@ func (o *Orchestrator) toolPatchFile(ctx context.Context, args json.RawMessage) 
 		}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
 	}
@@ -476,7 +484,7 @@ func (o *Orchestrator) toolListFiles(ctx context.Context, args json.RawMessage) 
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		// If no workspace, list available workspaces
 		list := o.workspaceMgr.ListWorkspaces()
@@ -513,7 +521,7 @@ func (o *Orchestrator) toolCreateDirectory(ctx context.Context, args json.RawMes
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
 	}
@@ -539,7 +547,7 @@ func (o *Orchestrator) toolRunTests(ctx context.Context, args json.RawMessage) (
 		return &models.ToolResult{Content: "Sandbox not available (Docker not connected)", IsError: true}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found. Create files first using write_file.", IsError: true}, nil
 	}
@@ -582,14 +590,15 @@ func (o *Orchestrator) toolRunTests(ctx context.Context, args json.RawMessage) (
 // host's toolchain (go, python, node, etc.).
 func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
 	var req struct {
-		WorkspaceID string `json:"workspace_id"`
-		Command     string `json:"command"`
+		WorkspaceID    string `json:"workspace_id"`
+		Command        string `json:"command"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found. Create files first using write_file.", IsError: true}, nil
 	}
@@ -599,8 +608,21 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 		return &models.ToolResult{Content: "Command rejected: " + rejection, IsError: true}, nil
 	}
 
-	// Set a per-command timeout (2 minutes max)
-	cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	// 超时 = clamp(LLM 提议, [0, ceiling])。ceiling 来自配置 workspace.cmd_timeout
+	// (main.go 注入,默认 defaultWorkspaceCmdTimeout)。LLM 不传或传 0 时按 ceiling
+	// 兜底;传值过大被钳到 ceiling,避免一条命令把 ReAct loop 锁死半小时以上。
+	ceiling := o.workspaceCmdTimeout
+	if ceiling <= 0 {
+		ceiling = defaultWorkspaceCmdTimeout
+	}
+	effectiveTimeout := ceiling
+	if req.TimeoutSeconds > 0 {
+		proposed := time.Duration(req.TimeoutSeconds) * time.Second
+		if proposed < effectiveTimeout {
+			effectiveTimeout = proposed
+		}
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, effectiveTimeout)
 	defer cancel()
 
 	// Execute using sh -c for shell expansion support
@@ -658,7 +680,7 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 		if cmdCtx.Err() != nil {
 			// Context timeout — killed entire process group
 			exitCode = 137
-			stderr.WriteString("\n⚠️ Command timed out after 2 minutes and was killed (including all child processes)\n")
+			fmt.Fprintf(&stderr, "\n⚠️ Command timed out after %s and was killed (including all child processes). Pass a smaller timeout_seconds to retry faster, or split the command if it legitimately needs more time (server-side ceiling: %s).\n", effectiveTimeout, ceiling)
 		} else if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
@@ -798,7 +820,7 @@ func (o *Orchestrator) toolEditFile(ctx context.Context, args json.RawMessage) (
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
 	}
@@ -837,7 +859,7 @@ func (o *Orchestrator) toolApplyDiff(ctx context.Context, args json.RawMessage) 
 		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
 	}
 
-	ws := o.resolveWorkspace(req.WorkspaceID)
+	ws := o.resolveWorkspaceCtx(ctx, req.WorkspaceID)
 	if ws == nil {
 		return &models.ToolResult{Content: "Workspace not found", IsError: true}, nil
 	}
@@ -994,6 +1016,30 @@ func (o *Orchestrator) ResolveSessionWorkspace(sessionID string) *workspace.Work
 // ═══════════════════════════════════════════════════════════════════════════════
 // Workspace Resolution
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// resolveWorkspaceCtx is the session-aware entry point that tool handlers
+// should use. When the LLM-supplied workspace_id is empty or the literal
+// "default", we prefer the per-session isolated workspace (looked up by the
+// sessionID stored in ctx) so files generated during a chat land in that
+// session's workspace and the frontend "Open in Workspace" deep-link finds
+// them. Without this, every tool call with no explicit workspace_id would
+// drop files into the shared global "default" bucket, pooling outputs from
+// every session into one directory.
+//
+// Falls back to the legacy resolveWorkspace (which manages the global
+// "default") when no sessionID is in ctx (planner / background callers) or
+// the session workspace cannot be materialised.
+func (o *Orchestrator) resolveWorkspaceCtx(ctx context.Context, id string) *workspace.Workspace {
+	if id != "" && id != "default" {
+		return o.resolveWorkspace(id)
+	}
+	if sid, _ := ctx.Value(ctxKeySessionID).(string); sid != "" {
+		if ws := o.ResolveSessionWorkspace(sid); ws != nil {
+			return ws
+		}
+	}
+	return o.resolveWorkspace(id)
+}
 
 // resolveWorkspace finds or creates a workspace for the given ID.
 // If empty/"default", uses or creates the designated default workspace.

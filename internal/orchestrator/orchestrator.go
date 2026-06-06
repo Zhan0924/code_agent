@@ -105,6 +105,12 @@ type Orchestrator struct {
 	toolPolicy    *toollearn.AdaptivePolicy
 	toolDistiller *toollearn.Distiller
 
+	// run_workspace_cmd 单次 exec 硬上限。0 = 取 defaultWorkspaceCmdTimeout
+	// 兜底。LLM 通过 tool args.timeout_seconds 可在 [0, 此值] 内自定义更
+	// 短上限;超此值被钳制。来源:config.WorkspaceConfig.CmdTimeout,经
+	// main.go 调 SetWorkspaceCmdTimeout 注入。
+	workspaceCmdTimeout time.Duration
+
 	// HITL: mutex-protected map of taskID → approval channel
 	approvalMu sync.RWMutex
 	approvalCh map[string]chan models.ApprovalResponse
@@ -152,6 +158,12 @@ type Orchestrator struct {
 
 	// Compaction mode: "truncate" (default) or "summarize" (LLM-based)
 	compactionMode string
+
+	// Optional Redis-backed stream cache. When wired, ProcessMessageStreamFull
+	// mirrors every emitted ReactStreamEvent to a per-session Redis Stream so
+	// /chat/react-stream/resume can replay+follow after a page refresh. nil ⇒
+	// streaming持续工作但刷新后无法重连进行中任务。
+	streamCache *StreamCache
 }
 
 // intentCacheEntry stores a cached intent classification result.
@@ -214,24 +226,32 @@ func NewOrchestratorWithConfig(
 3. Search and retrieve relevant code snippets (use search_code tool)
 4. Interact with external tools (GitHub, Jira, etc.) via MCP
 5. Help diagnose and troubleshoot production issues
-Always use tools when they would produce better answers. After receiving tool results, synthesize them into a clear answer.`,
+Always use tools when they would produce better answers. After receiving tool results, synthesize them into a clear answer.
+
+FINAL-ANSWER STYLE (strict — applies to the last assistant message that ends a task):
+- Keep it to a brief summary: at most ~6 short bullets or ~150 words covering what changed, where, and any next step required from the user.
+- Do NOT paste full file contents, large code blocks, or verification tables back into the chat — written files already live in the workspace and the UI surfaces an "Open in Workspace" button for the user to inspect them.
+- When the task produced or modified files in the workspace, end with one line:
+    Click "Open in Workspace" to browse the generated files.
+- Code snippets are only acceptable in the final answer when the user explicitly asked to see code inline, or when fewer than ~20 lines are needed to illustrate the answer.`,
 		MaxTotalTokens:      maxTokens,
 		EnablePromptCaching: enableCaching,
 	}, logger)
 
 	orch := &Orchestrator{
-		llmClient:        llmClient,
-		sessionMgr:       sessionMgr,
-		ragEngine:        ragEngine,
-		sandboxMgr:       sandboxMgr,
-		mcpGateway:       mcpGateway,
-		promptBuilder:    pb,
-		securityCfg:      securityCfg,
-		sensitiveRules:   rules,
-		maxContextTokens: maxTokens,
-		logger:           logger.With(zap.String("component", "orchestrator")),
-		approvalCh:       make(map[string]chan models.ApprovalResponse),
-		toolApprovalCh:   make(map[string]chan models.ApprovalResponse),
+		llmClient:           llmClient,
+		sessionMgr:          sessionMgr,
+		ragEngine:           ragEngine,
+		sandboxMgr:          sandboxMgr,
+		mcpGateway:          mcpGateway,
+		promptBuilder:       pb,
+		securityCfg:         securityCfg,
+		sensitiveRules:      rules,
+		maxContextTokens:    maxTokens,
+		workspaceCmdTimeout: defaultWorkspaceCmdTimeout,
+		logger:              logger.With(zap.String("component", "orchestrator")),
+		approvalCh:          make(map[string]chan models.ApprovalResponse),
+		toolApprovalCh:      make(map[string]chan models.ApprovalResponse),
 		interruptCh:      make(map[string]chan InterruptSignal),
 		txMap:            make(map[string]*ToolTransaction),
 		intentCache:      make(map[string]intentCacheEntry),
@@ -269,6 +289,19 @@ Always use tools when they would produce better answers. After receiving tool re
 		orch.store = pgStore[0]
 	}
 	return orch
+}
+
+// SetStreamCache wires the Redis-backed stream event cache. Nil is a valid
+// no-op state — streaming continues working without persistence/resume.
+func (o *Orchestrator) SetStreamCache(c *StreamCache) {
+	o.streamCache = c
+}
+
+// StreamCache exposes the wired cache so HTTP handlers can implement
+// /chat/react-stream/status and /chat/react-stream/resume. Returns nil when
+// streaming-persistence is disabled.
+func (o *Orchestrator) StreamCache() *StreamCache {
+	return o.streamCache
 }
 
 // SetToolLearnStore wires a persistent store into the tool-learning collector
@@ -333,6 +366,11 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	task.State = models.TaskStatePlanning
 	intent, err := o.parseIntent(ctx, sessionID, userMessage)
 	if err != nil {
+		// Persist a failure-state assistant placeholder so the conversation
+		// reflects WHY this turn produced no answer. Without this, the user
+		// just sees no response, retries, and Redis ends up with runs of
+		// consecutive RoleUser messages with no assistant in between.
+		o.persistFailureAssistant(ctx, sessionID, task.ID, "⚠️ Failed to parse intent: "+err.Error())
 		return nil, fmt.Errorf("intent parsing: %w", err)
 	}
 	task.Intent = intent
@@ -367,6 +405,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	response, err := o.reactLoop(ctx, task)
 	if err != nil {
 		task.State = models.TaskStateFailed
+		o.persistFailureAssistant(ctx, sessionID, task.ID, "⚠️ Task failed: "+err.Error())
 		return nil, err
 	}
 
@@ -386,6 +425,29 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 		SessionID: sessionID, TaskID: task.ID,
 		Message: response, State: models.TaskStateCompleted,
 	}, nil
+}
+
+// persistFailureAssistant writes a terminal RoleAssistant placeholder when the
+// orchestrator can't produce a real answer (intent-parse fail, ReAct loop error,
+// empty content, step-budget exhaustion). Without it, the session ends up with
+// a RoleUser write paired with no assistant record; the user sees nothing, hits
+// retry, and Redis fills with runs of consecutive RoleUser messages that look
+// like duplicates. Best-effort — never propagates errors back to the caller
+// because the caller is already on an error path.
+func (o *Orchestrator) persistFailureAssistant(ctx context.Context, sessionID, taskID, message string) {
+	if o.sessionMgr == nil || sessionID == "" {
+		return
+	}
+	if err := o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
+		Role:    models.RoleAssistant,
+		Content: message,
+	}); err != nil {
+		o.logger.Warn("failed to persist failure-state assistant message",
+			zap.String("session_id", sessionID),
+			zap.String("task_id", taskID),
+			zap.Error(err),
+		)
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -503,7 +565,17 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		if o.shouldVerifyOutput(task.Intent, result.stepsUsed) && result.content != "" {
 			vResult, vErr := o.verifyOutput(ctx, task.UserInput, result.content)
 			if vErr == nil && !vResult.Passed {
-				result.content += "\n\n" + formatVerificationFeedback(vResult)
+				// Verification feedback is for internal observability only —
+				// it is the *evaluator's* critique, not part of the assistant's
+				// answer. Never concatenate to result.content (would leak the
+				// "Please address the issues above before finalizing..." text
+				// to the user) and never AddMessage as RoleAssistant.
+				o.logger.Warn("output verification failed",
+					zap.String("task_id", task.ID),
+					zap.Float64("score", vResult.Score),
+					zap.Strings("issues", vResult.Issues),
+					zap.String("reasoning", vResult.Reasoning),
+				)
 			}
 		}
 		return result.content, nil
@@ -879,7 +951,12 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 		defer dropCancel()
 		defer close(eventCh)
 
-		sink := &channelSink{ch: eventCh, droppedCtx: droppedCtx}
+		var sink reactEventSink = &channelSink{ch: eventCh, droppedCtx: droppedCtx}
+		// 镜像每条 event 到 Redis Stream，让 /resume 能 Replay+Follow。
+		// nil-streamCache 路径下 persistingSink 退化为内层 channelSink。
+		if o.streamCache != nil {
+			sink = &persistingSink{inner: sink, cache: o.streamCache, sessionID: sessionID, ctx: workCtx}
+		}
 
 		interruptCh := o.registerInterrupt(sessionID)
 		defer o.unregisterInterrupt(sessionID)
@@ -892,14 +969,27 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 		streamTx, releaseStreamTx := o.registerTx(sessionID)
 		defer releaseStreamTx()
 
+		// 提前分配 task.ID 并标记 running，否则 parseIntent（一次 LLM 调用，
+		// 可能几秒）期间刷新页面，/status 会返回 running:false，前端就放弃了重连。
+		// MarkDone 在所有 sink.Emit 之后由 defer 触发，保证 Follow 端不会过早退出。
+		taskID := uuid.New().String()
+		if o.streamCache != nil {
+			o.streamCache.MarkRunning(workCtx, sessionID, taskID)
+			defer o.streamCache.MarkDone(workCtx, sessionID)
+		}
+
 		intent, err := o.parseIntent(workCtx, sessionID, userMessage)
 		if err != nil {
-			sink.Emit(models.ReactStreamEvent{Type: "error", Content: "Failed to parse intent: " + err.Error()})
+			msg := "⚠️ Failed to parse intent: " + err.Error()
+			sink.Emit(models.ReactStreamEvent{Type: "error", Content: msg})
+			// Pair the just-written user message with a failure-state assistant
+			// record so the user sees the error after refresh and doesn't retry.
+			o.persistFailureAssistant(workCtx, sessionID, "", msg)
 			return
 		}
 
 		task := &models.Task{
-			ID:        uuid.New().String(),
+			ID:        taskID,
 			SessionID: sessionID,
 			UserInput: userMessage,
 			Intent:    intent,
@@ -996,18 +1086,40 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 			globalStep += result.stepsUsed
 
 			if result.done {
-				if result.content != "" {
-					if o.shouldVerifyOutput(task.Intent, globalStep) {
-						vResult, vErr := o.verifyOutput(workCtx, task.UserInput, result.content)
-						if vErr == nil && !vResult.Passed {
-							result.content += "\n\n" + formatVerificationFeedback(vResult)
-						}
-					}
-					_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
-						Role: models.RoleAssistant, Content: result.content,
+				if result.content == "" {
+					// done==true but no content: model returned an empty final
+					// answer (rare — usually an upstream stop signal). Without
+					// a placeholder the session would silently lose this turn.
+					placeholder := "⚠️ Agent finished without producing a response."
+					o.persistFailureAssistant(workCtx, sessionID, task.ID, placeholder)
+					// Also push the placeholder onto the live stream so the user
+					// sees it immediately; without this they only learn about the
+					// empty turn on a page refresh that re-reads the session.
+					sink.Emit(models.ReactStreamEvent{
+						Type:    "message",
+						Content: placeholder,
+						TaskID:  task.ID,
 					})
-					o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
+					sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
+					return
 				}
+				if o.shouldVerifyOutput(task.Intent, globalStep) {
+					vResult, vErr := o.verifyOutput(workCtx, task.UserInput, result.content)
+					if vErr == nil && !vResult.Passed {
+						// Internal evaluator critique — never user-visible.
+						// See twin block in ProcessMessage for rationale.
+						o.logger.Warn("output verification failed",
+							zap.String("task_id", task.ID),
+							zap.Float64("score", vResult.Score),
+							zap.Strings("issues", vResult.Issues),
+							zap.String("reasoning", vResult.Reasoning),
+						)
+					}
+				}
+				_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
+					Role: models.RoleAssistant, Content: result.content,
+				})
+				o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
 				sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
 				return
 			}
@@ -1027,10 +1139,11 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 			}
 		}
 
-		sink.Emit(models.ReactStreamEvent{
-			Type:    "message",
-			Content: fmt.Sprintf("⚠️ Reached absolute maximum of %d reasoning steps. Task progress has been saved.", absoluteMaxSteps),
-		})
+		exhausted := fmt.Sprintf("⚠️ Reached absolute maximum of %d reasoning steps. Task progress has been saved.", absoluteMaxSteps)
+		sink.Emit(models.ReactStreamEvent{Type: "message", Content: exhausted})
+		// Persist a terminal assistant record for the step-exhausted exit so the
+		// session doesn't leave the user message dangling.
+		o.persistFailureAssistant(workCtx, sessionID, task.ID, exhausted)
 		sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
 	}()
 
@@ -1389,7 +1502,7 @@ AVAILABLE TOOLS
 - create_directory: Create directories
 - run_workspace_cmd: Execute shell commands directly (PREFERRED for go test, go build, curl, python, npm)
   * Supports: compilation, test execution, starting servers, curl testing, shell scripts
-  * Max timeout: 2 minutes per command
+  * Default timeout: 5 minutes (server-side cap workspace.cmd_timeout). Pass timeout_seconds for known long suites.
   * For server integration tests, use: './binary & sleep 2 && curl ... && kill %1'
 - run_tests: Execute in Docker sandbox (fallback only)
 - search_code: Semantic code search via RAG
@@ -1683,6 +1796,16 @@ func (o *Orchestrator) SetSkillRegistry(sr interface {
 // SetCompactionMode sets the context compaction mode ("truncate" or "summarize").
 func (o *Orchestrator) SetCompactionMode(mode string) {
 	o.compactionMode = mode
+}
+
+// SetWorkspaceCmdTimeout 覆盖 run_workspace_cmd 单次 exec 的硬上限。
+// 0 或负值忽略。配置项 workspace.cmd_timeout(config.go)经 main.go 接线
+// 到这里;LLM 通过 tool args.timeout_seconds 可在 [0, 此值] 内提出更短
+// 上限,超过此值会被钳制。
+func (o *Orchestrator) SetWorkspaceCmdTimeout(d time.Duration) {
+	if d > 0 {
+		o.workspaceCmdTimeout = d
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
