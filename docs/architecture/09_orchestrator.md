@@ -262,7 +262,7 @@ api/chat_handler → orch.ProcessMessage(sessionID, userMsg)
          │     ↓ returns content
          │
          ├─ shouldVerifyOutput? → verifyOutput（LLM 调用）
-         │     失败 → 追加 verification feedback
+         │     失败 → 仅 logger.Warn 记录（**不再追加到用户可见 content**）
          │
          └─ session.AddMessage(role=assistant) + extractMemoriesAsync
     │
@@ -726,7 +726,7 @@ if !skipHITL(ctx) {
 | `git_status` / `git_diff` / `git_log` | 0 | — | git 只读 / 元数据查询 |
 | `git_branch`             | 0 | **写入即失效 scope**（`InvalidatesCache=true`） | 创建或切换分支会改写 working tree 内容，缓存的文件读结果可能过期 |
 | `write_file` / `patch_file` / `edit_file` / `apply_diff` | 1 | 写入即失效 scope | 工作区已隔离 |
-| `run_workspace_cmd`      | 2 | 不缓存 | 宿主 shell 任意命令，触发审批 |
+| `run_workspace_cmd`      | 1 | 不缓存 | 宿主 shell 命令，2026-06-05 起从 2 降为 1：`validateWorkspaceCommand` 白名单 + `minimalCommandEnv` env scrub 已是静态护栏，常规工作区命令不再走工具级审批（详见 07_tools.md §8） |
 | `git_commit`             | 2 | 不缓存（`InvalidatesCache=true`） | 改写本地 git 历史，触发审批 |
 
 > 当前 `git_tools.go` 不注册 `git_push`；若将来加入，必然 RiskLevel=2（远端副作用），同样走工具级审批。
@@ -832,10 +832,12 @@ final answer 但 meta.NeedsReflection → 强制验证一轮
 仅当 `shouldVerifyOutput(intent, stepsUsed)` 为 true 时触发（Intent 是 CodeQuery/Diagnose + 步数 >= 3）。逻辑：
 
 1. 用一个独立 LLM 调用让模型自评 "答案是否充分回答用户问题"；
-2. 返回 `{passed: bool, feedback: string}`；
-3. `passed=false` 时把 feedback 拼到 content 后面返回给用户。
+2. 返回 `{passed, score, issues, suggestions, reasoning}`；
+3. `passed=false` 时 **仅写 `logger.Warn` 内部记录**，不污染用户可见的 `result.content`，也不入 session 持久化。
 
-**不**重新走 ReAct loop —— 只是给用户"自评分"。生产价值有限，因为 LLM 自评通常 passed=true。是 P2 待评估保留。
+**规则**：`verifyOutput` 的反馈是评判者面向 Agent loop 的内部批评（"Please address the issues above before finalizing your response."），属于评估器视角，不属于助手对用户的回答。无论 `passed` 取值，调用方都**不得**把 `formatVerificationFeedback` 的输出拼回 `result.content`，也**不得**以 `RoleAssistant` 写入 session。失败信号仅通过 `logger.Warn` 暴露给观测层。`formatVerificationFeedback` 保留供未来真正的 self-refine 回灌循环复用。
+
+**不**重新走 ReAct loop —— 只是给用户"自评分"。生产价值有限，因为 LLM 自评通常 passed=true。是 P2 待评估保留（或改造为真正的 self-refine 回灌循环）。
 
 ---
 

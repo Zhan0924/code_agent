@@ -2,7 +2,7 @@
 
 > 代码：
 > - `client.go` (378) — `Client` 客户端 + 双层熔断器 + fallback + provider dispatch + SSRF httpClient
-> - `anthropic_provider.go` (453) — Anthropic Messages API **原生协议** Provider（System 抽取 + cache_control + tool_use 双向映射）
+> - `anthropic_provider.go` (487) — Anthropic Messages API **原生协议** Provider（System 抽取 + cache_control + tool_use 双向映射 + 相邻同角色 `coalesceConsecutiveRoles` 合并）
 > - `openai_provider.go` (564) — OpenAI 兼容协议 Provider（sashabaranov/go-openai SDK）
 > - `router.go` (284) — `Router` 三档（Heavy/Medium/Light）动态路由
 > - `tokenizer.go` (151) — tiktoken-go 精确计数 + rune 加权快速估算
@@ -541,7 +541,7 @@ func (p *anthropicProvider) Name() string {
 
 Metrics 标签里 `provider=anthropic/claude-sonnet-4-20250514`，按模型粒度做 P99 / 成本曲线区分。
 
-### 5.3 消息转换 `convertMessages`（`anthropic_provider.go:308-414`）
+### 5.3 消息转换 `convertMessages`（`anthropic_provider.go:308-429`）
 
 Anthropic Messages API 的几个**关键差异**让转换层比 OpenAI 复杂：
 
@@ -613,7 +613,19 @@ toolResultBlock := anthropic.ToolResultBlockParam{
 
 Anthropic 严格要求 messages 数组首条是 user 角色。`convertMessages` 末尾自动补一条 `"(continue)"` user 消息如果第一条是 assistant（`anthropic_provider.go:395-408`）——这种情况发生在历史被裁切到只剩 assistant 回复之后。
 
-### 5.4 工具转换 `convertTools`（`anthropic_provider.go:417-453`）
+#### (e) 严格交替：相邻同角色必须合并
+
+Anthropic Messages API 的协议约束有两条：（1）任何 N 个 `tool_use` 块必须紧跟一条含 N 个匹配 `tool_result` 块的**同一条** user 消息；（2）`messages` 数组整体严格 user/assistant 交替，不允许两条同角色消息相邻。
+
+我们的 `models.Message` 是"一调用 / 一结果 = 一条消息"的扁平结构，并行 N 个 tool_call 会落成 N 条 `RoleTool`；ReAct 步内也可能在工具结果之后追加一条 `RoleUser` 的 continue / step-back 提示。两种情形都会在朴素映射下产出多条连续 user `MessageParam`，违反上述协议。
+
+`convertMessages` 末尾因此统一调用 `coalesceConsecutiveRoles`（`anthropic_provider.go:431-448`）合并相邻同角色 `MessageParam` 的 content blocks 后再返回。**实现要点**：
+
+- 单次线性扫描，复用首条 `MessageParam`，后续相同 role 直接 `append(last.Content, m.Content...)`，content blocks 原样保留；
+- 各 block 的 `cache_control` 不被改写，按各自原值带入合并后的消息（caller 通过 `models.Message.CacheControl` 决定哪个 block 打 cache breakpoint）；
+- 仅在 `anthropicProvider.convertMessages` 末尾调用；OpenAI Provider 不依赖此合并（OpenAI 协议接受 `role: "tool"` 与多条 user 相邻）。
+
+### 5.4 工具转换 `convertTools`（`anthropic_provider.go:451-487`）
 
 `models.ToolDefinition.Parameters json.RawMessage` 解析后映射到 `anthropic.ToolInputSchemaParam`：
 - 提取 `properties` map 给 SDK 的 `InputSchema.Properties`；

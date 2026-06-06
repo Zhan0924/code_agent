@@ -109,6 +109,7 @@ type Config struct {
     PTY        PTYConfig        // P1 新增：持久 PTY 会话
     TreeSitter TreeSitterConfig // P1 新增：AST 解析开关
     LSP        LSPConfig        // P1 新增：LSP 客户端（占位实现）
+    Workspace  WorkspaceConfig  // host workspace run_workspace_cmd 单次 exec 上限
 }
 ```
 
@@ -221,6 +222,23 @@ type SandboxConfig struct {
 ```
 
 **默认 `NetworkMode="none"`**——沙箱内执行的代码默认零网络出口，避免数据外泄；要联网得显式改成 bridge 或挂自建网络（再配合 `SecurityConfig.EgressAllowedHosts`，见 §2.7）。
+
+### 2.5.1 `WorkspaceConfig` — host 工作区 `run_workspace_cmd` 上限
+
+```go
+type WorkspaceConfig struct {
+    CmdTimeout time.Duration // run_workspace_cmd 单次 exec 硬上限,0 = 5min 默认
+}
+```
+
+**与 `SandboxConfig` 的区别**：`SandboxConfig.Timeout` 控的是 Docker 容器内 `run_tests` 的墙上时间；这里管的是 **host 进程直接 exec** 在 `/tmp/agent-workspaces/<id>` 下的 `run_workspace_cmd`（LLM 跑 `go test` / `pytest` / `npm test` / `bash test_*.sh` 的常用通道），无网络隔离仅有命令白名单（`validateWorkspaceCommand`）。
+
+**两层钳制**：
+
+1. 服务端兜底：`CmdTimeout`（默认 5min，通过 `orch.SetWorkspaceCmdTimeout` 由 `main.go` 注入）；
+2. 调用方自选：LLM 可在 tool args 里传 `timeout_seconds`，effective = `min(timeout_seconds, CmdTimeout)`；传 0 或不传按 `CmdTimeout` 走。
+
+超时后 `cmd.Cancel` 走 `syscall.Kill(-pgid, SIGKILL)` 杀掉整个进程组（包括 LLM 后台启的 server / sleep / curl），杜绝半截子进程驻留。从 2min 提到 5min 是为了覆盖典型的多阶段集成测试脚本（启动 server + 多组 curl 探针 + cleanup），既给合法长任务空间又不让一条命令把 ReAct loop 锁死半小时以上。
 
 ### 2.6 `SessionConfig` — 滑动窗口 + 压缩模式
 
@@ -568,6 +586,9 @@ sandbox:
   cpu_limit: "1.0"
   timeout: 60s
   network_mode: "none"           # 默认零网络
+
+workspace:
+  cmd_timeout: 5m                # host run_workspace_cmd 单次 exec 上限;LLM tool 可在 [0, 此值] 内传 timeout_seconds 自定义更短
 
 mcp:
   servers:

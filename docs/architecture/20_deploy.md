@@ -3,7 +3,7 @@
 > **范围**：从源码到 4 种运行形态的完整工程链路。本章不重复 18/19 的安全 / 可观测细节，专注**构建产物形态、运行时拓扑、健康探针接线、镜像与配置分离的安全约束**。
 >
 > **核心代码**：
-> - `Dockerfile` (47 行) — 生产多阶段构建
+> - `Dockerfile` (79 行) — 生产多阶段构建（含 workspace 工具链）
 > - `Dockerfile.allinone` (104 行) — 单镜像全栈（PG/Redis/Qdrant/Temporal/Jaeger/DinD）
 > - `Dockerfile.local` (26 行) — 静态二进制 + alpine:local 离线构建
 > - `Dockerfile.test` (33 行) — 容器内跑单元测试
@@ -53,13 +53,21 @@ golang:1.25-alpine  (含 Go 工具链 ~700MB)
    │  go build -ldflags="-w -s" → code-agent (~30MB 静态二进制)
    ▼
 alpine:3.20  (基础 ~5MB)
-   + ca-certificates + tzdata + curl + git + bash  (~15MB)
-   + code-agent 二进制                              (~30MB)
-   ────────────────────────────────────────────────
-   最终镜像 ~50MB
+   + ca-certificates + tzdata + curl + git + bash       (~15MB)
+   + nodejs + npm + python3 + py3-pip + build-base      (~250MB)
+   + COPY --from=builder /usr/local/go (Go 1.25 工具链)  (~340MB)
+   + code-agent 二进制                                   (~30MB)
+   ─────────────────────────────────────────────────────
+   最终镜像 ~640MB
 ```
 
-`-ldflags="-w -s"` 去掉符号表与调试信息；运行时镜像不带 Go 工具链 —— 攻击面最小化。
+`-ldflags="-w -s"` 去掉符号表与调试信息；二进制本身依旧只有 ~30MB。
+
+**为什么 runtime 不再 "最小化"？** orchestrator 的 `file_tools.go::toolRunWorkspaceCmd` 用 `exec.CommandContext("sh","-c", ...)` **直接在 agent 容器内**执行 LLM 产生的 workspace 命令（`go build` / `npm install` / `pytest` / `make` 等），没有 sandbox 隔离。runtime 镜像若没有相应工具链就会一律返回 `exit 127 / sh: <tool>: not found`，等于让所有编译类任务失效。补齐工具链是**功能正确性**问题，不是优化项。
+
+附带的环境变量（`PATH` / `GOTOOLCHAIN=auto` / `GOPROXY=goproxy.cn` / `NPM_CONFIG_REGISTRY=npmmirror` / `PIP_INDEX_URL=tuna` / `GOPATH` / `GOCACHE` / `GOMODCACHE` / `NPM_CONFIG_CACHE`）在 `Dockerfile:49-58` 一次性配齐；cache 目录在镜像构建期 `chown -R agent:agent` 到 `agent` 用户，避免首次跑非 root 工具命令时因 `$HOME` 不可写而失败。`py3-pip` 需要 `rm -f /usr/lib/python*/EXTERNALLY-MANAGED` 才能在 Alpine 上跑 `pip install`（PEP 668 限制）。
+
+**攻击面权衡**：增加这些工具相当于把 sandbox 边界从"agent 容器外"推进到容器内 `exec` 调用本身。当前实现依赖 `auth/security` 的敏感模式与 HITL 审批拦截恶意命令——sandbox 不再是唯一守门员，必须信任审批回路。详见 §6.1。
 
 ### 2.2 「同源构建，多形态打包」
 
@@ -110,6 +118,10 @@ AllInOne 的进程模型其实是**伪 supervisor** —— 它启动 6 个后台
    │      │   └── go build → /build/bin/code-agent
    │      └── stage 2: alpine:3.20
    │          ├── apk add: ca-certificates / tzdata / curl / git / bash
+   │          │           + nodejs / npm / python3 / py3-pip / build-base
+   │          ├── COPY --from=builder /usr/local/go (Go 1.25 工具链)
+   │          ├── 配置 PATH / GOTOOLCHAIN / GOPROXY / NPM_CONFIG_REGISTRY / PIP_INDEX_URL
+   │          ├── chown agent: /home/agent/go /home/agent/.cache /home/agent/.npm
    │          └── COPY /build/bin/code-agent → /usr/local/bin/code-agent
    │
    └── make docker-up ────►  docker compose up -d
@@ -193,7 +205,7 @@ internal/sandbox.Manager  →  Docker daemon (host)
      ├── 多阶段构建（golang:1.25-alpine → alpine:3.20）
      ├── -ldflags 注入 Version + BuildTime（来自 git describe）
      ▼
-   code-agent:v0.1.0-xxx 镜像（~50 MB）
+   code-agent:v0.1.0-xxx 镜像（~640 MB，含 workspace 工具链；详见 §2.1）
      │
      │ docker tag + docker push（手工）
      ▼
@@ -303,13 +315,43 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 # ─── 第二阶段 ───
 FROM docker.m.daocloud.io/library/alpine:3.20 AS runtime
-RUN apk add --no-cache ca-certificates tzdata curl git bash && \
-    addgroup -S agent && adduser -S agent -G agent     # 非 root 用户
+
+# 一次性装齐：基础运行依赖 + LLM workspace 工具链（node/python/build-base）
+# 末行 EXTERNALLY-MANAGED 移除是 PEP 668 解锁 pip install；addgroup/adduser 是非 root 用户
+RUN apk add --no-cache \
+        ca-certificates tzdata curl git bash \
+        nodejs npm \
+        python3 py3-pip \
+        build-base && \
+    rm -f /usr/lib/python*/EXTERNALLY-MANAGED && \
+    addgroup -S agent && adduser -S agent -G agent
+
+# ★ 把 builder 阶段的官方 Go 1.25 整体拷过来（比 apk add go 更小、版本可控）
+COPY --from=builder /usr/local/go /usr/local/go
+
+# 注：续行符 \ 后**不能跟注释**，否则 ENV 会失效；以下注释只能写在 ENV 之外
+ENV PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin \
+    GOTOOLCHAIN=auto \
+    GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=off \
+    GOPATH=/home/agent/go \
+    GOCACHE=/home/agent/.cache/go-build \
+    GOMODCACHE=/home/agent/go/pkg/mod \
+    NPM_CONFIG_REGISTRY=https://registry.npmmirror.com \
+    NPM_CONFIG_CACHE=/home/agent/.npm \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 上述 ENV：PATH 把 go 放最前；GOTOOLCHAIN=auto 让 go.mod 声明更高版本时自动下载；
+# 三大 cache 目录与 mirror 索引为中国大陆网络优化
+
+# ★ 预建 cache 目录并 chown，确保非 root 用户首次跑 go/npm/pip 不会因 $HOME 不可写失败
+RUN mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build /home/agent/.npm && \
+    chown -R agent:agent /home/agent
 
 COPY --from=builder /build/bin/code-agent /usr/local/bin/code-agent
+# ⚠️ 只 copy example，真实 config.yaml 由 docker-compose mount（避免 secrets 烘焙进镜像）
 COPY --from=builder /build/configs/config.example.yaml /etc/code-agent/configs/config.example.yaml
-                                                       # ⚠️ 只 copy example，真实 config.yaml 由 docker-compose mount
-USER agent                                             # 切换到非 root
+
+USER agent
 WORKDIR /home/agent
 EXPOSE 8080 8081
 
@@ -325,6 +367,10 @@ CMD ["--config", "/etc/code-agent/configs/config.yaml"]
 2. `bash` 装在运行时镜像，是因为 PTY 模式默认 shell（详见 26_pty.md）。最近一次提交 `1870fc9 fix: Dockerfile 运行时镜像安装 bash` 就是补此漏洞。
 3. `curl` 装在运行时镜像，仅为 HEALTHCHECK 用 —— 实际可换成 `wget`（Dockerfile.local 就这么做了）。
 4. **`USER agent` 后无法访问 host docker.sock**（docker.sock 默认 root:root 0660）。`docker-compose.yml:39` 通过 `user: "0:0"` 强制覆盖回 root 来解决。
+5. **`go` / `node` / `npm` / `python3` / `pip` / `make` / `gcc`（build-base）装在运行时镜像**，因为 LLM 通过 `toolRunWorkspaceCmd` 直接在 agent 容器内 `exec` 这些命令；缺任何一个都会触发 `exit 127: not found`。详见 §2.1。
+6. **`COPY --from=builder /usr/local/go`** 复用 builder 的官方 Go 1.25，比 `apk add go` 体积更小、版本可控；`GOTOOLCHAIN=auto` 保证 LLM 在 workspace 跑 `go.mod` 声明更高版本时自动下载，不卡死。
+7. **`EXTERNALLY-MANAGED` 标记移除**：Python 3.12 在 Alpine py3-pip 包里默认带 PEP 668 marker，会让 `pip install` 直接拒绝。Workspace 跑 `pip install` 是常规需求，删掉 marker 让它工作。注意这是**容器内**的妥协，宿主机别这么做。
+8. **Cache 目录 `chown agent:agent`**：`go build` / `npm install` / `pip install` 第一次跑时会写各自的 cache 目录，如果 `$HOME` 内目录不属于当前用户，命令立即失败。镜像构建期一次性建好并改权限，运行时不再有 mkdir 烦恼。
 
 ### 5.2 `Dockerfile.allinone` 设计
 
@@ -599,10 +645,17 @@ env:
 
 | 方案 | 镜像大小 | 攻击面 | 缓存效率 |
 |---|---|---|---|
-| 单阶段 `golang:1.25-alpine` | ~700MB | 含 Go 工具链 | 高（一层） |
-| **多阶段 builder + runtime** | **~50MB** | **仅运行时依赖** | 中（多层） |
+| 单阶段 `golang:1.25-alpine` | ~700MB | 含 Go 工具链 + 完整 builder 环境 | 高（一层） |
+| **多阶段 builder + runtime（含 workspace 工具链）** | **~640MB** | Go + Node + Python + build-base + 运行时依赖 | 中（多层） |
+| 多阶段 builder + 最小 runtime（无工具链） | ~50MB | 仅运行时依赖 | 中（多层） |
 
-选**多阶段**。代价是 Dockerfile 复杂度↑，但 50MB vs 700MB 的差距在分发场景压倒一切。
+选**含工具链的多阶段**方案。原因：
+
+- **不能用最小 runtime**：见 §2.1，LLM 通过 `toolRunWorkspaceCmd` 在 agent 容器内 `exec` `go` / `npm` / `pip` / `make`，缺工具链就 `exit 127`。
+- **不用单阶段**：单阶段会把整个 builder 环境（`/build` 源码、模块缓存、`go test` 缓存、git 历史）全留在镜像里，比当前 multi-stage 多出 ~60MB 无用产物，且攻击者获得 shell 后能直接读到源码。
+- **多阶段含工具链** 是"功能必需 + 攻击面控制"的折中：runtime 只装跑得动的最小集合，构建产物隔离在 builder。640MB 在 LAN 内拉取 < 10s，分发可接受。
+
+**对镜像分发体积敏感的场景**（如边缘部署、低带宽用户）应该走另一条路：**真用 sandbox** —— `sandbox.Manager`（见 [05_sandbox.md](05_sandbox.md)）已经实现了"每个 workspace 命令开一个隔离容器"，agent 容器本身就可以回到 50MB 最小态。当前 `toolRunWorkspaceCmd` 没走 sandbox 而是直接 `exec.CommandContext` 的原因是 sandbox 启动延迟较高，对短命令不划算；这是个待重审的取舍。
 
 ### 6.2 docker.sock 挂载 vs DinD
 

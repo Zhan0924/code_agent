@@ -140,7 +140,7 @@
 | `edit_file` | 委托 EditEngine：唯一匹配验证 → .bak 备份 → lint 检查 → 失败自动回滚 |
 | `apply_diff` | 委托 EditEngine：解析 unified diff (`sourcegraph/go-diff`) → 逐 hunk 应用 → .bak 备份 → lint 检查 → 失败回滚 |
 | `run_tests` | Docker sandbox 内执行，卷挂载 |
-| `run_workspace_cmd` | 宿主机 `sh -c` 执行，2 分钟超时，环境变量白名单，禁止命令检查 |
+| `run_workspace_cmd` | 宿主机 `sh -c` 执行，默认 5min 超时（`workspace.cmd_timeout` 可调；LLM 可传 `timeout_seconds` 在上限内自定义更短），环境变量白名单，禁止命令检查，超时 SIGKILL 整个进程组 |
 | `execute_code` | Sandbox 隔离执行 |
 | `search_code` | RAG 检索 |
 

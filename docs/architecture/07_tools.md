@@ -496,8 +496,8 @@ POST /api/v1/tools  {name, parameters, executor_type, executor_config, risk_leve
 | RiskLevel | 含义                          | 示例工具                                     |
 |-----------|------------------------------|---------------------------------------------|
 | 0         | safe（只读 / 沙箱）           | `read_file` / `search_code` / `execute_code`（沙箱里） |
-| 1         | moderate（写工作区文件 / 修改既有文件） | `write_file` / `patch_file` / `edit_file` / `apply_diff` |
-| 2         | high（外部副作用 / 任意命令） | `run_workspace_cmd` / `git_commit` / `git_push` / `create_directory`（OS 级）|
+| 1         | moderate（写工作区文件 / 修改既有文件 / 白名单宿主 exec） | `write_file` / `patch_file` / `edit_file` / `apply_diff` / `run_workspace_cmd` |
+| 2         | high（外部副作用 / 远端写）   | `git_commit` / `git_push` / `create_directory`（OS 级）|
 
 `RiskLevel >= 2` 时 `executeTool` 调用 `waitToolApproval`（`tool_approval.go`）：
 
@@ -512,6 +512,8 @@ POST /api/v1/tools  {name, parameters, executor_type, executor_config, risk_leve
 `ctxKeySkipHITL` 上下文键可以绕过该 gate（自动化测试 / Temporal activity 回调）；生产路径不要主动塞这个 key。
 
 `write_file` 历史上是 RiskLevel=2，2026-06-03 起降为 1：写动作发生在 `/tmp/agent-workspaces/<id>` 隔离目录中，与 `patch_file` 同档。
+
+`run_workspace_cmd` 历史上是 RiskLevel=2，2026-06-05 起降为 1：`validateWorkspaceCommand` 命令白名单 + `minimalCommandEnv` 环境变量擦除 已对宿主 exec 提供静态护栏，常规工作区命令（`go test` / `pytest` / `ls` 等）不再走 HITL，留出审批容量给真正越界的远端写。如需收回到 2，调整 `file_tools.go::ToolRunWorkspaceCmd` 的 `RiskLevel` 字段即可（HITL 阈值 `>=2` 见 `orchestrator.go:1460`）。
 
 ---
 

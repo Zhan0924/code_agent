@@ -86,12 +86,16 @@ case <-c.Request.Context().Done():   // 客户端断了
 - 用户掉线 → 重新 `GET /sessions/:id` 仍能拿到完整结果
 - LLM token 费已付，半途杀掉是浪费
 
-⚠️ **此设计只在 `POST /chat` 上实施**：
-- `POST /chat/stream` 用的是 `c.Request.Context()`（`handlers.go:204`）—— 客户端断 → 整个流终止
-- `POST /chat/react-stream` 同上（`handlers.go:277`）
+⚠️ **此设计在三类端点上略有差异**：
+- `POST /chat` 用 detached background ctx —— 客户端断 → 业务继续，结果落 session
+- `POST /chat/stream` 仍用 `c.Request.Context()`（`handlers.go:204`）—— token 流断了无意义
+- `POST /chat/react-stream` 已解耦（2026-06-04，详见 §2.5 与 09_orchestrator §4.1）：
+  形参重命名 `reqCtx`，内部构造 `workCtx (background + 30min)` 跑业务；reqCtx 死时只通过
+  `channelSink.droppedCtx` 静默丢弃事件，workCtx 不被传染。配合 25s SSE 心跳消除
+  `server.write_timeout: 600s` 在合法长任务上的触发。
 - `GET /ws` 用的是请求 ctx（`handlers.go:515,541`）
 
-这是**有意的不对称**：流式端点客户端断了就没人看了，继续跑没意义；同步端点跑完结果存 session 才有用。
+设计原则：用户离开 ≠ 任务死亡。同步与 react-stream 都贯彻此原则；`/chat/stream` 是 token 增量直传，断了无法续看，例外保留请求 ctx。
 
 ### Q4 — 晚绑定 Setter 而非构造参数
 
@@ -225,11 +229,17 @@ handleChatReactStream (handlers.go:249)
        │ Set Content-Type: text/event-stream, Cache-Control: no-cache
        │ Send "session" event with sessionID
        │
+       │ writeMu sync.Mutex; sendEvent := mu.Lock + sendSSEEvent + mu.Unlock
+       │ go runSSEHeartbeat(c.Request.Context(), c.Writer, &writeMu, 25*time.Second)
+       │   ↑ 25s 周期写 ": ping\n\n" 注释行（不进前端 data: parser），
+       │     防 server.write_timeout: 600s 撕扯合法长任务连接
+       │
        │ eventCh, err := orchestrator.ProcessMessageStreamFull(c.Request.Context(), ...)
-       │   ↑ 注意用的是请求 ctx — 客户端断 → 流终止
+       │   ↑ 形参在 orchestrator 内重命名为 reqCtx；业务 ctx 是函数级新建的
+       │     workCtx (background + 30min)，客户端断不传染业务。详见 09_orchestrator §4.1
        │
        │ for event := range eventCh {
-       │     sendSSEEvent(c, {Type: event.Type, Data: marshal(event)})
+       │     sendEvent(event)   // writeMu 与心跳串行化，禁止 SSE frame 字节交错
        │ }
        ▼
 SSE 事件类型（来自 orchestrator）:
