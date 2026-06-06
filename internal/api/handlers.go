@@ -55,11 +55,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/orchestrator"
+	"github.com/agent/code_agent/internal/session"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -185,7 +187,7 @@ func (s *Server) handleChatStream(c *gin.Context) {
 
 	sessionID := req.SessionID
 	if sessionID == "" {
-		sess, err := s.sessionMgr.Create(c.Request.Context(), "anonymous", "")
+		sess, err := s.sessionMgr.Create(c.Request.Context(), session.AnonymousUserID, "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 			return
@@ -270,7 +272,7 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 
 	sessionID := req.SessionID
 	if sessionID == "" {
-		sess, err := s.sessionMgr.Create(c.Request.Context(), "anonymous", "")
+		sess, err := s.sessionMgr.Create(c.Request.Context(), session.AnonymousUserID, "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 			return
@@ -330,6 +332,114 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 	<-pingDone
 }
 
+// handleChatReactStreamStatus 返回 sessionID 当前是否有 ReAct 任务在跑。
+// 前端在刷新页面恢复 session 后调用：若 running=true → 立刻打开 /resume SSE
+// 拉历史 + 跟随增量；若 running=false 但 event_count>0 → 任务在断流期间跑完了，
+// 仍需 /resume 把 cache 里的 tail Replay 给客户端。
+//
+//	GET /api/v1/chat/react-stream/status?session_id=<id>
+//	200 {"running": false, "event_count": 0}                       —— 完全无事
+//	200 {"running": false, "event_count": 924}                     —— 已完成,有 cache 可回放
+//	200 {"running": true,  "task_id": "<uuid>", "event_count": N}  —— 仍在跑
+func (s *Server) handleChatReactStreamStatus(c *gin.Context) {
+	sessionID := c.Query("session_id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id query parameter required"})
+		return
+	}
+	cache := s.orchestrator.StreamCache()
+	if cache == nil {
+		c.JSON(http.StatusOK, gin.H{"running": false, "event_count": 0})
+		return
+	}
+	taskID, running := cache.Status(c.Request.Context(), sessionID)
+	eventCount := cache.EventCount(c.Request.Context(), sessionID)
+	resp := gin.H{"running": running, "event_count": eventCount}
+	if running {
+		resp["task_id"] = taskID
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// handleChatReactStreamResume 重新建立 SSE 流：先 Replay 历史 Stream 事件，再
+// 用 Follow 跟随增量直到任务完成或客户端断开。
+//
+//	GET /api/v1/chat/react-stream/resume?session_id=<id>
+//	→ text/event-stream，事件格式与 /chat/react-stream 完全一致：session / step_start /
+//	  thinking / tool_call / tool_result / message / done / error
+//
+// 即使 session 没有在跑任务（已经 MarkDone），resume 仍然会把已有事件 Replay
+// 一遍——这是有意的：让客户端在「我以为还在跑、其实刚好完成」的赛跑窗口里
+// 仍然能补到尾巴。Replay 完后 Follow 立刻发现 status 不存在，drain tail 后退出。
+func (s *Server) handleChatReactStreamResume(c *gin.Context) {
+	sessionID := c.Query("session_id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id query parameter required"})
+		return
+	}
+	cache := s.orchestrator.StreamCache()
+	if cache == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "stream cache disabled"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Transfer-Encoding", "chunked")
+
+	var writeMu sync.Mutex
+	sendEvent := func(event models.StreamEvent) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		s.sendSSEEvent(c, event)
+	}
+
+	sessData, _ := json.Marshal(map[string]string{"session_id": sessionID})
+	sendEvent(models.StreamEvent{Type: "session", Data: sessData})
+
+	// 1) Replay 历史
+	historyCtx, historyCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	history, lastID, err := cache.Replay(historyCtx, sessionID)
+	historyCancel()
+	if err != nil {
+		errData, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sendEvent(models.StreamEvent{Type: "error", Data: errData})
+		return
+	}
+	for _, ev := range history {
+		data, mErr := json.Marshal(ev)
+		if mErr != nil {
+			continue
+		}
+		sendEvent(models.StreamEvent{Type: ev.Type, Data: data, TaskID: ev.TaskID})
+	}
+
+	// 如果 status 已经 NOT running，直接结束 —— 客户端 done 事件应已在 history 中。
+	if _, running := cache.Status(c.Request.Context(), sessionID); !running {
+		return
+	}
+
+	// 2) 心跳 + Follow 增量
+	pingCtx, pingCancel := context.WithCancel(c.Request.Context())
+	defer pingCancel()
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		runSSEHeartbeat(pingCtx, c.Writer, &writeMu, sseHeartbeatInterval)
+	}()
+
+	for ev := range cache.Follow(c.Request.Context(), sessionID, lastID) {
+		data, mErr := json.Marshal(ev)
+		if mErr != nil {
+			continue
+		}
+		sendEvent(models.StreamEvent{Type: ev.Type, Data: data, TaskID: ev.TaskID})
+	}
+	pingCancel()
+	<-pingDone
+}
+
 // sseHeartbeatInterval 控制 /chat/react-stream 心跳周期。write_timeout=600s 提供 24x 余量。
 // 与 internal/mcp/transport_sse.go 的 90s 心跳节奏对齐风格但更短，因为业务 SSE 直连前端，
 // 我们对网络空闲的容忍要远低于 MCP 内部传输。
@@ -374,7 +484,7 @@ func (s *Server) handleCreateSession(c *gin.Context) {
 		ProjectID string `json:"project_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		req.UserID = "anonymous"
+		req.UserID = session.AnonymousUserID
 	}
 
 	sess, err := s.sessionMgr.Create(c.Request.Context(), req.UserID, req.ProjectID)
@@ -440,6 +550,35 @@ func (s *Server) handleGetSession(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, sess)
+}
+
+// handleListSessions returns the lightweight session list for the sidebar,
+// ordered by most-recent activity. Reads `user_id` from query string and
+// defaults to AnonymousUserID (matches session.sessionIndexKey's normalization,
+// so anonymous sessions created without auth are still listable).
+func (s *Server) handleListSessions(c *gin.Context) {
+	userID := c.Query("user_id")
+	if userID == "" {
+		userID = session.AnonymousUserID
+	}
+
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+
+	summaries, err := s.sessionMgr.ListSessions(c.Request.Context(), userID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sessions: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user_id":  userID,
+		"sessions": summaries,
+	})
 }
 
 func (s *Server) handleDeleteSession(c *gin.Context) {

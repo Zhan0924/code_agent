@@ -129,6 +129,27 @@ func hotKey(sessionID string) string {
 	return fmt.Sprintf("sess:hot:%s", sessionID)
 }
 
+// AnonymousUserID is the canonical user_id for unauthenticated / dev usage.
+// All empty user_id values (session, memory, index keys) are normalized here
+// so the long-term memory tab and session sidebar share one keyspace instead
+// of being silently split between "default" and "" by different call sites.
+const AnonymousUserID = "anonymous"
+
+// sessionIndexKey returns the per-user ZSET key that indexes all sessions
+// owned by a user, scored by last-update timestamp. Used to power the
+// session-list sidebar without a `KEYS sess:hot:*` scan (which is O(N) over
+// the entire Redis keyspace).
+//
+// Empty userID is normalized to AnonymousUserID so anonymous sessions still
+// get indexed and listable — the alternative (skip indexing) would leave the
+// sidebar permanently empty for unauthenticated dev usage.
+func sessionIndexKey(userID string) string {
+	if userID == "" {
+		userID = AnonymousUserID
+	}
+	return fmt.Sprintf("sess:index:%s", userID)
+}
+
 // coldKey returns the Redis key for the cold summary/metadata.
 func coldKey(sessionID string) string {
 	return fmt.Sprintf("sess:cold:%s", sessionID)
@@ -151,7 +172,15 @@ func sessionShard(sessionID string) uint32 {
 // ─── CRUD Operations ─────────────────────────────────────────────────────────
 
 // Create initializes a new session.
+//
+// Empty userID is normalized to AnonymousUserID. Without this, sessions/
+// memories created without auth would scatter across "" / "default" / hand-
+// rolled fallbacks, and the long-term memory tab (which queries by user_id)
+// would silently return 0 even when 33 rows exist under user_id=''.
 func (m *Manager) Create(ctx context.Context, userID, projectID string) (*models.Session, error) {
+	if userID == "" {
+		userID = AnonymousUserID
+	}
 	if projectID == "" {
 		projectID = "default"
 	}
@@ -166,6 +195,20 @@ func (m *Manager) Create(ctx context.Context, userID, projectID string) (*models
 
 	if err := m.saveHot(ctx, session); err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+
+	// Best-effort index insert. Failure here is non-fatal — the session is
+	// already saved and Get/AddMessage will still work; only the sidebar
+	// listing degrades. Logged so a sustained outage is visible.
+	if err := m.rdb.ZAdd(ctx, sessionIndexKey(userID), redis.Z{
+		Score:  float64(session.UpdatedAt.UnixNano()),
+		Member: session.ID,
+	}).Err(); err != nil {
+		m.logger.Warn("failed to add session to user index",
+			zap.String("session_id", session.ID),
+			zap.String("user_id", userID),
+			zap.Error(err),
+		)
 	}
 
 	m.logger.Info("session created",
@@ -211,10 +254,24 @@ func (m *Manager) Get(ctx context.Context, sessionID string) (*models.Session, e
 	return &session, nil
 }
 
-// addMessageLuaScript is a Redis Lua script that atomically appends a message.
-// [OPT-9] It performs GET → modify → SET in a single atomic Redis operation,
-// eliminating the race condition where concurrent AddMessage calls could
-// overwrite each other's messages.
+// addMessageLuaScript is a Redis Lua script that atomically appends a message
+// and refreshes the per-user session index ZSET.
+//
+// [OPT-9] GET → modify → SET in a single atomic Redis operation eliminates the
+// race condition where concurrent AddMessage calls could overwrite each other's
+// messages. The same Lua block also runs ZADD against `sess:index:<userID>`
+// so the sidebar's recency ordering stays consistent without a follow-up RTT.
+//
+// KEYS[1] = sess:hot:<sid>
+// ARGV[1] = msgJSON
+// ARGV[2] = ttl seconds
+// ARGV[3] = updated_at as RFC3339Nano (stored on session)
+// ARGV[4] = ZSET key prefix ("sess:index:")
+// ARGV[5] = updated_at as unix-nanos string (used as ZSET score)
+// ARGV[6] = session id (ZSET member)
+// ARGV[7] = anonymous user fallback (= AnonymousUserID; injected so the Go
+//
+//	const remains the single source of truth — don't inline a literal here)
 var addMessageLuaScript = redis.NewScript(`
 	local key = KEYS[1]
 	local msgJSON = ARGV[1]
@@ -229,6 +286,14 @@ var addMessageLuaScript = redis.NewScript(`
 	session.updated_at = ARGV[3]
 	local encoded = cjson.encode(session)
 	redis.call('SET', key, encoded, 'EX', ttl)
+
+	local userID = session.user_id
+	if userID == nil or userID == "" then
+		userID = ARGV[7]
+	end
+	local score = tonumber(ARGV[5])
+	redis.call('ZADD', ARGV[4] .. userID, score, ARGV[6])
+
 	return #session.messages
 `)
 
@@ -255,12 +320,15 @@ func (m *Manager) AddMessage(ctx context.Context, sessionID string, msg models.M
 	}
 
 	ttlSeconds := int(m.cfg.TTL.Seconds())
-	nowStr := time.Now().Format(time.RFC3339Nano)
+	now := time.Now()
+	nowStr := now.Format(time.RFC3339Nano)
+	nowNanos := fmt.Sprintf("%d", now.UnixNano())
 
-	// Atomic append via Lua
+	// Atomic append + index refresh via Lua
 	_, err = addMessageLuaScript.Run(ctx, m.rdb,
 		[]string{hotKey(sessionID)},
 		string(msgJSON), ttlSeconds, nowStr,
+		"sess:index:", nowNanos, sessionID, AnonymousUserID,
 	).Int()
 	if err != nil {
 		// Fallback to non-atomic path if Lua fails (e.g., session not found)
@@ -284,7 +352,21 @@ func (m *Manager) addMessageFallback(ctx context.Context, sessionID string, msg 
 	session.Messages = append(session.Messages, msg)
 	session.UpdatedAt = time.Now()
 
-	return m.saveHot(ctx, session)
+	if err := m.saveHot(ctx, session); err != nil {
+		return err
+	}
+
+	// Mirror the Lua-path index refresh so fallback writes still bump recency.
+	if err := m.rdb.ZAdd(ctx, sessionIndexKey(session.UserID), redis.Z{
+		Score:  float64(session.UpdatedAt.UnixNano()),
+		Member: session.ID,
+	}).Err(); err != nil {
+		m.logger.Warn("fallback: failed to refresh session index",
+			zap.String("session_id", session.ID),
+			zap.Error(err),
+		)
+	}
+	return nil
 }
 
 // checkAndArchive checks if the session exceeds token budget and triggers archival.
@@ -406,20 +488,131 @@ func (m *Manager) Ping(ctx context.Context) error {
 	return m.rdb.Ping(ctx).Err()
 }
 
-// Delete removes all session data (hot + cold + sharded message keys).
+// Delete removes all session data (hot + cold + sharded message keys + index entry).
+//
+// The index ZREM needs the userID, which we fetch from the hot key before
+// deletion. If the hot key is already missing we still attempt cleanup on the
+// anonymous index (covers legacy / anonymous sessions — empty user_id is
+// normalized to AnonymousUserID by sessionIndexKey).
 func (m *Manager) Delete(ctx context.Context, sessionID string) error {
-	// Delete hot data
+	// Resolve userID before we delete the hot key. Best-effort: a missing
+	// session is not fatal here since the caller's intent is removal.
+	userID := ""
+	if session, err := m.Get(ctx, sessionID); err == nil {
+		userID = session.UserID
+	}
+
 	pipe := m.rdb.Pipeline()
 	pipe.Del(ctx, hotKey(sessionID))
 	pipe.Del(ctx, coldKey(sessionID))
 
-	// Delete all message shards
 	for i := 0; i < shardCount; i++ {
 		pipe.Del(ctx, fmt.Sprintf("sess:msg:%s:%d", sessionID, i))
 	}
 
+	pipe.ZRem(ctx, sessionIndexKey(userID), sessionID)
+
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// ─── Session Listing (Sidebar) ───────────────────────────────────────────────
+
+// SessionSummary is the lightweight projection used by the sidebar listing.
+// It deliberately omits the full Messages slice — surfacing only the metadata
+// and a short preview keeps the list payload small even when a user has
+// hundreds of sessions.
+type SessionSummary struct {
+	ID                 string    `json:"id"`
+	UserID             string    `json:"user_id"`
+	ProjectID          string    `json:"project_id,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	MessageCount       int       `json:"message_count"`
+	LastMessageRole    string    `json:"last_message_role,omitempty"`
+	LastMessagePreview string    `json:"last_message_preview,omitempty"`
+}
+
+// ListSessions returns the user's sessions ordered by most-recent activity.
+//
+// limit ≤ 0 defaults to 50; the hard cap (200) bounds worst-case Redis load
+// from a misbehaving caller. Members that have aged out of the hot store
+// (TTL expired) are silently skipped — and pruned from the index when seen —
+// so the list stays in sync with what Get can actually return.
+func (m *Manager) ListSessions(ctx context.Context, userID string, limit int) ([]*SessionSummary, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	indexKey := sessionIndexKey(userID)
+	ids, err := m.rdb.ZRevRange(ctx, indexKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read session index: %w", err)
+	}
+	if len(ids) == 0 {
+		return []*SessionSummary{}, nil
+	}
+
+	summaries := make([]*SessionSummary, 0, len(ids))
+	var stale []string
+
+	for _, sid := range ids {
+		session, err := m.Get(ctx, sid)
+		if err != nil {
+			// Expired or evicted — drop from index next pass.
+			stale = append(stale, sid)
+			continue
+		}
+		summaries = append(summaries, buildSummary(session))
+	}
+
+	// Prune stale members so the next listing doesn't keep paying for them.
+	// Fire-and-forget against a background context — if pruning fails we'll
+	// retry on the next list call.
+	if len(stale) > 0 {
+		members := make([]any, len(stale))
+		for i, s := range stale {
+			members[i] = s
+		}
+		go func() {
+			if err := m.rdb.ZRem(context.Background(), indexKey, members...).Err(); err != nil {
+				m.logger.Warn("failed to prune stale session index entries",
+					zap.String("user_id", userID),
+					zap.Int("count", len(stale)),
+					zap.Error(err),
+				)
+			}
+		}()
+	}
+
+	return summaries, nil
+}
+
+// buildSummary projects a full session into the lightweight sidebar shape.
+// Pulls the last non-empty message for the preview line — preferring the
+// assistant's reply, falling back to the user's most recent prompt when the
+// assistant hasn't responded yet.
+func buildSummary(s *models.Session) *SessionSummary {
+	sum := &SessionSummary{
+		ID:           s.ID,
+		UserID:       s.UserID,
+		ProjectID:    s.ProjectID,
+		CreatedAt:    s.CreatedAt,
+		UpdatedAt:    s.UpdatedAt,
+		MessageCount: len(s.Messages),
+	}
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Content == "" {
+			continue
+		}
+		sum.LastMessageRole = string(s.Messages[i].Role)
+		sum.LastMessagePreview = truncate(s.Messages[i].Content, 120)
+		break
+	}
+	return sum
 }
 
 // ─── Internal Helpers ────────────────────────────────────────────────────────

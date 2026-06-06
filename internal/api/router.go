@@ -54,6 +54,7 @@ import (
 
 	"github.com/agent/code_agent/internal/auth"
 	"github.com/agent/code_agent/internal/mcp"
+	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/orchestrator"
 	"github.com/agent/code_agent/internal/security"
@@ -89,6 +90,7 @@ type Server struct {
 	rdb           *redis.Client            // Redis client for distributed rate limiting
 	pgHealthPing  func(ctx context.Context) error // 可选 PG 健康检查
 	store         *store.Store                     // 可选 PG 持久化（动态工具等）
+	memoryStore   *memory.HybridStore              // 长期记忆 hot+cold 视图（可选,可视化用）
 	p0            *P0Probes                       // [P0-debug] 可观测探针（可选）
 	logger        *zap.Logger
 
@@ -166,6 +168,12 @@ func (s *Server) SetSkillRegistry(sr *skill.Registry) {
 // SetStore injects the PostgreSQL store for persistence (dynamic tools, etc.).
 func (s *Server) SetStore(st *store.Store) {
 	s.store = st
+}
+
+// SetMemoryStore injects the long-term memory hybrid store for /memory inspection.
+// Optional: when nil, /memory routes respond 503 service unavailable.
+func (s *Server) SetMemoryStore(m *memory.HybridStore) {
+	s.memoryStore = m
 }
 
 // GetAvailableTools returns all tools from MCP + Skills (used by handlers).
@@ -270,15 +278,22 @@ func (s *Server) setupRoutes() {
 		v1.POST("/chat", s.handleChat)
 		v1.POST("/chat/stream", s.handleChatStream)
 		v1.POST("/chat/react-stream", s.handleChatReactStream)
+		v1.GET("/chat/react-stream/status", s.handleChatReactStreamStatus)
+		v1.GET("/chat/react-stream/resume", s.handleChatReactStreamResume)
 		v1.POST("/chat/:session_id/interrupt", s.handleInterrupt)
 
 		// Session management
 		v1.POST("/sessions", s.handleCreateSession)
+		v1.GET("/sessions", s.handleListSessions)
 		v1.GET("/sessions/:id", s.handleGetSession)
 		v1.GET("/sessions/:id/workspace", s.handleGetSessionWorkspace)
 		v1.DELETE("/sessions/:id", s.handleDeleteSession)
 		v1.POST("/sessions/:id/messages/:message_id/pin", s.handlePinMessage)
 		v1.POST("/sessions/:id/messages/:message_id/unpin", s.handleUnpinMessage)
+
+		// Long-term memory inspection (read-only)
+		v1.GET("/memory", s.handleListMemory)
+		v1.GET("/memory/stats", s.handleMemoryStats)
 
 		// HITL approval (requires admin or dev role)
 		approvalGroup := v1.Group("")

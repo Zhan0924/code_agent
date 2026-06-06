@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
@@ -116,6 +117,55 @@ func (h *HybridStore) Retrieve(ctx context.Context, userID, projectID, query str
 		return h.cold.Retrieve(userID, projectID, query, limit)
 	}
 	return nil, nil
+}
+
+// List returns memories for (userID, projectID) without semantic ranking.
+// Merges hot + cold by ID (hot wins on conflict), sorted by LastAccessedAt desc.
+// Intended for UI inspection where the full enumeration is wanted, not relevance.
+// Returns (memories, hotCount, coldCount).
+func (h *HybridStore) List(ctx context.Context, userID, projectID string, limit int) ([]Memory, int, int, error) {
+	var hotMems, coldMems []Memory
+	if h.hot != nil {
+		ms, err := h.hot.Retrieve(ctx, userID, projectID, limit)
+		if err != nil {
+			h.logger.Debug("hot list failed", zap.Error(err))
+		} else {
+			hotMems = ms
+		}
+	}
+	if h.cold != nil {
+		ms, err := h.cold.Retrieve(userID, projectID, "", limit)
+		if err != nil {
+			h.logger.Debug("cold list failed", zap.Error(err))
+		} else {
+			coldMems = ms
+		}
+	}
+
+	seen := make(map[string]struct{}, len(hotMems)+len(coldMems))
+	merged := make([]Memory, 0, len(hotMems)+len(coldMems))
+	for _, m := range hotMems {
+		if _, dup := seen[m.ID]; dup {
+			continue
+		}
+		seen[m.ID] = struct{}{}
+		merged = append(merged, m)
+	}
+	for _, m := range coldMems {
+		if _, dup := seen[m.ID]; dup {
+			continue
+		}
+		seen[m.ID] = struct{}{}
+		merged = append(merged, m)
+	}
+
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].LastAccessedAt.After(merged[j].LastAccessedAt)
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged, len(hotMems), len(coldMems), nil
 }
 
 // Touch updates access metadata in cold store.
