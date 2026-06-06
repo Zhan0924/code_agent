@@ -25,6 +25,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # Sandbox needs Docker
       - ./configs/config.yaml:/etc/code-agent/configs/config.yaml:ro  # Mount local config
+      - agent-workspaces:/tmp/agent-workspaces     # Generated projects survive container restart
     depends_on:
       redis:
         condition: service_healthy
@@ -146,6 +147,7 @@ volumes:
   redis-data:
   pg-data:
   qdrant-data:
+  agent-workspaces:
 
 networks:
   agent-net:

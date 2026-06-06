@@ -73,6 +73,19 @@ type Config struct {
 	PTY        PTYConfig        `mapstructure:"pty"`
 	TreeSitter TreeSitterConfig `mapstructure:"tree_sitter"`
 	LSP        LSPConfig        `mapstructure:"lsp"`
+	Workspace  WorkspaceConfig  `mapstructure:"workspace"`
+}
+
+// WorkspaceConfig 控制 host workspace 上 run_workspace_cmd 的执行行为。
+// 注意:与 SandboxConfig 不同——后者是 Docker 容器内的命令执行,这里是
+// host 进程直接 exec 在 /tmp/agent-workspaces/<id> 下,LLM 生成的 go test /
+// pytest / npm test 等走这条路径,无网络隔离仅有命令白名单 + 进程组超时。
+type WorkspaceConfig struct {
+	// CmdTimeout 是 run_workspace_cmd 单次 exec 的硬上限。命令撞到这个
+	// 时间会被 SIGKILL 整个进程组(file_tools.go:Cancel)。LLM 通过
+	// tool args.timeout_seconds 可在 [0, CmdTimeout] 范围内自定义更短
+	// 的上限;不指定或 0 时按 CmdTimeout 兜底。零值时取 5 分钟默认。
+	CmdTimeout time.Duration `mapstructure:"cmd_timeout"`
 }
 
 // ServerConfig holds HTTP/WS server settings.

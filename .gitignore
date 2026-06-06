@@ -44,6 +44,7 @@ go.work
 *.tmp
 *.bak
 .claude/scheduled_tasks.lock
+.claude/plans/
 
 # Environment files
 .env

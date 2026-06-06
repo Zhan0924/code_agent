@@ -439,9 +439,26 @@ func main() {
 	if cfg.Session.CompactionMode != "" {
 		orch.SetCompactionMode(cfg.Session.CompactionMode)
 	}
+	if cfg.Workspace.CmdTimeout > 0 {
+		orch.SetWorkspaceCmdTimeout(cfg.Workspace.CmdTimeout)
+		logger.Info("workspace.cmd_timeout applied", zap.Duration("cmd_timeout", cfg.Workspace.CmdTimeout))
+	}
 	if llmRouter != nil {
 		orch.SetRouter(llmRouter)
 		logger.Info("LLM router wired into orchestrator")
+	}
+	// Stream event cache: mirrors ReactStreamEvent to Redis so the frontend
+	// can replay+follow in-progress tasks after a page refresh. Without this
+	// the SSE stream is in-memory only and a refresh loses everything.
+	streamCache := orchestrator.NewStreamCache(rdb, logger)
+	orch.SetStreamCache(streamCache)
+	logger.Info("stream event cache wired into orchestrator")
+	// 清扫上一进程 SIGTERM / 崩溃留下的孤儿 running 标记，避免前端 /resume 死等。
+	if cleared, err := streamCache.ClearAllRunning(context.Background()); err != nil {
+		logger.Warn("clear stale stream-running flags failed", zap.Error(err))
+	} else if cleared > 0 {
+		logger.Info("cleared stale stream-running flags from previous process",
+			zap.Int("count", cleared))
 	}
 	// Wire Planner for complex task DAG execution
 	plannerAdapter := orchestrator.NewLLMCallerAdapter(llmClient)
@@ -502,6 +519,12 @@ func main() {
 		RedisClient:  rdb,
 		PGHealthPing: pgPingFn,
 	})
+
+	// Wire long-term memory store for /api/v1/memory inspection endpoints.
+	if memAdapter != nil {
+		apiServer.SetMemoryStore(memAdapter.HybridStore())
+		logger.Info("memory store wired into API server (/memory endpoints)")
+	}
 
 	// ─── Wire Indexer into API Server ────────────────────────────────────
 	var repomapGen *repomap.Generator

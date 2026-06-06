@@ -82,6 +82,13 @@ sandbox:
   network_mode: "none"
   workspace_dir: "/workspace"
 
+# host workspace 上 run_workspace_cmd 的执行行为(与 sandbox: 区别——后者是
+# Docker 容器内,这里是 host 直接 exec 在 /tmp/agent-workspaces/<id>)。
+# cmd_timeout 是单次 exec 的硬上限;LLM 可通过 tool args.timeout_seconds 在
+# [0, cmd_timeout] 内提出更短上限,超此值被钳制。0 / 缺省按代码 5min 兜底。
+workspace:
+  cmd_timeout: 5m
+
 mcp:
   servers: []
   # Example:
