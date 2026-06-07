@@ -210,6 +210,29 @@ func (s *Store) Migrate(ctx context.Context) error {
 			PRIMARY KEY (project_name, file_path)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_file_checksums_project ON file_checksums(project_name)`,
+
+		// Sessions long-term persistence.
+		// Redis hot/cold layers (sess:hot:*, sess:cold:*) keep TTL 24h/48h for
+		// active workloads; this table is the authoritative source so the
+		// sidebar listing and rehydrate path survive Redis expiry.
+		// `data` holds the full models.Session JSON (incl. Messages + Summary)
+		// so we can rebuild a Session in a single row read. Token-budget driven
+		// hot/cold separation keeps the JSON bounded.
+		// user_id / project_id defaults align with session.AnonymousUserID and
+		// the manager's "default" projectID normalization (manager.go:181-186).
+		`CREATE TABLE IF NOT EXISTS sessions (
+			id            TEXT PRIMARY KEY,
+			user_id       TEXT NOT NULL DEFAULT 'anonymous',
+			project_id    TEXT NOT NULL DEFAULT 'default',
+			data          JSONB NOT NULL,
+			message_count INT  NOT NULL DEFAULT 0,
+			last_role     TEXT NOT NULL DEFAULT '',
+			last_preview  TEXT NOT NULL DEFAULT '',
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_user_project ON sessions(user_id, project_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_updated     ON sessions(updated_at DESC)`,
 	}
 
 	for _, m := range migrations {

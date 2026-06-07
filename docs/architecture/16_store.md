@@ -1,10 +1,10 @@
 # 16 · 持久化层 `internal/store` + `internal/auth`（Redis 撤销）
 
-> 代码（**以代码为准**）：
+> 代码(**以代码为准**):
 >
-> - `internal/store/postgres.go` (535 行) — PostgreSQL Store：6 张表 + 自动 migration + Tasks / AuditLogs / ApiKeys / Approvals / DynamicTools / FileChecksums CRUD
-> - `internal/store/postgres_test.go` (65 行) — 简单连通性测试，需要真实 PG
-> - `internal/auth/redis_revocation.go` (97 行) — JWT 撤销黑名单的 Redis 存储 + JWTManagerWithRedis 装饰器
+> - `internal/store/postgres.go` — PostgreSQL Store:**7 张表** + 自动 migration + Tasks / AuditLogs / ApiKeys / Approvals / DynamicTools / FileChecksums / **Sessions(2026-06 新增)** DDL。sessions 行的 CRUD **不在 store.Store 上**,而是由 `internal/session/pg_store.go` 的 `PGSessionStore` 通过 `pgStore.DB()` 暴露的 `*sql.DB` 直接持有(避免 store 包反向依赖 session 包)
+> - `internal/store/postgres_test.go` — 简单连通性测试,需要真实 PG
+> - `internal/auth/redis_revocation.go` — JWT 撤销黑名单的 Redis 存储 + JWTManagerWithRedis 装饰器
 >
 > 上层调用：
 >
@@ -37,11 +37,14 @@
 | `approvals` | HITL 授权请求生命周期 | task_id / status / approved_by |
 | `dynamic_tools` | 运行时注册的工具配置 + TTL | name / executor_type / ttl |
 | `file_checksums` | indexer 增量索引的 SHA-256 缓存 | project_name + file_path → hash |
+| `sessions` (2026-06) | Session 长期权威源(对抗 Redis hot/cold TTL) | id / user_id / project_id / data (JSONB 全 Session) / message_count / last_role / last_preview / updated_at |
 
 附带一个**小而关键**的姊妹组件：`internal/auth/redis_revocation.go` —— JWT 撤销黑名单。
 它放在 `auth` 包里但本质是持久化逻辑，所以一起讲。
 
-⚠️ **旧文档声称 4 张表（Tasks / AuditLogs / ApiKeys / Approvals），实际有 6 张**——新增了 `dynamic_tools` 和 `file_checksums`。
+⚠️ 旧文档声称 4 张表(Tasks / AuditLogs / ApiKeys / Approvals),实际现在有 **7 张**——`dynamic_tools` / `file_checksums` 先后加入,2026-06 又加了 `sessions`。
+
+⚠️ **sessions 表是 store 包"DDL 收口"但 CRUD 不收口的特例**:`internal/store/postgres.go::Migrate` 负责建表与建索引(`idx_sessions_user_project`、`idx_sessions_updated`),但 `Upsert/Get/ListByUser/Delete` 在 `internal/session/pg_store.go`。原因:Session 体量大且语义紧,塞进 store 包会让 store 反过来知道 `models.Session`,违反"store 是基础设施层"的分层假设。其他 6 张表的 CRUD 都在 `postgres.go` 上,sessions 是唯一例外。
 
 ---
 
@@ -433,7 +436,7 @@ WHERE ttl IS NULL OR (created_at + (ttl || ' seconds')::interval) > NOW()
 
 ⚠️ **没有后台清理任务**：过期工具记录会**永远留在表里**，只是 LoadDynamicTools 时被过滤掉。**P2：加 cron DELETE**。
 
-### 3.6 `file_checksums`（postgres.go:205-211）
+### 3.6 `file_checksums`(postgres.go:205-211)
 
 ```sql
 CREATE TABLE IF NOT EXISTS file_checksums (
@@ -449,7 +452,36 @@ CREATE INDEX idx_file_checksums_project ON file_checksums(project_name);
 **复合主键**：同一文件路径在不同项目下可以独立 hash。
 **用法**：indexer.go:119 `GetAllChecksums(projectName)` 拉全表预热内存缓存。
 
-⚠️ **没有 hash collision 检测**：理论上 SHA-256 collision 几乎不可能（2^128 量级），不需要。
+⚠️ **没有 hash collision 检测**:理论上 SHA-256 collision 几乎不可能(2^128 量级),不需要。
+
+### 3.7 `sessions`(2026-06 新增)
+
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL DEFAULT 'anonymous',
+    project_id    TEXT NOT NULL DEFAULT 'default',
+    data          JSONB NOT NULL,                      -- 整个 models.Session (含 Messages 数组、Summary)
+    message_count INT  NOT NULL DEFAULT 0,
+    last_role     TEXT NOT NULL DEFAULT '',
+    last_preview  TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_sessions_user_project ON sessions(user_id, project_id);
+CREATE INDEX idx_sessions_updated      ON sessions(updated_at DESC);
+```
+
+**为什么 data 走 JSONB 单列而不是拆 messages 子表**:
+- 写路径单条 Upsert,跟 Session 包 Lua 原子写 hot 节奏一致
+- session 长度有 token 阈值自动归档(`performHotColdSeparation`),单行 JSONB 体积可控
+- 拆表能换来按消息分页的能力,但 UI 当前无分页需求,**YAGNI 优先**
+
+**投影列**(`message_count` / `last_role` / `last_preview` / `updated_at`)单独存以供侧栏列表使用——`ListByUser` 不需要反序列化整个 `data` JSONB。
+
+**`user_id` / `project_id` DEFAULT** 沿用 `session.AnonymousUserID="anonymous"` / `"default"`,与 Manager 在 Create 时的归一化语义对齐。
+
+**CRUD 不在 store 包**:见 §1 头部说明;实际在 `internal/session/pg_store.go` 的 `PGSessionStore` 上,Manager 通过 `PGStore SessionStore` 字段持有。
 
 ---
 

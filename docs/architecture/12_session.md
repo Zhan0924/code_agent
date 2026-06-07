@@ -2,12 +2,13 @@
 
 > 代码（**以代码为准**，不要把 `_principles.go` 和 `doc.go` 里的设计构想当成实现）：
 >
-> - `manager.go` (633 行) — Redis 后端会话生命周期：CRUD + 热冷分层 + Lua 原子追加 + auto-pin + 压缩
-> - `summarizer.go` (108 行) — Summarizer 接口 + `LLMSummarizer` / `SimpleSummarizer`
-> - `_principles.go` (714 行) — **RFC 风格的设计构想**：里面描绘的 `sess:meta:{sid}` HASH + `sess:msg:{sid}:{shard}` LIST + Redis Cluster `{hash tag}` 全部 **未在 `manager.go` 中实现**。读这个文件时请意识到它是设计草图而非现状
-> - `doc.go` (46 行) — 同样**与代码不一致**：宣称的 List + Hash + String 三键分离 / PostgreSQL 表结构 / `SET NX PX` 分布式锁 在代码里都没有
+> - `manager.go` — Redis 后端会话生命周期：CRUD + 热冷分层 + Lua 原子追加 + auto-pin + 压缩 + **PG 长期持久化双写**
+> - `pg_store.go` — `SessionStore` 接口 + `PGSessionStore`(PostgreSQL `sessions` 表的 JSONB 行)。Manager 通过 `PGStore` 字段持有,作为 Redis hot/cold 过期后的权威源
+> - `summarizer.go` — Summarizer 接口 + `LLMSummarizer` / `SimpleSummarizer`
+> - `_principles.go` (714 行) — **RFC 风格的设计构想**:里面描绘的 `sess:meta:{sid}` HASH + `sess:msg:{sid}:{shard}` LIST + Redis Cluster `{hash tag}` 全部 **未在 `manager.go` 中实现**。读这个文件时请意识到它是设计草图而非现状
+> - `doc.go` (46 行) — 同样**与代码不一致**:宣称的 List + Hash + String 三键分离 / `SET NX PX` 分布式锁 在代码里都没有(**注意**:PostgreSQL 表结构这一项在 2026-06 引入 `pg_store.go` 之后**已落地**)
 >
-> 测试：`summarizer_test.go` (127 行)。
+> 测试:`summarizer_test.go`、`pg_store_test.go`、`manager_test.go`。
 
 ---
 
@@ -24,11 +25,12 @@ LLM 调用本质无状态——每一轮 ReAct 都要把完整 history 重新塞
 - **并发**：同一会话两条消息并发写，read-modify-write 会丢消息；
 - **持久化**：过期 session 占着 Redis 不释放，月度成本失控。
 
-本包实际用了 3 招（**不是 _principles.go 描绘的 5 招**）：
+本包实际用了 4 招(**比 _principles.go 描绘的更务实**):
 
-1. **Lua 原子追加**（`addMessageLuaScript`）：单线程 GET-decode-append-encode-SET 一气呵成，杜绝并发写丢失；
-2. **Token 预算驱动的热冷分离**：超 `SummaryThresholdTokens` 时把最旧若干条摘要化并归档到 `coldKey`；
-3. **Auto-Pin**：含"always/never/must/important:"等关键词的用户消息自动置位 `Pinned=true`（注意：**当前压缩逻辑并未真正读取 `Pinned`**，是埋点供未来的剪枝器使用）。
+1. **Lua 原子追加**(`addMessageLuaScript`):单线程 GET-decode-append-encode-SET 一气呵成,杜绝并发写丢失;
+2. **Token 预算驱动的热冷分离**:超 `SummaryThresholdTokens` 时把最旧若干条摘要化并归档到 `coldKey`;
+3. **Auto-Pin**:含"always/never/must/important:"等关键词的用户消息自动置位 `Pinned=true`(注意:**当前压缩逻辑并未真正读取 `Pinned`**,是埋点供未来的剪枝器使用);
+4. **PG 长期持久化**(`PGStore`,2026-06 引入):Create/AddMessage 时异步双写到 PostgreSQL `sessions` 表,Get 在 hot miss 时从 PG rehydrate 并回写 hot;ListSessions 改以 PG 为权威源——解决了 Redis hot/cold TTL 过期后会话从侧栏永久消失的旧 bug。
 
 **没有实现但 `_principles.go` 声称有的**：
 
@@ -50,8 +52,9 @@ LLM 调用本质无状态——每一轮 ReAct 都要把完整 history 重新塞
 | Redis | <1ms | AOF 可选 | 共享 | 原生 `EXPIRE` | 中 |
 | Postgres | 1-5ms | 强 | 共享 | 手工清理 | 高 |
 
-**结论**：Redis。`main.go:140-141` 显示 Redis 失败直接 fatal，session 包认 Redis 为强依赖。
-Postgres 只通过 `ColdStore` 回调注入（可选）。
+**结论**:Redis(热路径)+ Postgres(长期持久化)双层。`main.go` 显示 Redis 失败直接 fatal,session 包认 Redis 为热路径强依赖;PG 可选,无 PG 时退化为 Redis-only 模式(行为等同 2026-06 前的实现,过期仍会从侧栏消失)。
+
+历史钩子 `ColdStore func`(`manager.go`)仍保留:它服务"超 token 阈值压缩归档到 Redis cold"语义,跟"全量持久化"的 `PGStore` 是两条正交路径,共存不冲突。
 
 ### Q2 — 为什么是单 JSON blob，不是 HASH + LIST？
 
@@ -106,34 +109,35 @@ go m.checkAndArchive(context.Background(), sessionID)
 └────────────┬───────────────────────────────────────┘
              │
              ▼
-   ┌────────────────────────┐
-   │ session.Manager         │
-   │  - rdb: *redis.Client   │
-   │  - cfg: SessionConfig   │
-   │  - ColdStore: callback  │
-   │  - Summarizer: iface    │
-   └────────┬───────────────┘
+   ┌────────────────────────────┐
+   │ session.Manager             │
+   │  - rdb: *redis.Client       │
+   │  - cfg: SessionConfig       │
+   │  - PGStore: SessionStore    │  ← 2026-06 新增,长期权威源
+   │  - ColdStore: callback      │  ← 旧钩子,与 PGStore 正交
+   │  - Summarizer: iface        │
+   └────────┬────────────────────┘
             │
-     ┌──────┴──────┐
-     │             │
-     ▼             ▼
-  ┌──────┐    ┌─────────────┐
-  │Redis │    │ Summarizer  │
-  │ hot+ │    │ (LLM/Simple│
-  │ cold │    │  字符串)    │
-  └──────┘    └─────────────┘
-            │
-            │ (async, optional)
-            ▼
-       ColdStore(callback)
-         → PostgreSQL / S3
+     ┌──────┼───────┬──────────────┐
+     ▼      ▼       ▼              ▼
+  ┌──────┐ ┌──────────┐ ┌──────────────┐
+  │Redis │ │PG sessions│ │ Summarizer   │
+  │ hot+ │ │ table     │ │ (LLM/Simple │
+  │ cold │ │ (JSONB)   │ │  字符串)     │
+  └──────┘ └──────────┘ └──────────────┘
+                            │
+                            │ (async, optional, 旧路径)
+                            ▼
+                       ColdStore(callback)
+                         → PostgreSQL / S3
 ```
 
-**注入点**（`cmd/agent/main.go`）：
+**注入点**(`cmd/agent/main.go`):
 
-- L144：`session.NewManager(rdb, &cfg.Session, logger)`
-- L194-209：把 `llmClient.ChatCompletion`（Temperature=0.2）包装成 `LLMSummarizer` 注入 `sessionMgr.Summarizer`
-- `ColdStore` 字段**在 main.go 中没有任何赋值**——目前是悬空回调，归档只到 `coldKey` Redis，不会落 PG
+- `session.NewManager(rdb, &cfg.Session, logger)`
+- 把 `llmClient.ChatCompletion`(Temperature=0.2)包装成 `LLMSummarizer` 注入 `sessionMgr.Summarizer`
+- `pgStore != nil` 时:`sessionMgr.PGStore = session.NewPGSessionStore(pgStore.DB(), logger)`,启用 PG 长期持久化
+- `ColdStore` 字段**在 main.go 中没有任何赋值**——目前是悬空回调,归档只到 `coldKey` Redis(`PGStore` 已替代了它的"长期落 PG"职责,`ColdStore` 留作未来扩展)
 
 ---
 
@@ -227,22 +231,24 @@ sessionShard(sid)       = fnv32(sid) % shardCount     // shardCount=4
 
 ## 4. 数据模型
 
-### 4.1 `Manager` 结构（manager.go:91-103）
+### 4.1 `Manager` 结构(manager.go)
 
 ```go
 type Manager struct {
     rdb    *redis.Client       // ⚠️ 不是 ClusterClient
     cfg    *config.SessionConfig
     logger *zap.Logger
-    ColdStore  func(ctx, sessionID, *ColdSessionData) error  // 可选
+    PGStore    SessionStore                                   // 2026-06 新增,可选
+    ColdStore  func(ctx, sessionID, *ColdSessionData) error  // 可选,旧钩子
     Summarizer Summarizer                                     // 可选
 }
 ```
 
-`ColdStore` 和 `Summarizer` 都是**可选字段**：
+`PGStore`/`ColdStore`/`Summarizer` 都是**可选字段**:
 
 - `Summarizer == nil` → `buildSummary` 走字符串拼接 fallback
-- `ColdStore == nil` → 归档只写 Redis `coldKey`，不落 PG / S3
+- `ColdStore == nil` → 归档只写 Redis `coldKey`,不落 PG / S3
+- `PGStore == nil` → 退化为 Redis-only 模式:Create/AddMessage 不双写,Get 不 rehydrate,ListSessions 走旧路径(含 stale ZREM)。**生产环境强烈建议接入 PGStore**——否则会话超过 Redis hot TTL(24h)后从侧栏永久消失
 
 ### 4.2 `SessionConfig`（config.go:255-261）
 
@@ -467,9 +473,70 @@ if ColdStore != nil:
 | `PinMessage(sid, msgID)` | L586 | GET → 找到 msgID 改 Pinned=true → SET |
 | `UnpinMessage(sid, msgID)` | L591 | 同上设 false |
 
-⚠️ **`PinMessage`/`UnpinMessage` 非 Lua 原子**（L596-633）：
-读-改-写 序列，**与并发 AddMessage 竞争会导致 Pin 状态丢失**。
-原因：Pin 操作不是高频，未被设计成原子。**已知 P1**。
+⚠️ **`PinMessage`/`UnpinMessage` 非 Lua 原子**(L596-633):
+读-改-写 序列,**与并发 AddMessage 竞争会导致 Pin 状态丢失**。
+原因:Pin 操作不是高频,未被设计成原子。**已知 P1**。
+
+---
+
+## 7.5 ★ ListSessions / Get 的 PG 长期持久化路径(2026-06)
+
+### 7.5.1 旧 bug:Redis-only 时为何会话从侧栏消失
+
+旧 `ListSessions` 流程:遍历 `sess:idx:<userID>` ZSET 拿 sessionID → 逐条 `Get(hotKey)` → **hot miss 则 ZREM 索引项**。
+hot TTL=24h,用户两天没回访的会话被认定"stale"主动 ZREM,**索引一旦删除就不可恢复**——即使 cold key 还在 Redis 里也找不回来,即使 user 重启服务也救不回来。
+
+### 7.5.2 新流程:PG 为权威源,Redis 仅做 hot warming
+
+`PGStore != nil` 时,`ListSessions` 不再走 Redis ZSET 路径,而是:
+
+```
+PGStore.ListByUser(userID, limit)
+  ├ SELECT id,user_id,project_id,message_count,last_role,last_preview,created_at,updated_at
+  │ FROM sessions WHERE user_id=$1 ORDER BY updated_at DESC LIMIT $2
+  ├ 不读 data JSONB(避免大列扫描)
+  └ 返回 []*SessionSummary
+对每条 PG summary,opportunistic 从 hot 取实时 message_count/last_preview 覆盖
+→ 返回最终列表
+```
+
+**关键改动**:
+- ✅ 不再 ZREM——hot miss 不会触发索引清理,会话永不"被动消失"
+- ✅ PG 是权威源,Redis 仅当"加速层"使用
+- ✅ `PGStore.ListByUser` 失败时**优雅回落**到旧的 Redis ZSET 路径(只是没有 stale prune,见 §7.5.4)
+
+### 7.5.3 Get 的 rehydrate
+
+```
+Get(sid):
+  data := rdb.Get(hotKey)
+  if redis.Nil && PGStore != nil:
+      session := PGStore.Get(sid)   // 从 PG JSONB 反序列化整 Session
+      saveHot(session)              // 回写 hot,后续 Get 走 fast path
+      return session
+  ...
+```
+
+PG 命中后自动回写 hot,意味着用户点开一个超过 24h 的会话,**第一次 Get 慢一点(多 1 个 PG round-trip),后续都是热路径**。
+
+### 7.5.4 双写策略
+
+| 写入点 | 同步 Redis | 异步 PG | 备注 |
+|---|---|---|---|
+| `Create` | ✅ saveHot + 入 ZSET | ✅ `go m.asyncPGUpsert(session)` | 失败仅 Warn |
+| `AddMessage` | ✅ Lua 原子追加 | ✅ Lua 后 Get 一次拿快照,再 asyncPGUpsert | 多 1 次 Redis GET 的成本 |
+| `Delete` | ✅ Pipeline 删 hot/cold | ✅ 5s timeout context 异步 Delete | 失败仅 Warn |
+
+**异步 PG 写一律深 copy `Messages` slice 后再丢 goroutine**,避免与后续 AddMessage 的 slice mutation 竞争。
+
+### 7.5.5 PG 不可用退化
+
+`PGStore == nil` 时,Manager 行为**完全等同 2026-06 前**:
+- Create/AddMessage/Delete 不双写
+- Get 在 hot miss 时直接 return not-found
+- ListSessions 走旧 Redis ZSET 路径,**保留 stale prune**(Redis-only 模式下索引膨胀的唯一回收手段)
+
+`main.go` 在 PG DSN 为空时 Warn:"session PG long-term store disabled (no Postgres DSN); sessions will be lost after Redis TTL"——这是显式提示,不是 Fatal。
 
 ---
 
@@ -560,12 +627,13 @@ return total
 
 ### 10.1 当前实现的真实利弊
 
-**优势（验证过的）**
-- ✅ Lua 原子 AddMessage：并发写不丢消息
-- ✅ Token 预算驱动归档：单条 50KB 消息也能触发压缩
-- ✅ Summarizer 失败自动降级：LLM 挂不影响主流程
-- ✅ 异步 `Background()` ctx 归档：用户请求结束不打断归档
-- ✅ Cold key TTL=hot*2：用户跨天回访还能拿到摘要
+**优势(验证过的)**
+- ✅ Lua 原子 AddMessage:并发写不丢消息
+- ✅ Token 预算驱动归档:单条 50KB 消息也能触发压缩
+- ✅ Summarizer 失败自动降级:LLM 挂不影响主流程
+- ✅ 异步 `Background()` ctx 归档:用户请求结束不打断归档
+- ✅ Cold key TTL=hot*2:用户跨天回访还能拿到摘要
+- ✅ **PG 长期持久化(2026-06)**:Redis hot/cold 过期不丢会话;ListSessions 不再 ZREM stale;Get 透明 rehydrate
 
 **已知风险**
 - ⚠️ **并发归档无 lock**：连续两条 AddMessage 触发的 `performHotColdSeparation` 可能并发执行，最终靠"最后一次 SET hotKey 胜出"收敛——少量消息可能被复制归档

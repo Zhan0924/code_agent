@@ -177,18 +177,23 @@ Activity 配置：StartToCloseTimeout=5min, RetryPolicy{Initial=1s, Backoff=2.0,
 
 ### 表结构
 
-`Migrate()` 自动创建 4 张表：
+`Migrate()` 自动创建 **7 张表**:
 
 | 表 | 主要字段 | 用途 |
 |---|---------|------|
-| `tasks` | id, session_id, user_id, intent, state, user_input, result | 任务记录 |
+| `tasks` | id, session_id, user_id, intent, state, user_input, result, plan_json | 任务记录 |
 | `audit_logs` | task_id, user_id, action, details(JSONB), risk_level | 审计日志 |
 | `api_keys` | key_hash, user_id, role, label | API Key 存储 |
 | `approvals` | task_id, session_id, action, risk_level, status, approved_by | HITL 审批记录 |
+| `dynamic_tools` | name, description, parameters(JSONB), executor_type, executor_config(JSONB), ttl | 运行时注册工具 + TTL |
+| `file_checksums` | (project_name, file_path) PK, hash | indexer 增量索引缓存 |
+| `sessions` (2026-06) | id, user_id, project_id, data(JSONB 全 Session), message_count, last_role, last_preview, updated_at | Session 长期权威源,对抗 Redis hot/cold TTL |
 
-连接池：MaxOpenConns / MaxIdleConns 可配置，ConnMaxLifetime=5min。
+连接池:MaxOpenConns / MaxIdleConns 可配置,ConnMaxLifetime=5min。
 
-**不变量**：Store 故障不影响核心功能——Session 状态在 Redis，Store 仅用于持久化/审计。
+**不变量**:Store 故障不影响核心功能——hot Session 在 Redis(热路径必备);PG 失败时 Session 退化为 Redis-only 模式(过期会从侧栏消失,但 chat/RAG 主链路不受影响)。
+
+**sessions 表 CRUD 不在 store 包**:DDL 在 `store.Migrate`,但 `Upsert/Get/ListByUser/Delete` 在 `internal/session/pg_store.go::PGSessionStore`(通过 `pgStore.DB()` 暴露的 `*sql.DB`),避免 store 包反向依赖 session 包。其他 6 张表 CRUD 都在 `store.Store` 上,sessions 是唯一例外。
 
 ## Workspace
 

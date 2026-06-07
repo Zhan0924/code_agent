@@ -53,6 +53,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -93,9 +94,18 @@ type Manager struct {
 	cfg    *config.SessionConfig
 	logger *zap.Logger
 
-	// ColdStore is an optional callback for archiving cold session data.
-	// In production, this would write to PostgreSQL or S3.
+	// ColdStore is an optional callback for archiving cold session data
+	// (the token-budget driven compression path — see performHotColdSeparation).
+	// Orthogonal to PGStore: ColdStore archives *trimmed* old messages, whereas
+	// PGStore mirrors the *current* session for long-term sidebar persistence.
 	ColdStore func(ctx context.Context, sessionID string, data *ColdSessionData) error
+
+	// PGStore is the optional long-term persistence layer. When non-nil,
+	// every Create/AddMessage/Delete is mirrored to PG asynchronously, Get
+	// falls back to PG on hot miss (and rewrites hot), and ListSessions uses
+	// PG as the authoritative source. When nil, Manager behaves exactly as
+	// the pre-PG Redis-only implementation — so Postgres is a strict upgrade.
+	PGStore SessionStore
 
 	// Summarizer is an optional LLM-based summarizer for archived messages.
 	// If nil, buildSummary falls back to simple string truncation.
@@ -211,12 +221,88 @@ func (m *Manager) Create(ctx context.Context, userID, projectID string) (*models
 		)
 	}
 
+	// Mirror to PG long-term store. Async + best-effort: the Redis write above
+	// is already the source of truth for the active request; PG miss only
+	// matters once hot TTL expires, by which point the goroutine has long
+	// since finished or logged.
+	m.asyncPGUpsert(session)
+
 	m.logger.Info("session created",
 		zap.String("session_id", session.ID),
 		zap.String("project_id", projectID),
 		zap.Uint32("shard", sessionShard(session.ID)),
 	)
 	return session, nil
+}
+
+// rehydrateFromPG pulls a session from the PG long-term store on Redis hot
+// miss and writes it back to hot so subsequent Get/AddMessage stay on the fast
+// path. Returns nil for any failure mode (PG unavailable, ErrSessionNotFound,
+// rewrite error) — caller treats nil as "still not found" and surfaces the
+// original session-not-found error to keep behavior identical when PGStore
+// isn't wired.
+func (m *Manager) rehydrateFromPG(ctx context.Context, sessionID string) *models.Session {
+	if m.PGStore == nil {
+		return nil
+	}
+	session, err := m.PGStore.Get(ctx, sessionID)
+	if err != nil {
+		if !errors.Is(err, ErrSessionNotFound) {
+			m.logger.Warn("pg session rehydrate failed",
+				zap.String("session_id", sessionID),
+				zap.Error(err),
+			)
+		}
+		return nil
+	}
+	if err := m.saveHot(ctx, session); err != nil {
+		m.logger.Warn("pg session rehydrate: hot rewrite failed",
+			zap.String("session_id", sessionID),
+			zap.Error(err),
+		)
+		// Still return the session — the read succeeded even if the write-
+		// back didn't. Next call will rehydrate again.
+	} else {
+		// Refresh the per-user index ZSET so the sidebar keeps reflecting
+		// recency once this session is hot again.
+		if err := m.rdb.ZAdd(ctx, sessionIndexKey(session.UserID), redis.Z{
+			Score:  float64(session.UpdatedAt.UnixNano()),
+			Member: session.ID,
+		}).Err(); err != nil {
+			m.logger.Warn("pg session rehydrate: index refresh failed",
+				zap.String("session_id", sessionID),
+				zap.Error(err),
+			)
+		}
+	}
+	return session
+}
+
+// asyncPGUpsert is the shared best-effort PG mirror used by Create/AddMessage.
+// No-op when PGStore is nil so Redis-only deployments pay zero overhead.
+//
+// The copy is made on the caller's goroutine — the source session is mutated
+// by ReAct loops (e.g. AddMessage appends, performHotColdSeparation trims)
+// while the goroutine runs, and json.Marshal would otherwise race the writer.
+func (m *Manager) asyncPGUpsert(s *models.Session) {
+	if m == nil || m.PGStore == nil || s == nil {
+		return
+	}
+	snapshot := *s
+	if len(s.Messages) > 0 {
+		snapshot.Messages = make([]models.Message, len(s.Messages))
+		copy(snapshot.Messages, s.Messages)
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := m.PGStore.Upsert(ctx, &snapshot); err != nil {
+			m.logger.Warn("pg session upsert failed",
+				zap.String("session_id", snapshot.ID),
+				zap.Error(err),
+			)
+		}
+	}()
 }
 
 // Get retrieves a session from Redis, combining hot data with cold summary.
@@ -228,6 +314,12 @@ func (m *Manager) Get(ctx context.Context, sessionID string) (*models.Session, e
 	data, err := m.rdb.Get(ctx, hotKey(sessionID)).Bytes()
 	if err != nil {
 		if err == redis.Nil {
+			// Redis hot expired or evicted. Fall back to PG long-term store
+			// when wired — this is the rehydrate path that keeps "click an
+			// archived session in the sidebar" working past the 24h TTL.
+			if rehydrated := m.rehydrateFromPG(ctx, sessionID); rehydrated != nil {
+				return rehydrated, nil
+			}
 			return nil, fmt.Errorf("session not found: %s", sessionID)
 		}
 		return nil, fmt.Errorf("failed to get session: %w", err)
@@ -338,6 +430,16 @@ func (m *Manager) AddMessage(ctx context.Context, sessionID string, msg models.M
 	// Check if hot/cold separation is needed based on token budget
 	// (async — use Background since request ctx may cancel before goroutine runs)
 	go m.checkAndArchive(context.Background(), sessionID)
+
+	// Mirror the updated session to PG. We need a fresh snapshot because the
+	// Lua script wrote it server-side — choosing one extra Redis GET over
+	// teaching the Lua script to return the JSON keeps the Lua block stable.
+	// Skip the round trip entirely when PG isn't wired.
+	if m.PGStore != nil {
+		if updated, getErr := m.Get(ctx, sessionID); getErr == nil {
+			m.asyncPGUpsert(updated)
+		}
+	}
 
 	return nil
 }
@@ -513,6 +615,23 @@ func (m *Manager) Delete(ctx context.Context, sessionID string) error {
 	pipe.ZRem(ctx, sessionIndexKey(userID), sessionID)
 
 	_, err := pipe.Exec(ctx)
+
+	// Mirror delete to PG. Async + best-effort: a stale PG row would later
+	// resurface in the sidebar, but the caller's intent (Redis purge) is
+	// already satisfied; the next ListSessions call would still expose it.
+	if m.PGStore != nil {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if delErr := m.PGStore.Delete(bgCtx, sessionID); delErr != nil {
+				m.logger.Warn("pg session delete failed",
+					zap.String("session_id", sessionID),
+					zap.Error(delErr),
+				)
+			}
+		}()
+	}
+
 	return err
 }
 
@@ -535,10 +654,22 @@ type SessionSummary struct {
 
 // ListSessions returns the user's sessions ordered by most-recent activity.
 //
-// limit ≤ 0 defaults to 50; the hard cap (200) bounds worst-case Redis load
-// from a misbehaving caller. Members that have aged out of the hot store
-// (TTL expired) are silently skipped — and pruned from the index when seen —
-// so the list stays in sync with what Get can actually return.
+// limit ≤ 0 defaults to 50; the hard cap (200) bounds worst-case load from a
+// misbehaving caller.
+//
+// Two paths:
+//
+//   - **PG-authoritative** (PGStore != nil): list directly from `sessions`.
+//     This is the only path that survives Redis TTL — without it, hot expiry
+//     would silently drop the row from the sidebar forever. We deliberately
+//     do NOT ZREM stale ZSET members here; the index is now a warming hint,
+//     not the source of truth, and pruning would re-introduce the original
+//     bug (sessions older than 48h vanish permanently from PG queries too).
+//
+//   - **Redis-only legacy** (PGStore == nil): preserve the pre-PG behavior
+//     for deployments without Postgres — list from the per-user ZSET, drop
+//     and ZREM rows whose hot key is gone. This path is exactly what shipped
+//     before this commit.
 func (m *Manager) ListSessions(ctx context.Context, userID string, limit int) ([]*SessionSummary, error) {
 	if limit <= 0 {
 		limit = 50
@@ -547,6 +678,49 @@ func (m *Manager) ListSessions(ctx context.Context, userID string, limit int) ([
 		limit = 200
 	}
 
+	if m.PGStore != nil {
+		return m.listSessionsFromPG(ctx, userID, limit)
+	}
+	return m.listSessionsFromRedis(ctx, userID, limit)
+}
+
+// listSessionsFromPG is the PG-authoritative path. Hot warming is opportunistic:
+// if a session is still in hot we use its (more accurate, near-realtime) message
+// metrics; otherwise we surface the PG projection columns as-is.
+func (m *Manager) listSessionsFromPG(ctx context.Context, userID string, limit int) ([]*SessionSummary, error) {
+	pgSummaries, err := m.PGStore.ListByUser(ctx, userID, limit)
+	if err != nil {
+		// Fall back to Redis-only on PG outage so the sidebar doesn't go
+		// dark when PG hiccups. Logged so the degradation is visible.
+		m.logger.Warn("pg session list failed, falling back to redis index",
+			zap.String("user_id", userID),
+			zap.Error(err),
+		)
+		return m.listSessionsFromRedis(ctx, userID, limit)
+	}
+	if len(pgSummaries) == 0 {
+		return []*SessionSummary{}, nil
+	}
+
+	for _, s := range pgSummaries {
+		// Best-effort hot refresh — if hot is still warm, the message count
+		// and preview reflect the live state more accurately than PG, which
+		// is only refreshed by the async asyncPGUpsert goroutine.
+		if session, err := m.fetchHotOnly(ctx, s.ID); err == nil {
+			fresh := buildSummary(session)
+			s.MessageCount = fresh.MessageCount
+			s.LastMessageRole = fresh.LastMessageRole
+			s.LastMessagePreview = fresh.LastMessagePreview
+			s.UpdatedAt = fresh.UpdatedAt
+		}
+	}
+	return pgSummaries, nil
+}
+
+// listSessionsFromRedis is the legacy Redis-only path. Identical to the
+// pre-PG implementation: walk the per-user ZSET, drop entries whose hot key
+// is gone, and ZREM stale members so the next call doesn't pay for them.
+func (m *Manager) listSessionsFromRedis(ctx context.Context, userID string, limit int) ([]*SessionSummary, error) {
 	indexKey := sessionIndexKey(userID)
 	ids, err := m.rdb.ZRevRange(ctx, indexKey, 0, int64(limit-1)).Result()
 	if err != nil {
@@ -562,16 +736,12 @@ func (m *Manager) ListSessions(ctx context.Context, userID string, limit int) ([
 	for _, sid := range ids {
 		session, err := m.Get(ctx, sid)
 		if err != nil {
-			// Expired or evicted — drop from index next pass.
 			stale = append(stale, sid)
 			continue
 		}
 		summaries = append(summaries, buildSummary(session))
 	}
 
-	// Prune stale members so the next listing doesn't keep paying for them.
-	// Fire-and-forget against a background context — if pruning fails we'll
-	// retry on the next list call.
 	if len(stale) > 0 {
 		members := make([]any, len(stale))
 		for i, s := range stale {
@@ -589,6 +759,22 @@ func (m *Manager) ListSessions(ctx context.Context, userID string, limit int) ([
 	}
 
 	return summaries, nil
+}
+
+// fetchHotOnly reads a session strictly from the Redis hot key, without
+// triggering the PG rehydrate path that Get does. Used by ListSessions' PG
+// path to opportunistically overlay live message metrics without amplifying
+// PG read pressure (rehydrating every listed session would defeat the point).
+func (m *Manager) fetchHotOnly(ctx context.Context, sessionID string) (*models.Session, error) {
+	data, err := m.rdb.Get(ctx, hotKey(sessionID)).Bytes()
+	if err != nil {
+		return nil, err
+	}
+	var session models.Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		return nil, err
+	}
+	return &session, nil
 }
 
 // buildSummary projects a full session into the lightweight sidebar shape.

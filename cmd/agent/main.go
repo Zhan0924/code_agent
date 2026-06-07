@@ -372,6 +372,18 @@ func main() {
 		}
 	}
 
+	// ─── Wire Session PG Long-Term Store ─────────────────────────────────
+	// Without this, Redis hot/cold TTL (24h/48h) silently drops sessions from
+	// the sidebar forever. With it, the PG `sessions` row is authoritative
+	// and Redis becomes a cache. Graceful degradation: no PG → legacy
+	// Redis-only behavior (start-time Warn keeps the limitation visible).
+	if pgStore != nil {
+		sessionMgr.PGStore = session.NewPGSessionStore(pgStore.DB(), logger)
+		logger.Info("session PG long-term store enabled")
+	} else {
+		logger.Warn("session PG long-term store disabled (no Postgres DSN); sessions will be lost after Redis TTL")
+	}
+
 	// ─── Initialize Tracing (optional) ───────────────────────────────────
 	tracingCfg := &tracing.Config{
 		Enabled:     cfg.Tracing.Enabled,
