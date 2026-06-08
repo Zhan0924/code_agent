@@ -33,8 +33,15 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
-      # temporal:
-      #   condition: service_started
+      # Temporal is in the `hitl` profile (off by default). Older Compose
+      # versions error on depends_on of profile-disabled services, so the
+      # dependency is intentionally NOT declared here. Behavior:
+      #   - `--profile hitl up`: temporal + agent both come up; if Dial races
+      #     temporal's startup the worker stays nil (HITL disabled), since
+      #     startTemporalWorker (cmd/agent/main.go) dials once with no retry.
+      #     Re-run `docker compose --profile hitl up -d agent` once temporal
+      #     is healthy if you need HITL on this boot.
+      #   - default boot: Dial fails fast, HITL stays nil, HTTP path stays up.
     restart: unless-stopped
     # Docker socket needs root or docker group access
     user: "0:0"
@@ -91,9 +98,11 @@ services:
       - agent-net
 
   # ─── Jaeger (Distributed Tracing) ────────────────────────
+  # Profile: observability. Start with `docker compose --profile observability up -d`.
   jaeger:
     image: docker.m.daocloud.io/jaegertracing/all-in-one:latest
     container_name: agent-jaeger
+    profiles: ["observability"]
     ports:
       - "16686:16686"   # Jaeger UI
       - "4317:4317"     # OTLP gRPC
@@ -103,10 +112,13 @@ services:
     networks:
       - agent-net
 
-  # ─── Temporal Server (optional, comment out if not using) ─
+  # ─── Temporal Server (HITL workflow engine) ─────────────
+  # Profile: hitl. Start with `docker compose --profile hitl up -d`.
+  # Without this profile, agent runs without HITL (Temporal Dial fails → nil worker).
   temporal:
     image: docker.m.daocloud.io/temporalio/auto-setup:1.25
     container_name: agent-temporal
+    profiles: ["hitl"]
     ports:
       - "7233:7233"
     environment:
@@ -130,10 +142,45 @@ services:
     networks:
       - agent-net
 
+  # ─── Temporal Namespace Init (one-shot) ─────────────────
+  # Profile: hitl. Ensures the `code-agent` namespace exists in temporal.
+  # auto-setup only registers `default`; without this, the agent's Temporal
+  # worker fails with `Namespace code-agent is not found`. Idempotent: re-run
+  # on subsequent ups just confirms existence and exits.
+  temporal-init:
+    image: docker.m.daocloud.io/temporalio/admin-tools:1.25
+    container_name: agent-temporal-init
+    profiles: ["hitl"]
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      # Bypass inherited host proxy — gRPC to temporal:7233 must not be tunneled
+      - NO_PROXY=temporal,postgres,redis,qdrant,jaeger,localhost,127.0.0.1
+      - no_proxy=temporal,postgres,redis,qdrant,jaeger,localhost,127.0.0.1
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        until temporal --address temporal:7233 operator namespace describe -n code-agent >/dev/null; do
+          temporal --address temporal:7233 operator namespace create --retention 72h -n code-agent || true;
+          sleep 3;
+        done;
+        echo "namespace code-agent ready"
+    restart: "no"
+    networks:
+      - agent-net
+
   # ─── Temporal Web UI ────────────────────────────────────
+  # Profile: hitl (rides with temporal).
   temporal-ui:
     image: docker.m.daocloud.io/temporalio/ui:2.31.2
     container_name: agent-temporal-ui
+    profiles: ["hitl"]
     ports:
       - "8088:8080"
     environment:

@@ -338,9 +338,13 @@ func (s *Server) handleChatReactStream(c *gin.Context) {
 // 仍需 /resume 把 cache 里的 tail Replay 给客户端。
 //
 //	GET /api/v1/chat/react-stream/status?session_id=<id>
-//	200 {"running": false, "event_count": 0}                       —— 完全无事
-//	200 {"running": false, "event_count": 924}                     —— 已完成,有 cache 可回放
-//	200 {"running": true,  "task_id": "<uuid>", "event_count": N}  —— 仍在跑
+//	200 {"running": false, "event_count": 0,                  "last_event_at_ms": 0}
+//	200 {"running": false, "event_count": 924, "last_event_at_ms": 17178...}  —— 已完成,有 cache 可回放
+//	200 {"running": true,  "task_id": "<uuid>", "event_count": N, "last_event_at_ms": 17178...}
+//
+// last_event_at_ms 是 Redis Stream 最末一条事件的写入毫秒戳。前端在 watchdog
+// 触发前可据此判断"后端是否真活着":若 running=true 但 last_event_at_ms 已
+// 停滞数分钟,后端八成卡在 finalize LLM 调用上,UI 应给出更友好提示。
 func (s *Server) handleChatReactStreamStatus(c *gin.Context) {
 	sessionID := c.Query("session_id")
 	if sessionID == "" {
@@ -349,12 +353,18 @@ func (s *Server) handleChatReactStreamStatus(c *gin.Context) {
 	}
 	cache := s.orchestrator.StreamCache()
 	if cache == nil {
-		c.JSON(http.StatusOK, gin.H{"running": false, "event_count": 0})
+		c.JSON(http.StatusOK, gin.H{"running": false, "event_count": 0, "last_event_at_ms": 0})
 		return
 	}
-	taskID, running := cache.Status(c.Request.Context(), sessionID)
-	eventCount := cache.EventCount(c.Request.Context(), sessionID)
-	resp := gin.H{"running": running, "event_count": eventCount}
+	ctx := c.Request.Context()
+	taskID, running := cache.Status(ctx, sessionID)
+	eventCount := cache.EventCount(ctx, sessionID)
+	lastEventAtMs := cache.LastEventAt(ctx, sessionID)
+	resp := gin.H{
+		"running":          running,
+		"event_count":      eventCount,
+		"last_event_at_ms": lastEventAtMs,
+	}
 	if running {
 		resp["task_id"] = taskID
 	}
@@ -398,8 +408,26 @@ func (s *Server) handleChatReactStreamResume(c *gin.Context) {
 	sessData, _ := json.Marshal(map[string]string{"session_id": sessionID})
 	sendEvent(models.StreamEvent{Type: "session", Data: sessData})
 
+	streamReplayFollow(c.Request.Context(), cache, sessionID, sendEvent, c.Writer, &writeMu)
+}
+
+// streamReplayFollow 是 handleChatReactStreamResume 的核心逻辑，独立出来纯粹
+// 为可测性：它只依赖 StreamCacheReplayer 接口（足以 stub）+ sendEvent 闭包，
+// 不绑 *gin.Context，可以在测试里直接驱动而无需构造完整 Orchestrator。
+//
+// 终态兜底：Replay 历史与 Follow 增量任一段缺 done/error 都会让前端 reader
+// 永远不收到结束信号，UI spinner 卡到 90s watchdog 才降级。本函数对两段都
+// 主动检查 hasTerminal，必要时 emit 一条合成 done。
+func streamReplayFollow(
+	ctx context.Context,
+	cache streamCacheReplayer,
+	sessionID string,
+	sendEvent func(models.StreamEvent),
+	writer sseFlushWriter,
+	writeMu *sync.Mutex,
+) {
 	// 1) Replay 历史
-	historyCtx, historyCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	historyCtx, historyCancel := context.WithTimeout(ctx, 10*time.Second)
 	history, lastID, err := cache.Replay(historyCtx, sessionID)
 	historyCancel()
 	if err != nil {
@@ -407,37 +435,74 @@ func (s *Server) handleChatReactStreamResume(c *gin.Context) {
 		sendEvent(models.StreamEvent{Type: "error", Data: errData})
 		return
 	}
+	hasTerminal := false
 	for _, ev := range history {
 		data, mErr := json.Marshal(ev)
 		if mErr != nil {
 			continue
 		}
 		sendEvent(models.StreamEvent{Type: ev.Type, Data: data, TaskID: ev.TaskID})
+		if ev.Type == "done" || ev.Type == "error" {
+			hasTerminal = true
+		}
 	}
 
-	// 如果 status 已经 NOT running，直接结束 —— 客户端 done 事件应已在 history 中。
-	if _, running := cache.Status(c.Request.Context(), sessionID); !running {
+	// 如果 status 已经 NOT running，直接结束 —— history 应已含 done。
+	if _, running := cache.Status(ctx, sessionID); !running {
+		if !hasTerminal {
+			emitSyntheticDone(sendEvent, "synthesized_after_replay")
+		}
 		return
 	}
 
-	// 2) 心跳 + Follow 增量
-	pingCtx, pingCancel := context.WithCancel(c.Request.Context())
+	// 2) 心跳 + Follow 增量（heartbeat 仅在 writer 非 nil 时启动 —— 测试可跳过）
+	var pingDone chan struct{}
+	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
-	pingDone := make(chan struct{})
-	go func() {
-		defer close(pingDone)
-		runSSEHeartbeat(pingCtx, c.Writer, &writeMu, sseHeartbeatInterval)
-	}()
+	if writer != nil && writeMu != nil {
+		pingDone = make(chan struct{})
+		go func() {
+			defer close(pingDone)
+			runSSEHeartbeat(pingCtx, writer, writeMu, sseHeartbeatInterval)
+		}()
+	}
 
-	for ev := range cache.Follow(c.Request.Context(), sessionID, lastID) {
+	for ev := range cache.Follow(ctx, sessionID, lastID) {
 		data, mErr := json.Marshal(ev)
 		if mErr != nil {
 			continue
 		}
 		sendEvent(models.StreamEvent{Type: ev.Type, Data: data, TaskID: ev.TaskID})
+		if ev.Type == "done" || ev.Type == "error" {
+			hasTerminal = true
+		}
 	}
 	pingCancel()
-	<-pingDone
+	if pingDone != nil {
+		<-pingDone
+	}
+
+	// Follow 退出后再兜底一次：Follow 已 drainTail 但 stream 末尾仍可能因 cache
+	// 截断 / 写入顺序竞态而缺终态。若客户端 ctx 还活着，补一条 done 让 UI 收尾。
+	if ctx.Err() == nil && !hasTerminal {
+		emitSyntheticDone(sendEvent, "synthesized_after_follow")
+	}
+}
+
+// streamCacheReplayer 抽象 StreamCache 的三个方法，仅供 streamReplayFollow 使用 ——
+// 解耦测试 stub 与真 cache。生产路径用 *orchestrator.StreamCache 满足该接口。
+type streamCacheReplayer interface {
+	Replay(ctx context.Context, sessionID string) ([]models.ReactStreamEvent, string, error)
+	Status(ctx context.Context, sessionID string) (string, bool)
+	Follow(ctx context.Context, sessionID, lastID string) <-chan models.ReactStreamEvent
+}
+
+// emitSyntheticDone 在 Replay/Follow 都没碰到 done/error 时主动合成一条 done。
+// reason 出现在 SSE data 字段里，方便前端 console 与后端日志关联排查。
+// 不增加日志噪音 —— 走「兜底成功」路径时不需要 warn。
+func emitSyntheticDone(send func(models.StreamEvent), reason string) {
+	payload, _ := json.Marshal(map[string]string{"reason": reason})
+	send(models.StreamEvent{Type: "done", Data: payload})
 }
 
 // sseHeartbeatInterval 控制 /chat/react-stream 心跳周期。write_timeout=600s 提供 24x 余量。
@@ -452,11 +517,14 @@ type sseFlushWriter interface {
 	Flush()
 }
 
-// runSSEHeartbeat 周期性地向 w 写出 SSE 注释行 `: ping\n\n`，
-// 直至 ctx 取消。每次写入通过 mu 与业务事件串行化，避免与 c.SSEvent 的多次 Write 交错。
-// `: ` 前缀加空行是 SSE 标准注释格式：EventSource / 兼容的 fetch reader 都不会把它
-// 投递给上层（前端 ChatPage.tsx 仅识别 `data:` 前缀），仅消耗一次链路 IO 字节，
-// 足以让 net/http 的 write_timeout 计时器复位。
+// runSSEHeartbeat 周期性地向 w 写出业务 SSE 事件 `data: {"type":"ping","ts":N}\n\n`,
+// 直至 ctx 取消。每次写入通过 mu 与业务事件串行化,避免与 c.SSEvent 的多次 Write 交错。
+//
+// P1 改造:从 SSE 注释行 `: ping\n\n` 改为业务事件 — 注释行虽然能保 net/http write_timeout
+// 计时器复位,但前端 `consumeReactStream` 的 `data:` 行解析才触发 onByte 回调,
+// 注释行被 fetch reader 透传却不调用业务回调,导致前端 90s 静默 watchdog 误判超时。
+// 业务级 ping 事件强制走 onByte → 重置 lastEventAt,前端类型 union 已扩 "ping",
+// traceSteps switch 默认 drop 该类型不入 UI。
 func runSSEHeartbeat(ctx context.Context, w sseFlushWriter, mu *sync.Mutex, interval time.Duration) {
 	if interval <= 0 {
 		return
@@ -468,8 +536,9 @@ func runSSEHeartbeat(ctx context.Context, w sseFlushWriter, mu *sync.Mutex, inte
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			payload := fmt.Sprintf("data: {\"type\":\"ping\",\"ts\":%d}\n\n", time.Now().UnixMilli())
 			mu.Lock()
-			_, _ = w.Write([]byte(": ping\n\n"))
+			_, _ = w.Write([]byte(payload))
 			w.Flush()
 			mu.Unlock()
 		}

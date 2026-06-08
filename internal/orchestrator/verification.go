@@ -168,3 +168,34 @@ func formatVerificationFeedback(result *VerificationResult) string {
 
 	return strings.Join(parts, "\n")
 }
+
+// verificationWarningPayload mirrors the JSON body of the
+// `verification_warning` SSE event. Kept in its own type (rather than an
+// inline anonymous struct) so the front-end contract and the unit tests
+// see the same shape.
+type verificationWarningPayload struct {
+	Score     float64  `json:"score"`
+	Issues    []string `json:"issues,omitempty"`
+	Reasoning string   `json:"reasoning,omitempty"`
+	Retrying  bool     `json:"retrying"`
+}
+
+// decideVerificationFollowup encodes the retry-once gate used after
+// verifyOutput fails. Returns the payload to emit and whether the caller
+// should push the verifier critique back onto the conversation and continue
+// the ReAct loop.
+//
+//   - canRetry is true only when the task has not already retried AND there is
+//     room for at least a few more steps; otherwise the gate fails closed and
+//     the original (low-scored) answer ships.
+//   - vResult is assumed non-nil and Passed=false at the call site — the
+//     helper does not re-check those preconditions.
+func decideVerificationFollowup(retried bool, globalStep, absoluteMaxSteps int, vResult *VerificationResult) (verificationWarningPayload, bool) {
+	canRetry := !retried && globalStep < absoluteMaxSteps-3
+	return verificationWarningPayload{
+		Score:     vResult.Score,
+		Issues:    vResult.Issues,
+		Reasoning: vResult.Reasoning,
+		Retrying:  canRetry,
+	}, canRetry
+}

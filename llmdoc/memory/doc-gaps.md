@@ -39,7 +39,7 @@
 | 无测试 | 零测试文件，无测试框架依赖 |
 | 无状态管理 | 无 Context / Redux / zustand，页面间仅 localStorage 共享 |
 | 无错误边界 | 未捕获的 React 错误会崩溃整个应用 |
-| 无 SSE 重连 | ChatPage 仅捕获初始 fetch 错误，无 EventSource 重试 |
+| SSE 链路鲁棒性 | watchdog（90s 静默 abort）+ reconcileFinalMessage（getSession 兜底）已落地（2026-06-07）；EventSource 自动重连 / 后端推送恢复仍未做 |
 | WebSocket 未使用 | Vite 配置了 `/ws` 代理但无组件使用 WebSocket |
 
 ## 配置与安全缺口
@@ -141,3 +141,13 @@
 - [x] `must/working-agreement.md::工具分发拆分` 已追加「工具名常量化」段落，指向 `tool_names.go`
 - [ ] `must/working-agreement.md::已接线` 表 RedisRateLimiter / tiktoken / 双估算器 三项下沉为「历史回溯」（仍可延后）
 - [ ] `docs/architecture/09_orchestrator.md::§11 P0` 把 ORC-1 / ORC-3 / shutdown-drain 标记为已修复并保留 file:line（仍可延后）
+
+---
+
+## 2026-06-07 verifier retry-once 落地（收束）
+
+反思 `memory/reflections/2026-06-07-verifier-retry-and-process-as-artifact.md` 末段「已发现的潜在 doc gap」三条均已落地，**不再开新条目**：
+
+- [x] `must/working-agreement.md` 死代码清单移除 `formatVerificationFeedback` —— 改为 ✅ 接线条目并指向「Verifier retry-once 门控」段
+- [x] `must/working-agreement.md` 新增「ToolResult.Metadata 契约」段，约定 `json.RawMessage` 透传（不要 `map[string]any`）
+- [x] `docs/architecture/09_orchestrator.md` §9.2 已在文中点明 `task.VerificationRetried`「运行时哨兵，不入 JSON」—— 该文件无 Task 字段表，故不再单列

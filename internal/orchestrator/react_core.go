@@ -247,7 +247,13 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		}
 		o.applyModelRoute(llmReq, string(opts.task.Intent), opts.task.UserInput, len(messages))
 		for attempt := range 3 {
-			resp, llmErr = o.llmClient.ChatCompletion(ctx, llmReq)
+			// LLM 进度三件套：started → 周期 progress → completed。
+			// 目的：当 finalize 阶段一次 ChatCompletion 可能阻塞数分钟乃至 20+ 分钟
+			// 时（非流式接口），前端 UI 会看到稳定的 elapsed_ms 心跳，不再呈现假死。
+			// 进度事件通过 persistingSink 自动入 Redis Stream，resume 链路一样可见。
+			resp, llmErr = callLLMWithProgress(ctx, func(c context.Context) (*llm.ChatResponse, error) {
+				return o.llmClient.ChatCompletion(c, llmReq)
+			}, sink, opts.task.ID, globalStep, attempt, len(messages), len(opts.tools))
 			if llmErr == nil {
 				break
 			}
@@ -340,9 +346,10 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 		}
 
 		type processedResult struct {
-			tc      models.ToolCall
-			content string
-			isErr   bool
+			tc       models.ToolCall
+			content  string
+			isErr    bool
+			metadata json.RawMessage
 		}
 
 		var processed []processedResult
@@ -359,13 +366,15 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 					continue
 				}
 				var content string
+				var meta json.RawMessage
 				if pr.result != nil {
 					content = pr.result.Content
+					meta = pr.result.Metadata
 				}
 				if pr.execErr != nil {
 					content = fmt.Sprintf("Error: %v", pr.execErr)
 				}
-				processed = append(processed, processedResult{tc: pr.tc, content: content, isErr: (pr.execErr != nil) || (pr.result != nil && pr.result.IsError)})
+				processed = append(processed, processedResult{tc: pr.tc, content: content, isErr: (pr.execErr != nil) || (pr.result != nil && pr.result.IsError), metadata: meta})
 			}
 			o.logger.Debug("parallel tool execution", zap.Int("count", len(dedupedCalls)))
 		} else {
@@ -413,8 +422,12 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 					}
 				}
 
+				var meta json.RawMessage
+				if result != nil {
+					meta = result.Metadata
+				}
 				isErr := (execErr != nil) || (result != nil && result.IsError) || strings.Contains(content, "❌ Command FAILED")
-				processed = append(processed, processedResult{tc: tc, content: content, isErr: isErr})
+				processed = append(processed, processedResult{tc: tc, content: content, isErr: isErr, metadata: meta})
 			}
 		}
 
@@ -455,10 +468,16 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				meta.AddUncertainty("recent tool failure: " + pr.tc.Name)
 			}
 
+			// Pass tool-level structured payload through unchanged so the UI
+			// can render artifacts (e.g. edit_file's unified diff) alongside
+			// the human-readable content. ReactStreamEvent.Metadata is
+			// `interface{}` but the SSE encoder marshals json.RawMessage
+			// verbatim, so the front-end sees the original object shape.
 			sink.Emit(models.ReactStreamEvent{
 				Type: "tool_result", Step: globalStep,
 				ToolName: pr.tc.Name, ToolCallID: pr.tc.ID,
 				Content: pr.content, IsError: pr.isErr,
+				Metadata: pr.metadata,
 			})
 
 			messages = append(messages, models.Message{
@@ -509,4 +528,63 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 
 	// Step limit exhausted
 	return reactCoreResult{messages: messages, stepsUsed: opts.maxSteps, hitStepLimit: true}
+}
+
+// llmProgressInterval 控制 llm_call_progress 心跳节奏。
+// 3s 是 UX 与 Redis Stream 体积的折中：长任务 (20min) 仅 ~400 条事件、~32KB,
+// 远低于 streamMaxLen=2000。改更短会增加 Redis 压力;更长则 UI 感知会变迟钝。
+// 包级 var(非 const)是为了让测试可以缩短 interval 验证 progress 真在跳。
+var llmProgressInterval = 3 * time.Second
+
+// callLLMWithProgress 包一层 llm_call_started/progress/completed 事件,
+// 让前端在 finalize 阶段(LLM 非流式调用阻塞数分钟)仍能看到稳定 elapsed_ms 心跳。
+// 进度 goroutine 在 LLM 返回后立即收敛(progressCancel + 等 progressDone),
+// 不留泄漏。事件经由 persistingSink 自动入 Redis Stream,resume 链路同样可见。
+//
+// call 参数注入实际 LLM 调用 —— 让本函数纯粹只管进度三件套,不绑 orchestrator
+// 状态,便于单元测试用 stub 注入慢响应验证 progress 心跳真的在跳。
+func callLLMWithProgress(
+	ctx context.Context,
+	call func(context.Context) (*llm.ChatResponse, error),
+	sink reactEventSink,
+	taskID string,
+	globalStep int,
+	attempt int,
+	messageCount int,
+	toolCount int,
+) (*llm.ChatResponse, error) {
+	startedAt := time.Now()
+	sink.Emit(models.ReactStreamEvent{
+		Type: "llm_call_started", TaskID: taskID, Step: globalStep,
+		Content: fmt.Sprintf(`{"attempt":%d,"messages":%d,"tools":%d}`, attempt+1, messageCount, toolCount),
+	})
+
+	progressCtx, progressCancel := context.WithCancel(ctx)
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(llmProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressCtx.Done():
+				return
+			case <-ticker.C:
+				sink.Emit(models.ReactStreamEvent{
+					Type: "llm_call_progress", TaskID: taskID, Step: globalStep,
+					Content: fmt.Sprintf(`{"attempt":%d,"elapsed_ms":%d}`, attempt+1, time.Since(startedAt).Milliseconds()),
+				})
+			}
+		}
+	}()
+
+	resp, err := call(ctx)
+	progressCancel()
+	<-progressDone
+
+	sink.Emit(models.ReactStreamEvent{
+		Type: "llm_call_completed", TaskID: taskID, Step: globalStep,
+		Content: fmt.Sprintf(`{"attempt":%d,"elapsed_ms":%d,"err":%t}`, attempt+1, time.Since(startedAt).Milliseconds(), err != nil),
+	})
+	return resp, err
 }

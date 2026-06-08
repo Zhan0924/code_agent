@@ -155,3 +155,45 @@ func TestStreamCache_EventCount(t *testing.T) {
 		t.Fatalf("after MarkDone: events still expected 3, got %d", n)
 	}
 }
+
+// TestStreamCache_LastEventAt 校验 B3 — last_event_at_ms 解析。
+//
+// Redis Stream ID 形如 "1717843200000-0",前段就是 XADD 时的服务器毫秒戳。
+// 我们 split '-' 取前段 ParseInt;空流返回 0;nil 接收者返回 0。
+func TestStreamCache_LastEventAt(t *testing.T) {
+	sc, _, cleanup := newTestStreamCache(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// 空流 → 0
+	if got := sc.LastEventAt(ctx, "s1"); got != 0 {
+		t.Fatalf("empty stream: expected 0, got %d", got)
+	}
+
+	// 写入若干事件,LastEventAt 应返回 > 0(miniredis 内置毫秒时钟)
+	before := time.Now().UnixMilli()
+	for i := range 3 {
+		sc.Append(ctx, "s1", models.ReactStreamEvent{Type: "step_start", Step: i + 1})
+	}
+	after := time.Now().UnixMilli()
+
+	got := sc.LastEventAt(ctx, "s1")
+	if got <= 0 {
+		t.Fatalf("after 3 appends: expected positive ms, got %d", got)
+	}
+	// 容忍 miniredis 时钟略偏离 wall clock,允许 ±10s 区间
+	if got < before-10_000 || got > after+10_000 {
+		t.Fatalf("LastEventAt out of window: got=%d before=%d after=%d", got, before, after)
+	}
+
+	// 空 sessionID → 0,不 panic
+	if got := sc.LastEventAt(ctx, ""); got != 0 {
+		t.Fatalf("empty sessionID: expected 0, got %d", got)
+	}
+
+	// nil 接收者 → 0
+	var nilSC *StreamCache
+	if got := nilSC.LastEventAt(ctx, "s1"); got != 0 {
+		t.Fatalf("nil receiver: expected 0, got %d", got)
+	}
+}

@@ -91,6 +91,12 @@ type Task struct {
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
 	CompletedAt  *time.Time      `json:"completed_at,omitempty"`
+
+	// VerificationRetried is a runtime-only sentinel that gates the
+	// stream-path "fix once" loop after verifyOutput rejects an answer.
+	// Set to true the moment a retry is triggered so a chronically-failing
+	// LLM cannot ping-pong the agent indefinitely (one retry max per task).
+	VerificationRetried bool `json:"-"`
 }
 
 // ExecutionPlan describes the sequence of steps the agent plans to execute.
@@ -219,10 +225,17 @@ type ToolDefinition struct {
 }
 
 // ToolResult represents the output of a tool execution.
+//
+// Metadata carries optional structured payload (e.g. unified diff for
+// edit_file/apply_diff) that the SSE pipeline relays into
+// ReactStreamEvent.Metadata so the UI can render it as a richer artifact
+// alongside the human-readable Content. Using json.RawMessage avoids the
+// type-erasure that map[string]any would incur on the relay.
 type ToolResult struct {
-	ToolCallID string `json:"tool_call_id"`
-	Content    string `json:"content"`
-	IsError    bool   `json:"is_error"`
+	ToolCallID string          `json:"tool_call_id"`
+	Content    string          `json:"content"`
+	IsError    bool            `json:"is_error"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
 }
 
 // ─── Sandbox Models ──────────────────────────────────────────────────────────
@@ -344,7 +357,7 @@ type StreamEvent struct {
 
 // ReactStreamEvent is a structured event emitted during the ReAct loop.
 type ReactStreamEvent struct {
-	Type       string      `json:"type"`                   // "step_start", "thinking", "tool_call", "tool_result", "rag_context", "message", "error", "done"
+	Type       string      `json:"type"`                   // "step_start", "thinking", "tool_call", "tool_result", "rag_context", "message", "verification_warning", "error", "done"
 	Step       int         `json:"step,omitempty"`         // Current ReAct step number (1-based)
 	MaxSteps   int         `json:"max_steps,omitempty"`    // Maximum steps allowed
 	Content    string      `json:"content,omitempty"`      // Text content (thinking, message, error)

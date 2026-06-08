@@ -28,6 +28,14 @@ import (
 // 通过 main.go SetWorkspaceCmdTimeout 覆盖此值。
 const defaultWorkspaceCmdTimeout = 5 * time.Minute
 
+// workspaceCmdHeartbeatInterval 是 run_workspace_cmd 静默期心跳节奏。
+// 5s 既保证前端 90s watchdog 有 ≥10× 余量,又把 5min 跑产 ~60 条进度限制
+// 在 stream maxlen(2000)的 3% 以内,内存压力可忽略。
+//
+// 用 `var` 而非 `const` 是为了测试时可压到 ms 级而不需要等真实 5s 心跳触发
+// (见 file_tools_test.go::TestToolRunWorkspaceCmd_EmitsHeartbeat)。
+var workspaceCmdHeartbeatInterval = 5 * time.Second
+
 // allowedHostEnvVars is the closed allowlist of environment variables
 // propagated into LLM-executed host commands. The previous implementation
 // used cmd.Environ() and leaked every host variable — including AWS_*,
@@ -107,34 +115,52 @@ var allowedCommandPrefixes = []string{
 }
 
 // validateWorkspaceCommand checks a command string for security violations.
-// Returns an empty string if safe, or a rejection reason.
-func validateWorkspaceCommand(command string) string {
+// 返回:
+//   - rejection: 非空表示直接拒绝执行
+//   - warning:   非空表示允许执行但有需要让 LLM 看到的可疑组合(如 `| head` 截断
+//     长进程的语义陷阱),将随工具结果一并返回,LLM 可据此自纠或写入用户可见说明
+//
+// B2 — `| head` / `| tail` 是 bash shell pipe,会在 N 行后给上游 SIGPIPE,
+// 把长跑命令(如 `go run` 编译运行)杀掉只剩前 N 行 stdout。命令本身不出错
+// (head 退出码 0),但语义上输出被静默截断,导致"看起来跑完了"的误判。
+// 这类警告不阻断执行,只在工具结果末尾追加 warning 字符串。
+func validateWorkspaceCommand(command string) (rejection string, warning string) {
 	if strings.TrimSpace(command) == "" {
-		return "empty command"
+		return "empty command", ""
 	}
 
-	// Check banned patterns
+	// Check banned patterns (hard reject)
 	for _, pat := range bannedCommandPatterns {
 		if pat.MatchString(command) {
-			return fmt.Sprintf("matches banned pattern: %s", pat.String())
+			return fmt.Sprintf("matches banned pattern: %s", pat.String()), ""
 		}
 	}
 
 	// Extract the base command (first token, ignoring env var assignments)
 	baseCmd := extractBaseCommand(command)
 	if baseCmd == "" {
-		return "could not determine base command"
+		return "could not determine base command", ""
 	}
 
 	// Check against allowed prefixes
+	allowed := false
 	for _, prefix := range allowedCommandPrefixes {
 		trimmed := strings.TrimSpace(prefix)
 		if baseCmd == trimmed || strings.HasPrefix(baseCmd, trimmed) {
-			return ""
+			allowed = true
+			break
 		}
 	}
+	if !allowed {
+		return fmt.Sprintf("command '%s' not in allowed list — use standard dev tools (go, python, node, make, git, etc.)", baseCmd), ""
+	}
 
-	return fmt.Sprintf("command '%s' not in allowed list — use standard dev tools (go, python, node, make, git, etc.)", baseCmd)
+	// 非阻断 warning:命令组合可能触发截断陷阱。
+	if strings.Contains(command, "| head") || strings.Contains(command, "| tail") ||
+		strings.Contains(command, "|head") || strings.Contains(command, "|tail") {
+		warning = "command pipes through `head`/`tail` — long-running producers may receive SIGPIPE after N lines, silently truncating output. If you need partial view of a long-running command, redirect to a file first (`cmd > out.log 2>&1`) and then `head -N out.log`."
+	}
+	return "", warning
 }
 
 // extractBaseCommand strips leading env assignments (KEY=val) and returns
@@ -603,8 +629,10 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 		return &models.ToolResult{Content: "Workspace not found. Create files first using write_file.", IsError: true}, nil
 	}
 
-	// Security: comprehensive command validation
-	if rejection := validateWorkspaceCommand(req.Command); rejection != "" {
+	// Security: comprehensive command validation。
+	// B2:warning 非阻断,留到结果末尾追加,让 LLM 自纠或保留为用户可见的提示。
+	rejection, cmdWarning := validateWorkspaceCommand(req.Command)
+	if rejection != "" {
 		return &models.ToolResult{Content: "Command rejected: " + rejection, IsError: true}, nil
 	}
 
@@ -660,11 +688,39 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 		if startErr := cmd.Start(); startErr != nil {
 			return &models.ToolResult{Content: "Failed to start command: " + startErr.Error(), IsError: true}, nil
 		}
+		// B1:scanner 跑独立 goroutine,主循环 select(lineCh, tick.C, ctx.Done()) ——
+		// 无 stdout 新行时也按 workspaceCmdHeartbeatInterval 周期发心跳,
+		// 防止 `go run` 编译冷启动这类长沉默期里前端 watchdog(90s)误判超时。
+		// 心跳走 progressCb → react_core WithProgressCallback → tool_progress event
+		// → persistingSink → Redis Stream → SSE → 前端 onByte 重置 lastEventAt。
 		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			line := scanner.Text() + "\n"
-			stdout.WriteString(line)
-			progressCb(line)
+		// Larger buffer for long lines from compile/test output (default 64KB → 1MB cap).
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		lineCh := make(chan string, 16)
+		go func() {
+			defer close(lineCh)
+			for scanner.Scan() {
+				lineCh <- scanner.Text()
+			}
+		}()
+		tick := time.NewTicker(workspaceCmdHeartbeatInterval)
+		defer tick.Stop()
+	scanLoop:
+		for {
+			select {
+			case line, ok := <-lineCh:
+				if !ok {
+					break scanLoop
+				}
+				stdout.WriteString(line + "\n")
+				progressCb(line + "\n")
+			case <-tick.C:
+				// 心跳文案带前缀方便前端识别;不写入 stdout 缓冲(避免污染 LLM 看到的输出)。
+				progressCb(fmt.Sprintf("⏱ workspace cmd running %ds, no new output yet\n",
+					int(time.Since(start).Seconds())))
+			case <-cmdCtx.Done():
+				break scanLoop
+			}
 		}
 		err = cmd.Wait()
 		duration = time.Since(start)
@@ -713,6 +769,12 @@ func (o *Orchestrator) toolRunWorkspaceCmd(ctx context.Context, args json.RawMes
 		out.WriteString("✅ Command SUCCEEDED\n")
 	} else {
 		out.WriteString("❌ Command FAILED — review errors above and fix with write_file or patch_file, then re-run\n")
+	}
+
+	// B2:命令组合 warning (例如 `| head` 导致的 SIGPIPE 截断陷阱)
+	// 非阻断追加到末尾。LLM 在下一步可据此改命令,或忽略并继续。
+	if cmdWarning != "" {
+		fmt.Fprintf(&out, "⚠️ workspace cmd warning: %s\n", cmdWarning)
 	}
 
 	o.logger.Info("tool:run_workspace_cmd",
@@ -843,8 +905,9 @@ func (o *Orchestrator) toolEditFile(ctx context.Context, args json.RawMessage) (
 		zap.Int("lint_errors", len(result.LintErrors)))
 
 	return &models.ToolResult{
-		Content: result.Message,
-		IsError: !result.Success,
+		Content:  result.Message,
+		IsError:  !result.Success,
+		Metadata: editResultToMetadata(result),
 	}, nil
 }
 
@@ -880,9 +943,43 @@ func (o *Orchestrator) toolApplyDiff(ctx context.Context, args json.RawMessage) 
 		zap.Int("lint_errors", len(result.LintErrors)))
 
 	return &models.ToolResult{
-		Content: result.Message,
-		IsError: !result.Success,
+		Content:  result.Message,
+		IsError:  !result.Success,
+		Metadata: editResultToMetadata(result),
 	}, nil
+}
+
+// editResultToMetadata serialises the structured edit outcome for the SSE
+// stream so the UI can render a diff block alongside the tool_result content.
+// The body intentionally omits backup_path (a server-side path the user can't
+// act on) and is small enough to pass through ReactStreamEvent untouched.
+//
+// Marshal failures here are never fatal — they mean the front-end loses the
+// diff for this one tool call but the tool itself already succeeded; returning
+// nil keeps Metadata `omitempty` on the wire.
+func editResultToMetadata(result *EditResult) json.RawMessage {
+	if result == nil {
+		return nil
+	}
+	payload := struct {
+		Path        string   `json:"path,omitempty"`
+		DiffPreview string   `json:"diff_preview,omitempty"`
+		RolledBack  bool     `json:"rolled_back,omitempty"`
+		LintErrors  []string `json:"lint_errors,omitempty"`
+	}{
+		Path:        result.FilePath,
+		DiffPreview: result.DiffPreview,
+		RolledBack:  result.RolledBack,
+		LintErrors:  result.LintErrors,
+	}
+	if payload.Path == "" && payload.DiffPreview == "" && !payload.RolledBack && len(payload.LintErrors) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

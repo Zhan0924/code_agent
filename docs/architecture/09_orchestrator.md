@@ -64,6 +64,9 @@ ProcessMessage(user_msg)
          │    ├─ tool distiller recommendation（首步）
          │    ├─ token budget prune
          │    ├─ LLM call（含 3 次指数退避重试）         # LLM 调用 #N
+         │    │   ├─ emit llm_call_started              # 见 §1.7 LLM 进度三件套
+         │    │   ├─ 每 3s emit llm_call_progress
+         │    │   └─ emit llm_call_completed
          │    ├─ if no tool_calls → 终止返回           # 正常出口
          │    ├─ DedupeToolCalls（同步 Runner 走同一 helper）
          │    ├─ 并发/串行 executeTool × N
@@ -138,6 +141,42 @@ LLM provider（OpenAI / Anthropic / 自部署 vLLM）在以下场景会瞬时失
 `react_core.go:170-183` 写死 3 次重试 + `2^attempt` 秒退避（1s → 2s → 4s）。**不**对所有错误重试（如 401/400），但当前代码没区分错误类型 —— 是 P1 待办（见 §11）。
 
 3 次足够覆盖 99% 瞬时故障；超过 3 次说明 provider 真挂了，退化让 ReAct loop 把错误作为 observation 回喂上一层（如果用户在 SSE 流，会看到 `error` event）。
+
+### Q4.5：LLM 进度三件套（finalize 假死的根本对策）
+
+**问题背景**：ReAct 主循环使用**非流式** `llm.Client.ChatCompletion`。当模型在 finalize 阶段生成长答案时，单次调用可能阻塞数分钟乃至 20+ 分钟。这期间业务事件流（thinking/tool_call/tool_result）天然为空，前端 UI 表现为 "Step N/M" 卡住不动，用户与排查者都无法分辨"任务死了" vs "LLM 还在算"。
+
+**对策**：不动 LLM 接口（避免触动 provider streaming、circuit breaker、双链路 fallback），而是在每次 ChatCompletion 调用前后包一层**进度三件套**事件，由 `react_core.go` 的 `callLLMWithProgress` 实现：
+
+| 事件 | 时机 | Content（JSON） |
+|---|---|---|
+| `llm_call_started` | 调用前同步 emit | `{"attempt":N,"messages":N,"tools":N}` |
+| `llm_call_progress` | 调用期间周期 emit（默认 3s 一次） | `{"attempt":N,"elapsed_ms":N}` |
+| `llm_call_completed` | 调用返回后同步 emit | `{"attempt":N,"elapsed_ms":N,"err":bool}` |
+
+**关键设计**：
+
+- 周期心跳走 `time.NewTicker(llmProgressInterval)` + 独立 goroutine；返回路径通过 `progressCancel()` + `<-progressDone` 强同步收敛，**无 goroutine 泄漏**。
+- 进度事件经由 `persistingSink` 自动入 Redis Stream（`stream_cache.go`），SSE 断线 → Replay/Follow 链路一样能看见已发出的 progress，UI 重连后可恢复当时的 elapsed_ms。
+- 3s 间隔的取舍：20min LLM 调用产 ~400 条事件 ~32KB，远低于 `streamMaxLen=2000` 截断阈值；缩短到 1s 会给 Redis 带来 3 倍写入压力，拉长到 10s UX 反馈迟钝。
+- `llmProgressInterval` 是包级 `var` 而非 `const`，仅用于测试时缩短间隔（见 `react_core_test.go: TestCallLLMWithProgress_*`）。
+
+**前端契约**：UI 不在 trace 流里新增 step 卡片，而是把最新 `llm_call_progress.elapsed_ms` 内联到当前 step 的 spinner 旁边渲染为 "LLM 处理中 (Ns)"；`llm_call_completed` 后清空标签。详见 `code_agent_ui/src/pages/ChatPage.tsx` 的 ReActTrace 组件。
+
+### Q4.6：工具长跑期间 stdout 沉默,怎么防止前端 watchdog 误判?
+
+**问题**:`toolRunWorkspaceCmd` 跑 `go run`/`go test` 这类命令时,编译冷启动期可能几十秒零 stdout 输出 → 前端 90s watchdog 在沉默 90s 后触发 "网络静默超时"。Q4.5 的 LLM 心跳只覆盖 LLM 调用阶段,工具阶段无对应保护。
+
+**方案(`file_tools.go::toolRunWorkspaceCmd`)**:
+
+- `bufio.Scanner` 跑独立 goroutine,通过 `chan string` 把每一行送给主循环
+- 主循环 `select { case <-lineCh; case <-tick.C; case <-cmdCtx.Done() }` 三通道
+- `workspaceCmdHeartbeatInterval = 5 * time.Second`:无 stdout 新行也按 5s 周期通过 `progressCb` 推一条心跳文案(`⏱ workspace cmd running %ds, no new output yet\n`)
+- 心跳走同一个 `progressCb` → `react_core.go WithProgressCallback` 包装为 `tool_progress` event → `persistingSink` 写 Redis Stream → SSE 推前端 → 前端 onByte 回调重置 `lastEventAt`,watchdog 不再误判
+
+**节奏取舍**:5s × 5min 命令 = 60 条心跳,每条 ~80 字节 ~5KB,远低于 `streamMaxLen=2000` 截断阈值;1s 给前端 + Redis 三倍压力,30s 让 90s watchdog 留余量太小。
+
+**心跳文案不污染 stdout**:心跳走 progressCb,**不**写入 `stdout.WriteString`,LLM 看到的工具结果仍然是纯净的 stdout/stderr,只是用户在 UI trace 中看到一条 progress hint。
 
 ### Q5：为什么并发执行只覆盖纯读工具？
 
@@ -262,7 +301,11 @@ api/chat_handler → orch.ProcessMessage(sessionID, userMsg)
          │     ↓ returns content
          │
          ├─ shouldVerifyOutput? → verifyOutput（LLM 调用）
-         │     失败 → 仅 logger.Warn 记录（**不再追加到用户可见 content**）
+         │     失败 → emit verification_warning SSE 事件（前端展示 ⚠️ 评分+issues）
+         │            ├─ decideVerificationFollowup 通过：
+         │            │   把 critique 作为 RoleUser 入 messages，continue 外层 for（仅 stream，每 task 限 1 次）
+         │            └─ 否则：仅 logger.Warn，正常 done
+         │     sync 路径不 retry（保留延迟预算）
          │
          └─ session.AddMessage(role=assistant) + extractMemoriesAsync
     │
@@ -829,15 +872,26 @@ final answer 但 meta.NeedsReflection → 强制验证一轮
 
 ### 9.2 verifyOutput（`verification.go`）
 
-仅当 `shouldVerifyOutput(intent, stepsUsed)` 为 true 时触发（Intent 是 CodeQuery/Diagnose + 步数 >= 3）。逻辑：
+仅当 `shouldVerifyOutput(intent, stepsUsed)` 为 true 时触发（高风险 Intent —— Deploy/CodeExecute/Diagnose —— 或 stepsUsed > 5）。流程：
 
 1. 用一个独立 LLM 调用让模型自评 "答案是否充分回答用户问题"；
 2. 返回 `{passed, score, issues, suggestions, reasoning}`；
-3. `passed=false` 时 **仅写 `logger.Warn` 内部记录**，不污染用户可见的 `result.content`，也不入 session 持久化。
+3. `passed=false` 时分两步处理（**仅 stream 路径**，见 `orchestrator.go:ProcessMessageStreamFull`）：
 
-**规则**：`verifyOutput` 的反馈是评判者面向 Agent loop 的内部批评（"Please address the issues above before finalizing your response."），属于评估器视角，不属于助手对用户的回答。无论 `passed` 取值，调用方都**不得**把 `formatVerificationFeedback` 的输出拼回 `result.content`，也**不得**以 `RoleAssistant` 写入 session。失败信号仅通过 `logger.Warn` 暴露给观测层。`formatVerificationFeedback` 保留供未来真正的 self-refine 回灌循环复用。
+   **a. emit `verification_warning` SSE 事件**（`Metadata = {score, issues, reasoning, retrying}`）。这是「独立审查可见」的接线：前端 ChatPage 渲染 ⚠️ 评分条 + issues 清单，把评判者视角直接展示给用户。
 
-**不**重新走 ReAct loop —— 只是给用户"自评分"。生产价值有限，因为 LLM 自评通常 passed=true。是 P2 待评估保留（或改造为真正的 self-refine 回灌循环）。
+   **b. retry-once 自修复**：通过 `decideVerificationFollowup(retried, globalStep, absoluteMaxSteps, vResult)` 做决策 —— 若 `!task.VerificationRetried && globalStep < absoluteMaxSteps-3`，则：
+   - 置 `task.VerificationRetried = true`（运行时哨兵，不入 JSON）；
+   - 把刚才的 assistant content + `formatVerificationFeedback(vResult)` push 回 `messages`；
+   - `continue` 外层 for 循环，让 LLM 看到 critique 后重新决定是否调工具补救。
+
+   每个 task 最多 retry 一次，避免 0.2→0.2→0.2 死循环。若 retry 后第二轮再次失败，只发 warning（`retrying=false`）然后正常 done。
+
+**sync 路径**（`ProcessMessage`，`orchestrator.go:565` 附近）**保持仅 `logger.Warn`**，因为同步 API 通常有严格延迟预算，二次 LLM 调用会让调用方超时。
+
+**关键不变量**：
+- `formatVerificationFeedback` 永远以 `RoleUser` 入 messages —— 让 LLM 把它当用户反馈，触发再一轮 ReAct，而非误以为是上一轮自己的话；
+- warning payload 与前端 `VerificationWarningMetadata` 类型字段一一对应，新增字段须同步 `code_agent_ui/src/types/index.ts`。
 
 ---
 

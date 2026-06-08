@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -616,5 +617,89 @@ func TestEditEngine_ApplyUnifiedDiff_InvalidDiff(t *testing.T) {
 
 	if result.Success {
 		t.Fatal("expected failure for invalid diff")
+	}
+}
+
+// ─── P0a: tool_result Metadata plumbing ──────────────────────────────────────
+
+// TestToolEditFile_ReturnsDiffPreviewInMetadata locks in the contract that
+// `edit_file` populates ToolResult.Metadata with a JSON body containing the
+// unified diff, so the SSE pipeline (react_core.go) can forward it untouched
+// to the front-end DiffBlock renderer. Without this, the UI loses the
+// "process-as-artifact" view: it would only see the human-readable Message
+// summary and have to ask the user to inspect the file by hand.
+func TestToolEditFile_ReturnsDiffPreviewInMetadata(t *testing.T) {
+	wm, ws := setupTestWorkspace(t)
+	logger := zap.NewNop()
+	engine := NewEditEngine(wm, logger)
+
+	o := &Orchestrator{
+		logger:       logger,
+		workspaceMgr: wm,
+		editEngine:   engine,
+	}
+
+	const initial = "package main\n\nfunc greet() string {\n\treturn \"hello\"\n}\n"
+	if err := wm.WriteFile(ws, "main.go", initial); err != nil {
+		t.Fatal(err)
+	}
+
+	args, _ := json.Marshal(map[string]string{
+		"workspace_id": ws.ID,
+		"path":         "main.go",
+		"old_text":     `return "hello"`,
+		"new_text":     `return "hi"`,
+	})
+
+	result, err := o.toolEditFile(context.Background(), args)
+	if err != nil {
+		t.Fatalf("toolEditFile returned err: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("toolEditFile reported error: %s", result.Content)
+	}
+	if len(result.Metadata) == 0 {
+		t.Fatal("expected non-empty ToolResult.Metadata, got empty")
+	}
+
+	var meta struct {
+		Path        string   `json:"path"`
+		DiffPreview string   `json:"diff_preview"`
+		RolledBack  bool     `json:"rolled_back"`
+		LintErrors  []string `json:"lint_errors"`
+	}
+	if err := json.Unmarshal(result.Metadata, &meta); err != nil {
+		t.Fatalf("Metadata is not valid JSON: %v (%q)", err, string(result.Metadata))
+	}
+
+	if meta.Path != "main.go" {
+		t.Errorf("expected metadata.path=main.go, got %q", meta.Path)
+	}
+	if !strings.Contains(meta.DiffPreview, `-	return "hello"`) ||
+		!strings.Contains(meta.DiffPreview, `+	return "hi"`) {
+		t.Errorf("diff_preview missing expected +/- lines: %q", meta.DiffPreview)
+	}
+	if meta.RolledBack {
+		t.Error("rolled_back should be false on success")
+	}
+}
+
+// TestEditResultToMetadata_NilAndEmpty guards the omitempty path: if the
+// EditEngine is nil or produced no diff (e.g. early-return failure), the
+// helper must return nil so json.RawMessage stays omitted from the SSE wire
+// instead of leaking a `{}` empty object.
+func TestEditResultToMetadata_NilAndEmpty(t *testing.T) {
+	if got := editResultToMetadata(nil); got != nil {
+		t.Errorf("nil result should yield nil metadata, got %q", string(got))
+	}
+	if got := editResultToMetadata(&EditResult{}); got != nil {
+		t.Errorf("zero-value result should yield nil metadata, got %q", string(got))
+	}
+	raw := editResultToMetadata(&EditResult{FilePath: "x.go", DiffPreview: "@@\n-a\n+b\n"})
+	if len(raw) == 0 {
+		t.Fatal("non-zero result should yield non-empty metadata")
+	}
+	if !strings.Contains(string(raw), `"diff_preview"`) {
+		t.Errorf("expected diff_preview key in metadata: %q", string(raw))
 	}
 }

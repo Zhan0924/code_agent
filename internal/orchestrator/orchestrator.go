@@ -1106,14 +1106,45 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 				if o.shouldVerifyOutput(task.Intent, globalStep) {
 					vResult, vErr := o.verifyOutput(workCtx, task.UserInput, result.content)
 					if vErr == nil && !vResult.Passed {
-						// Internal evaluator critique — never user-visible.
-						// See twin block in ProcessMessage for rationale.
+						// Emit a structured warning so the front-end can show the
+						// score + issues to the user. Until this commit the
+						// critique was logged only and the human-facing answer
+						// silently shipped — verifier said 0.2 / "no actual code"
+						// and the user saw nothing.
+						warnPayload, canRetry := decideVerificationFollowup(
+							task.VerificationRetried, globalStep, absoluteMaxSteps, vResult,
+						)
+
 						o.logger.Warn("output verification failed",
 							zap.String("task_id", task.ID),
 							zap.Float64("score", vResult.Score),
 							zap.Strings("issues", vResult.Issues),
 							zap.String("reasoning", vResult.Reasoning),
+							zap.Bool("retrying", canRetry),
 						)
+
+						if raw, mErr := json.Marshal(warnPayload); mErr == nil {
+							sink.Emit(models.ReactStreamEvent{
+								Type:     "verification_warning",
+								Step:     globalStep,
+								TaskID:   task.ID,
+								Metadata: json.RawMessage(raw),
+							})
+						}
+
+						if canRetry {
+							task.VerificationRetried = true
+							// Push the previous assistant answer + the verifier's
+							// feedback back onto the conversation and continue the
+							// outer for loop. The next reactLoopCore iteration sees
+							// the critique as a user instruction and is free to
+							// invoke tools again to address the cited issues.
+							messages = append(messages,
+								models.Message{Role: models.RoleAssistant, Content: result.content},
+								models.Message{Role: models.RoleUser, Content: formatVerificationFeedback(vResult)},
+							)
+							continue
+						}
 					}
 				}
 				_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{

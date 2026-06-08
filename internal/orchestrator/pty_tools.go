@@ -58,8 +58,10 @@ func (o *Orchestrator) toolShellExec(ctx context.Context, args json.RawMessage) 
 		params.Timeout = 120
 	}
 
-	// Security: validate command using existing patterns
-	if rejection := validateWorkspaceCommand(params.Command); rejection != "" {
+	// Security: validate command using existing patterns。
+	// PTY 路径只关心 reject;warning(`| head`/`| tail`)忽略 —— PTY 是交互式
+	// session,组合管道少见,且无独立工具结果末尾可追加。
+	if rejection, _ := validateWorkspaceCommand(params.Command); rejection != "" {
 		return &models.ToolResult{Content: "Command rejected: " + rejection, IsError: true}, nil
 	}
 

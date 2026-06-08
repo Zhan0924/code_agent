@@ -26,6 +26,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/agent/code_agent/internal/models"
@@ -173,6 +175,41 @@ func (c *StreamCache) EventCount(ctx context.Context, sessionID string) int64 {
 			c.logger.Debug("event count failed",
 				zap.String("session_id", sessionID), zap.Error(err))
 		}
+		return 0
+	}
+	return n
+}
+
+// LastEventAt 返回 session 最后一条事件的写入毫秒戳；流为空或不存在返回 0。
+//
+// 用途:前端 GET /chat/react-stream/status 据此判断"后端是否真活着"——
+// 即使 running=true、event_count>0，若 last_event_at 已停滞数分钟,前端可据此
+// 提前提示用户"后端可能卡死",避免无止境地依赖 watchdog 90s 兜底。
+//
+// 实现:Redis Stream ID 形如 "1717843200000-0",前段就是 XADD 时的服务器毫秒戳;
+// 直接 split 解析即可,无需服务端 TIME 调用。
+func (c *StreamCache) LastEventAt(ctx context.Context, sessionID string) int64 {
+	if c == nil || sessionID == "" {
+		return 0
+	}
+	key := streamEventsKeyPrefix + sessionID
+	msgs, err := c.rdb.XRevRangeN(ctx, key, "+", "-", 1).Result()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			c.logger.Debug("last event at xrevrange failed",
+				zap.String("session_id", sessionID), zap.Error(err))
+		}
+		return 0
+	}
+	if len(msgs) == 0 {
+		return 0
+	}
+	id := msgs[0].ID
+	if idx := strings.IndexByte(id, '-'); idx > 0 {
+		id = id[:idx]
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
 		return 0
 	}
 	return n

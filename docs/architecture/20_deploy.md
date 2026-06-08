@@ -6,9 +6,7 @@
 > - `Dockerfile` (79 行) — 生产多阶段构建（含 workspace 工具链）
 > - `Dockerfile.allinone` (104 行) — 单镜像全栈（PG/Redis/Qdrant/Temporal/Jaeger/DinD）
 > - `Dockerfile.local` (26 行) — 静态二进制 + alpine:local 离线构建
-> - `Dockerfile.test` (33 行) — 容器内跑单元测试
-> - `Dockerfile.p0test` (67 行) — P0 优化项集成验证镜像（含 -race / -bench）
-> - `docker-compose.yml` (153 行) — 7 服务本地编排
+> - `docker-compose.yml` (≈160 行) — 默认 4 服务 + `--profile hitl` / `--profile observability` 按需扩展
 > - `docker-compose.test.yml` (47 行) — 烟雾测试最小栈
 > - `deploy/entrypoint.sh` (162 行) — allinone 镜像 7 阶段启动脚本
 > - `deploy/redis.conf` / `deploy/qdrant.yaml` — 嵌入式服务配置
@@ -31,7 +29,7 @@
 | 形态 | 用例 | 主镜像 | 启动方式 | 是否含外部依赖镜像 |
 |---|---|---|---|---|
 | **Local Dev** | 开发者本机 | `Dockerfile.local`（可选）| `make run` | 否（依赖容器外起） |
-| **Compose Demo** | 单机演示 / 小团队共享 | `Dockerfile` + `docker-compose.yml` | `make docker-up` | 是（7 个服务容器） |
+| **Compose Demo** | 单机演示 / 小团队共享 | `Dockerfile` + `docker-compose.yml` | `make docker-up`（默认 4 服务），`--profile hitl` 加 Temporal/UI，`--profile observability` 加 Jaeger | 是（按 profile 4 / 6 / 5 / 7 个容器） |
 | **AllInOne** | 一键体验 / 销售 Demo / 无网络环境 | `Dockerfile.allinone` | `docker run --privileged ...` | **同一镜像内** 6 服务 |
 | **K8s Prod** | 生产、多副本、HPA | `Dockerfile` + `deployments/k8s/deployment.yaml` | `kubectl apply -f` | 否（依赖外部托管服务） |
 
@@ -76,8 +74,8 @@ alpine:3.20  (基础 ~5MB)
 | Dockerfile | builder 阶段调 `go build` | 二进制由 Docker 构建 |
 | Dockerfile.local | 宿主机 `go build` → `bin/code-agent-linux` | COPY 静态二进制，**不联网** |
 | Dockerfile.allinone | 宿主机 `go build` → `bin/code-agent-linux-arm64` | COPY 二进制 + 嵌入式服务 |
-| Dockerfile.test | builder 同源 | `go test` 而非 `go build` |
-| Dockerfile.p0test | builder 同源 + CGO=1 | `go vet` + `go test -race` + `go test -bench` |
+
+> 历史 `Dockerfile.test` / `Dockerfile.p0test` 在 2026-06-07 与各自的 `.dockerignore` 副文件一起移除：容器内单测随 `go test -race ./...` + `docker-compose.test.yml` 即可覆盖，独立测试镜像长期未维护。
 
 **统一构建命令**：`CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/code-agent ./cmd/agent`。
 
@@ -515,25 +513,22 @@ docker build --network=none -f Dockerfile.local -t code-agent:test .
 
 `--network=none` 强制断网构建 —— 任何 `apk add` 都会失败，所以镜像里**不能**有 `RUN apk add`（这就是为什么不装 curl，用 wget 替代）。
 
-### 5.6 `Dockerfile.test` / `Dockerfile.p0test` 容器内测试
+### 5.6 Compose Profile 分组（2026-06-07 引入）
 
-**Dockerfile.test**：CI 环境跑指定单元测试。`go build -o /dev/null ./cmd/agent` 仅验证编译，不产出二进制；CMD 跑 `go test -run "TestValidateDAG|TestTopologicalSort|..."` 等指定 P1 模块的用例。
+`docker-compose.yml` 现在按需启动：
 
-**Dockerfile.p0test**：四阶段 P0 优化项验证镜像
-1. `go build` ：编译通过证明 API 兼容；
-2. `go vet`：静态检查；
-3. `go test -race -v`：带竞态检测的全用例（CGO=1，需 gcc/musl-dev）；
-4. `go test -bench`：性能对比（Cache hit/miss 吞吐对比）。
+| Profile | 启动命令 | 包含 | 用途 |
+|---|---|---|---|
+| 默认 | `make docker-up` 或 `docker compose up -d` | `agent` + `redis` + `postgres` + `qdrant` | 跑 chat / RAG / sandbox 主链路 |
+| `hitl` | `docker compose --profile hitl up -d` | 默认 + `temporal` + `temporal-ui` + `temporal-init`（one-shot） | 启用 HITL 审批 / 长周期工作流 |
+| `observability` | `docker compose --profile observability up -d` | 默认 + `jaeger` | 开 OTel 追踪、Jaeger UI |
+| 全启 | `docker compose --profile hitl --profile observability up -d` | 8 个 | 与历史 `make docker-up` 行为等价 |
 
-```bash
-# 用法
-docker build -f Dockerfile.p0test -t p0test:latest .
-docker run --rm p0test:latest
-```
+**注意**：`agent.depends_on` 故意**不**声明 temporal —— 旧版 Compose 不会自动 drop profile-disabled 依赖，会报 "undefined service"。`cmd/agent/main.go::startTemporalWorker` 的 Dial **没有重试**：一次失败即返回 nil，HITL 静默禁用、HTTP 链路保留。后果：
 
-**为何区分 test/p0test**：
-- test 镜像无 -race（更快），仅验证函数行为；
-- p0test 镜像带 -race + -bench（更慢），针对 P0 优化项做完整 quality gate。
+- 默认 boot：Temporal 未启 → Dial 失败 → 行为符合预期。
+- `--profile hitl up`：temporal 与 agent 并发启动，agent 可能先于 temporal 就绪发起 Dial 而失败 → HITL 仍为 nil。如需启用，待 temporal 健康后再 `docker compose --profile hitl up -d agent` 重启一次 agent。
+- 若想避免这道坑，长期方案是在 `startTemporalWorker` 里加带退避的重试或改成订阅式 watch（见 11_temporal.md）。
 
 ### 5.7 `.dockerignore` 白名单语义
 
@@ -556,7 +551,7 @@ README.md  *.md  **/*_test.go  .DS_Store  Thumbs.db
 **关键设计**：
 - `configs/config.yaml` 与 `configs/config.allinone.yaml` **被排除** —— 防止任何包含真实 LLM API key、PG 密码的配置烤进可分发镜像。
 - `bin/` **不**排除 —— Dockerfile.local 依赖 `bin/code-agent-linux`。
-- `**/*_test.go` 排除 —— 测试代码不进生产镜像（但 Dockerfile.test/p0test 用单独的 `.dockerignore.test` 覆盖此规则）。
+- `**/*_test.go` 排除 —— 测试代码不进生产镜像（容器内测试通过 `docker-compose.test.yml` 起最小栈 + `go test` 覆盖）。
 
 ### 5.8 `Makefile` 14 个 target
 
@@ -691,7 +686,6 @@ AllInOne 是**纯 Demo / 销售场景**的工具，不应混淆为生产能力�
 | Dockerfile | `["code-agent"]` exec form | 信号直传，PID 1 干净 | 启动前无 shell 初始化 |
 | Dockerfile.allinone | `["/entrypoint.sh"]` | 多服务编排 | 子进程无 watchdog |
 | Dockerfile.local | `["code-agent"]` exec form | 同生产 | — |
-| Dockerfile.test | `["go", "test", ...]` | 直接跑测试 | 不是 server |
 
 生产路径用 exec form 是因为 shell form (`code-agent ...` 不加 `[]`) 会被 `/bin/sh -c` 包裹，SIGTERM 只能到达 sh，无法终止 code-agent。
 
@@ -761,8 +755,6 @@ CN 网络环境下：
 | `go test -short -race ./...` | `make test-short` | 单元测试（跳过 Redis/Qdrant/Docker 依赖项） | 否 |
 | `go test -race -cover ./...` | `make test` | 全量单元 + 集成 | 需 Redis/Qdrant |
 | `test_integration.sh` | 宿主机 `./test_integration.sh` | api 包 integration_test.go（miniredis + zap）| 仅需 Docker（容器内跑）|
-| `Dockerfile.test` | `docker build -f Dockerfile.test && docker run --rm code-agent-test` | P1 模块（planner/repomap/llm/orchestrator）的精选用例 | 否 |
-| `Dockerfile.p0test` | `docker build -f Dockerfile.p0test && docker run --rm p0test:latest` | P0 优化项 4 阶段（build + vet + race test + bench）| 否 |
 | `docker-compose.test.yml` | `docker compose -f docker-compose.test.yml up -d` | TestP0_* HTTP 烟雾测试 | 自带最小栈（redis-p0 + qdrant-p0）|
 | `test_chat.sh` | 宿主机 `./test_chat.sh` | ReAct chat 端到端 | 需完整 compose 栈 |
 | `test_comprehensive.sh` | 宿主机 `./test_comprehensive.sh` | 多端点全功能验证 | 需完整 compose 栈 |
@@ -790,7 +782,9 @@ cp configs/config.example.yaml configs/config.yaml
 vim configs/config.yaml
 
 # 2. 起依赖栈（不含 agent，方便本地 go run / dlv 调试）
-docker compose up -d redis postgres qdrant jaeger
+docker compose up -d redis postgres qdrant
+# 如需 Jaeger，叠加 observability profile：
+# docker compose --profile observability up -d redis postgres qdrant jaeger
 
 # 3. 本地跑 agent
 make run
@@ -804,19 +798,30 @@ dlv debug ./cmd/agent -- --config configs/config.yaml
 # 1. 配置 LLM API key
 export CODE_AGENT_LLM_PRIMARY_API_KEY="sk-xxx"
 
-# 2. 起完整栈
-make docker-build           # 构建 agent 镜像
-make docker-up              # 启动 7 服务
+# 2. 构建镜像
+make docker-build
 
-# 3. 验证
+# 3. 启动 —— 三选一
+#   a) 仅核心链路（agent + redis + postgres + qdrant，4 容器）
+make docker-up
+#   b) 核心 + HITL（追加 temporal + temporal-ui）
+docker compose --profile hitl up -d
+#   c) 核心 + 追踪（追加 jaeger）
+docker compose --profile observability up -d
+#   d) 全开
+docker compose --profile hitl --profile observability up -d
+
+# 4. 验证
 curl http://localhost:18080/healthz
 curl http://localhost:18080/readyz
-open http://localhost:16686  # Jaeger UI
-open http://localhost:8088   # Temporal UI
+open http://localhost:16686  # Jaeger UI（observability profile）
+open http://localhost:8088   # Temporal UI（hitl profile）
 
-# 4. 清理
+# 5. 清理（停同一组 profile）
 make docker-down            # ⚠️ 同时删除卷（数据丢失）
 ```
+
+> Profile 设计动机见 §5.6。新增可观测/HITL 组件时直接挂相应 profile，不污染默认 boot。
 
 ### 9.3 AllInOne 一键体验
 

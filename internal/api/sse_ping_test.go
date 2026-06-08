@@ -2,7 +2,12 @@
 //
 // 背景：在 2026-06-04 前，handleChatReactStream 在 ReAct 内部空闲 60+ 秒时会被
 // `server.write_timeout: 600s` 撕扯 SSE 连接（write_timeout 是 idle write 超时，
-// 不是请求总时长）。新引入的 25s SSE 注释行心跳消除了这一可能。
+// 不是请求总时长）。引入 25s SSE 心跳消除了这一可能。
+//
+// 2026-06-07 P1 改造:心跳由 `: ping\n\n` 注释行改为业务级 `data: {"type":"ping","ts":<ms>}\n\n`
+// 事件 —— 注释行不会触发浏览器 fetch ReadableStream 的 onByte 回调,导致前端
+// watchdog 仍然把"只剩心跳"的连接误判为静默超时。改业务事件后 onByte 自然触发,
+// 前端 traceSteps filter 显式 drop type=ping 不入 UI。
 //
 // 这里测试提取出来的小函数 runSSEHeartbeat —— handler 内联调用同一逻辑。
 package api
@@ -68,16 +73,21 @@ func TestRunSSEHeartbeat_EmitsPingOnInterval(t *testing.T) {
 	}
 
 	out, writes, flushes := w.snapshot()
-	// 期望至少 3 次 `: ping\n\n`（wait/interval >= 3）。
+	// 期望至少 3 次业务 ping 事件(wait/interval >= 3)。
 	if writes < 3 {
 		t.Errorf("expected >= 3 writes, got %d (out=%q)", writes, out)
 	}
 	if flushes != writes {
 		t.Errorf("flush count %d != write count %d (each ping must flush)", flushes, writes)
 	}
-	const want = ": ping\n\n"
-	if !bytes.Contains([]byte(out), []byte(want)) {
-		t.Errorf("output missing %q; got %q", want, out)
+	// P1:业务 ping 事件,合规 `data: {"type":"ping","ts":<ms>}\n\n`
+	const wantPrefix = `data: {"type":"ping"`
+	if !bytes.Contains([]byte(out), []byte(wantPrefix)) {
+		t.Errorf("output missing prefix %q; got %q", wantPrefix, out)
+	}
+	// 保证不是误用 SSE 注释行(注释行不会触发 fetch ReadableStream onByte 回调)
+	if bytes.Contains([]byte(out), []byte(": ping\n")) {
+		t.Errorf("found SSE comment `: ping` in output — P1 改造已将心跳替换为业务事件: %q", out)
 	}
 }
 
@@ -142,13 +152,14 @@ func TestRunSSEHeartbeat_SerializesWithBusinessWriter(t *testing.T) {
 	time.Sleep(20 * time.Millisecond) // drain
 
 	out, _, _ := w.snapshot()
-	// 没有任何 `: ping` 与 `data:` 字节交错：每帧都以 \n\n 结束才能继续下一帧。
-	// 简单结构性检查：扫描整个输出，按 "\n\n" 切，每段必须以 ": ping" 或 "data:" 开头。
+	// 没有任何业务事件与心跳字节交错:每帧都以 \n\n 结束才能继续下一帧。
+	// P1 后心跳也是 `data: {"type":"ping"...`,所有 frame 都以 "data:" 开头。
+	// 简单结构性检查:扫描整个输出,按 "\n\n" 切,每段必须以 "data:" 开头。
 	for _, frame := range bytes.Split([]byte(out), []byte("\n\n")) {
 		if len(frame) == 0 {
 			continue
 		}
-		if !bytes.HasPrefix(frame, []byte(": ping")) && !bytes.HasPrefix(frame, []byte("data:")) {
+		if !bytes.HasPrefix(frame, []byte("data:")) {
 			t.Fatalf("interleaved frame detected: %q (full output=%q)", frame, out)
 		}
 	}

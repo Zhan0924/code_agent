@@ -88,7 +88,72 @@ Orchestrator 的 `executeTool()` 优先级：(1) MCP gateway `FindServerForTool(
 
 **仍然死的**（本表只列"曾在此处声明但已修复"的项；其它跨子系统死代码以 `llmdoc/memory/doc-gaps.md` 为准）：
 
-> ✅ MCP SSE 传输（2026-06）：`internal/mcp/transport_sse.go` 已实现 HTTP+SSE 传输，`dialTransport` 按 `cfg.Transport` 分发；`NewGateway` 不再 skip SSE 配置。详见 `llmdoc/architecture/infrastructure-subsystems.md::传输`。其它未接线项（如 `internal/audit`、`internal/pool` 单一 importer 等）见 `llmdoc/memory/doc-gaps.md::死代码`。
+> ✅ MCP SSE 传输（2026-06）：`internal/mcp/transport_sse.go` 已实现 HTTP+SSE 传输，`dialTransport` 按 `cfg.Transport` 分发；`NewGateway` 不再 skip SSE 配置。详见 `llmdoc/architecture/infrastructure-subsystems.md::传输`。
+>
+> ✅ `formatVerificationFeedback`（2026-06-07）：曾仅被 `logger.Warn` 路径触及，本日 stream 路径 retry-once 已消费（见下「Verifier retry-once 门控」段）。**不要再当死代码删**。
+>
+> 其它未接线项（如 `internal/audit`、`internal/pool` 单一 importer 等）见 `llmdoc/memory/doc-gaps.md::死代码`。
+
+## ToolResult.Metadata 契约
+
+跨边界（tool → orchestrator → SSE → 前端）传 typed struct 时，统一用 `json.RawMessage` 透传，**不要**在中间层落成 `map[string]any`——一旦中间层用 map 反序列化再编码回去，前端拿到的 JSON 形状（数字类型 / null / 字段顺序）由中间层决定而非后端 struct 的源真相。
+
+- 工具侧把结构化产物（如 `EditResult` → `editResultToMetadata`，`internal/orchestrator/file_tools.go`）`json.Marshal` 成 `ToolResult.Metadata`；
+- `react_core.go` 把它原样塞进 `ReactStreamEvent.Metadata`；
+- 前端按已知 metadata schema 渲染产物块（DiffBlock 等）。
+
+**不变量**：新增工具携带结构化产物时，定义专属 metadata struct + 序列化 helper，**不要**在 orchestrator 里手搓 `map[string]any{...}`。
+
+## SSE 断线恢复与合成 done 兜底
+
+`GET /api/v1/chat/react-stream/status` / `/resume` 复用 `streamReplayFollow`（`internal/api/handlers.go`）的 **Replay → Status → Follow** 三段式：先把 Redis Stream 缓存的历史事件回放给客户端，再读任务 Status 决定是否继续 Follow 实时流。
+
+**合成 `done` 不变量**：
+
+- 触发条件 1（Replay 后）：history 末尾不是 `done`/`error` 且 `Status` not running → emit `{"reason":"synthesized_after_replay"}`；
+- 触发条件 2（Follow 退出后）：整段未见终态且 ctx 仍存活 → emit `{"reason":"synthesized_after_follow"}`；
+- 守门变量 `hasTerminal` 保证幂等：真 `done` 已在 history 时绝不重复合成；
+- `reason` 字段是审计/排查的唯一区分手段，客户端对 `done` 幂等。
+
+**测试惯例**：`streamCacheReplayer` 局部接口仅用于让 `streamReplayFollow` 可单测（miniredis-backed StreamCache），不是为了让外部包替换。新增类似 handler 内重型流程时，首选「**局部接口 + 真实依赖**」测试模式，而非全栈 mock。
+
+## Verifier retry-once 门控
+
+`verifyOutput` 失败时的 retry 决策由唯一纯函数 `decideVerificationFollowup(retried, globalStep, absoluteMaxSteps, vResult)` 给出（`internal/orchestrator/verification.go`）。约束：
+
+- **stream-only**：仅 `ProcessMessageStreamFull` 路径消费；sync `ProcessMessage` 有严格延迟预算，二次 LLM 调用会让调用方超时，**保留旧的 `logger.Warn` 行为**。
+- **一次性哨兵**：`task.VerificationRetried bool json:"-"`（`internal/models/models.go`）—— 运行时哨兵，`json:"-"` 不参与持久化，避免跨会话被复用。
+- **步数预算**：guard `globalStep < absoluteMaxSteps - 3`，给二次 ReAct 至少 3 步落实 feedback；任何「触发额外子任务」的门控都要为下游预留步数。
+- **回流方式**：feedback 以 `RoleUser` push 回 `messages` 后 `continue` 外层 for，触发自然的下一轮 ReAct——**不要** break 出主循环再启一段新流程。
+
+详细架构语境见 `docs/architecture/09_orchestrator.md` §9.2 与 `llmdoc/architecture/request-flow.md`。
+
+## SSE 长任务心跳契约
+
+长任务（finalize 阶段单次非流式 LLM 调用可能阻塞 20+ 分钟）的心跳分两层，**职责不重叠**：
+
+| 层 | 位置 | 形态 | 目的 |
+|----|------|------|------|
+| 协议级 | `internal/api/handlers.go::runSSEHeartbeat` | 每 25s 写 `": ping\n\n"` 注释行（不进前端 `data:` parser） | 防 `server.write_timeout: 600s` 撕扯合法长任务连接 |
+| 业务级 | `internal/orchestrator/react_core.go::callLLMWithProgress` | 每 3s emit `llm_call_started` / `llm_call_progress` / `llm_call_completed` 三件套，progress 载 `{attempt,elapsed_ms}` JSON Content | 让 UI 在 finalize 阻塞时仍能看到稳定心跳 |
+
+**不变量**：
+
+- 两层契约不要试图合并——协议级保的是 TCP/HTTP 不被 timeout 撕、业务级保的是 UI「进度可感知」。
+- `llmProgressInterval` 是包级 `var` 而非 `const`，仅用于测试缩短间隔，**不要**改成常量。
+- 三件套事件经 `persistingSink` 自动入 Redis Stream，resume 路径同样可见；新增类似机制时要走这条总线而非 SSE 直发，否则断线无法恢复。
+- 前端 UI 不把三件套渲染为新 step 卡片，而是内联到当前 step 的 spinner 旁。
+
+详见 `docs/architecture/09_orchestrator.md` §Q4.5。
+
+## 决策模式：跨传输路径差异化
+
+同一个逻辑分支（如 verifier retry）在 sync 与 stream 路径采取**不同**策略是合法的，判据是「延迟容忍度」而非「行为必须一致」。当前案例：
+
+- **sync** `/chat`：调用方等 HTTP response，二次 LLM 调用 = 用户感知超时 → 不 retry。
+- **stream** `/chat/react-stream`：用户已在看事件流，retry 对 UX 是透明加分 → retry-once。
+
+修重构时不要为了「统一」强行把两条路径合并；先评估各自的延迟/状态预算。
 
 ## 双重 Token 估算器
 

@@ -231,8 +231,12 @@ handleChatReactStream (handlers.go:249)
        │
        │ writeMu sync.Mutex; sendEvent := mu.Lock + sendSSEEvent + mu.Unlock
        │ go runSSEHeartbeat(c.Request.Context(), c.Writer, &writeMu, 25*time.Second)
-       │   ↑ 25s 周期写 ": ping\n\n" 注释行（不进前端 data: parser），
-       │     防 server.write_timeout: 600s 撕扯合法长任务连接
+       │   ↑ 25s 周期写业务 ping 事件 `data: {"type":"ping","ts":<ms>}\n\n`,
+       │     既能防 server.write_timeout: 600s 撕扯合法长任务连接,
+       │     也能触发前端 fetch ReadableStream onByte 回调重置 90s watchdog
+       │     `lastEventAt`(P1 改造前用 `: ping\n\n` 注释行,某些 proxy/fetch
+       │     实现不向上抛字节,导致 watchdog 误判 "网络静默超时")。
+       │     前端 ChatPage.tsx 显式 drop type=ping,不入 trace UI。
        │
        │ eventCh, err := orchestrator.ProcessMessageStreamFull(c.Request.Context(), ...)
        │   ↑ 形参在 orchestrator 内重命名为 reqCtx；业务 ctx 是函数级新建的
@@ -243,8 +247,23 @@ handleChatReactStream (handlers.go:249)
        │ }
        ▼
 SSE 事件类型（来自 orchestrator）:
-  session / intent / thinking / tool_call / tool_result /
-  approval_request / final / error / done
+  session / intent / step_start / thinking / tool_call / tool_result /
+  tool_progress / rag_context / approval_request /
+  verification_warning / fix_loop_abort / message / error / done /
+  llm_call_started / llm_call_progress / llm_call_completed / ping
+
+`ping` 由 `runSSEHeartbeat` 直接写入,不经 orchestrator channel —— 仅
+作为业务级心跳重置前端 watchdog,前端不渲染。
+
+特殊事件载荷（`ReactStreamEvent.Metadata` 为 `json.RawMessage`，透传到前端）:
+
+| 事件 | Metadata 字段 / Content | 来源 / 用途 |
+|---|---|---|
+| `tool_result`（edit_file/apply_diff） | `{path, diff_preview, rolled_back, lint_errors[]}` | `editResultToMetadata`（`file_tools.go`）。前端 ChatPage 用 `diff_preview` 渲染 unified diff 块（行级 +/- 着色，10 000 字符上限+Show more） |
+| `verification_warning` | `{score, issues[], reasoning, retrying}` | `decideVerificationFollowup`（`verification.go`）。低分时 emit，`retrying=true` 表示 orchestrator 将自动把 critique 作为 user 反馈再跑一轮（每 task 限 1 次，仅 stream 路径） |
+| `llm_call_started` / `_progress` / `_completed` | Content 是 JSON：`{attempt,messages,tools}` / `{attempt,elapsed_ms}` / `{attempt,elapsed_ms,err}` | `callLLMWithProgress`（`react_core.go`）。包住每次非流式 ChatCompletion，让 finalize 阶段长达 20+ 分钟的 LLM 调用也有 3s 周期心跳，消除 UI 假死。详见 09_orchestrator §Q4.5 |
+
+新增 metadata 字段须同步前端 `code_agent_ui/src/types/index.ts` 中的 `ToolResultMetadata` / `VerificationWarningMetadata` / `ReactStreamEventType`。
 
 ═══════════════ WebSocket 升级 ══════════════════════════════════════
 
@@ -469,6 +488,59 @@ debugGroup **没有** `RequireRole`。
 ### 5.3 `handleChatReactStream`（handlers.go:249）
 
 与 `handleChatStream` 同结构，但调 `ProcessMessageStreamFull`，事件类型由 orchestrator 决定。
+
+### 5.3.1 Replay / Resume：`stream/status` + `stream/resume` + 合成 `done` 兜底
+
+短端点 `GET /api/v1/chat/react-stream/status` / `GET /api/v1/chat/react-stream/resume` 复用 `streamReplayFollow` 通用流程：从 `StreamCache.Replay` 拿历史快照、`Status` 判任务是否还在跑、`Follow` XREAD BLOCK 续追新事件。前端断线、tab 重开、SessionStart 重连都走这条路径恢复 SSE。
+
+**问题**：在"task 已 `MarkDone` 但 `done` 事件尚未或永远不会进 Stream"的竞态/截断窗口里，朴素 Replay 会把没有 `done` 的 history 直接吐给客户端然后退出 ——SSE reader 永远等不到终态，UI 卡 spinner。
+
+**对策**（`handlers.go: streamReplayFollow`，2026-06-07）：
+
+| 触发点 | 条件 | 动作 | 合成事件 `reason` |
+|---|---|---|---|
+| Replay 后 | history 末尾不是 `done`/`error` 且 `Status` 报 not running | 主动 emit 一条合成 `done` | `synthesized_after_replay` |
+| Follow 退出后 | Follow 通道关闭时 ctx 仍存活、整段会话从未见过终态 | 主动 emit 一条合成 `done` | `synthesized_after_follow` |
+
+合成 `done` 的 `Data` 是 `{"reason": "synthesized_after_..."}`，让审计/排查能区分真假终态。客户端对 `done` 幂等，已有 `done` 时不会重复合成（用 `hasTerminal` 守门）。
+
+测试覆盖在 `internal/api/stream_replay_followup_test.go`：
+- `TestStreamReplayFollow_NoTerminalInHistory_SynthesizesDone` — 校验合成路径
+- `TestStreamReplayFollow_TerminalInHistory_NoSyntheticDone` — 校验幂等不重复
+
+为了让 `streamReplayFollow` 可测，handler 把 StreamCache 抽象成局部 `streamCacheReplayer` 接口，测试可以直接用 miniredis-backed 真实 StreamCache 验证，不依赖完整 Orchestrator 构造。
+
+**status endpoint 返回字段(2026-06-07 起增加 `last_event_at_ms`)**:
+
+```
+GET /api/v1/chat/react-stream/status?session_id=<id>
+200 {
+  "running":          true|false,                    // 是否仍在跑
+  "event_count":      <int>,                         // Redis Stream 总条数
+  "last_event_at_ms": <unix_millis>,                 // 最末条事件写入毫秒戳;0 表示流空
+  "task_id":          "<uuid>"                       // 仅 running=true 返回
+}
+```
+
+`last_event_at_ms` 是 `StreamCache.LastEventAt` 解析 Redis Stream 末条 ID 的前段毫秒戳返回(Stream ID 格式 `1717843200000-0`),不需要服务端 TIME 调用。前端可在 watchdog 触发前据此判断"后端是否真活着":若 `running=true` 但 `last_event_at_ms` 已停滞数分钟,后端八成卡在 finalize LLM 调用上,UI 可给出更友好提示而非粗暴报错。
+
+### 5.3.2 前端 UI 解锁不依赖 reader 自然退出(2026-06-07）
+
+后端的 `done`/`error` 即使按时到达 Redis Stream，前端 SSE reader 仍可能因为浏览器 fetch 缓冲、Vite dev proxy、HTTP keep-alive 等中间层卡在 `body.getReader().read()` 长达数十秒。期间 `consumeReactStream` 不会自然结束，外层 `finally` 块里 `setLoading(false)` / `reconcileFinalMessage` 永远不跑，UI spinner 永转——观感与"后端没回报告"完全相同。
+
+**约定**（`code_agent_ui/src/pages/ChatPage.tsx`）：
+
+| 改动点 | 规则 |
+|---|---|
+| `consumeReactStream` | 收到 `done`/`error` 事件时立即调上层 `onTerminal` 回调；不等 reader 退出 |
+| 两条 `runWithSilentWatchdog` 调用点 | 在 `onTerminal` 里调 `controller.abort()`，强制 reader 抛 `AbortError` 走 catch+finally |
+| `ReActTrace` `finalMessage` | 反向 for 取**最后**一条 `type:"message"` 而非 `find`(首条)——fallback resume 启动前会插入"🔄 网络静默超时…"告警，若 finalMessage 取首条，真 finalize 报告永远被遮蔽 |
+| `ReActTrace` loading indicator | 关闭条件叠加 `!finalMessage`：`loading && !isDone && !finalMessage`——即使 done event 丢失，只要 `reconcileFinalMessage` 已从 PG 补出 final message，spinner 也立即关掉 |
+| 告警/重连提示 step type | 一律 `type:"thinking"`，不再使用 `type:"message"`——避免污染 finalMessage 检测 |
+| `useEffect` resume 失败兜底 | 一次 resume 静默 90s 后自动二次 resume，对称于 `runReactStream` 的双层 fallback |
+| F1 — PG polling 兜底 | watchdog 触发 + fallback resume 也超时后,启 `pollSessionUntilFinal`:每 5s 调 `GET /api/v1/sessions/:id`,2 分钟内拉到 `timestamp > entry.createdAt` 的 assistant message 即推到 UI(silent recovery),否则才报错"已尝试 2 分钟 PG 兜底,请刷新页面" |
+| F3 — reconcile 幂等 | `reconcileFinalMessage` 三重 guard:① `!Number.isFinite(createdAt)`/<=0 拒绝 ② `reconciledEntryIdsRef`(以 createdAt 为 key 的 Set)同 entry 只 reconcile 一次 ③ `messagesToEntries` 给历史 entry 派生 `createdAt = msg.timestamp`,防 0-createdAt 击穿 |
+| F2 — error step 软化 | 同 entry 已有 `type=message` 时,所有 `type=error` step 标记 `softHidden=true`,UI 淡灰显示并加 "(已自动恢复)" 后缀,不再红字粘屏 |
 
 ### 5.4 `handleInterrupt`（handlers.go:407）
 

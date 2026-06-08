@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -242,7 +243,7 @@ func TestValidateWorkspaceCommand_AllowedCommands(t *testing.T) {
 		"ls -la",
 	}
 	for _, cmd := range allowed {
-		if rejection := validateWorkspaceCommand(cmd); rejection != "" {
+		if rejection, _ := validateWorkspaceCommand(cmd); rejection != "" {
 			t.Errorf("command %q should be allowed, got rejection: %s", cmd, rejection)
 		}
 	}
@@ -270,7 +271,7 @@ func TestValidateWorkspaceCommand_BannedPatterns(t *testing.T) {
 		"mount /dev/sda1 /mnt",
 	}
 	for _, cmd := range banned {
-		if rejection := validateWorkspaceCommand(cmd); rejection == "" {
+		if rejection, _ := validateWorkspaceCommand(cmd); rejection == "" {
 			t.Errorf("command %q should be rejected but was allowed", cmd)
 		}
 	}
@@ -284,7 +285,7 @@ func TestValidateWorkspaceCommand_DisallowedCommands(t *testing.T) {
 		"unknown_command arg1 arg2",
 	}
 	for _, cmd := range disallowed {
-		if rejection := validateWorkspaceCommand(cmd); rejection == "" {
+		if rejection, _ := validateWorkspaceCommand(cmd); rejection == "" {
 			t.Errorf("command %q should be rejected (not in allowlist) but was allowed", cmd)
 		}
 	}
@@ -384,6 +385,78 @@ func TestRunWorkspaceCmd_ZeroPerCallUsesCeiling(t *testing.T) {
 	}
 	if effective != ceiling {
 		t.Errorf("expected ceiling=%s when per-call=0, got %s", ceiling, effective)
+	}
+}
+
+// TestToolRunWorkspaceCmd_EmitsHeartbeat 校验 B1 心跳:即使 stdout 无任何新行,
+// progressCb 也按 workspaceCmdHeartbeatInterval 周期触发,前端 watchdog 不再
+// 因工具长跑零输出误判 "网络静默超时"。
+//
+// 测试用 `sleep 2` 命令(沉默 2 秒)+ 把心跳间隔压到 200ms。期望:
+//   - progressCb 至少触发 ≥ 5 次心跳(2s / 200ms ~ 10 次,留 50% 容忍)
+//   - 心跳文案前缀 `⏱`(确保走的是心跳分支而非 stdout 旁路)
+//   - LLM 看到的 ToolResult.Content 不包含心跳文案(不污染纯净输出)
+func TestToolRunWorkspaceCmd_EmitsHeartbeat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip: spawns sh -c with sleep")
+	}
+	// 压短心跳节奏,测试结束后恢复。
+	prevInterval := workspaceCmdHeartbeatInterval
+	workspaceCmdHeartbeatInterval = 200 * time.Millisecond
+	defer func() { workspaceCmdHeartbeatInterval = prevInterval }()
+
+	o := newTimeoutTestOrchestrator(t, 30*time.Second)
+
+	// 注入 progressCb,统计心跳 chunk。
+	var (
+		mu          sync.Mutex
+		chunks      []string
+		heartbeats  int
+		stdoutLines int
+	)
+	cb := func(chunk string) {
+		mu.Lock()
+		defer mu.Unlock()
+		chunks = append(chunks, chunk)
+		if strings.HasPrefix(chunk, "⏱") {
+			heartbeats++
+		} else if strings.TrimSpace(chunk) != "" {
+			stdoutLines++
+		}
+	}
+	ctx := WithProgressCallback(context.Background(), cb)
+
+	// `sleep` 不在 allowlist,用 bash 包一层(bash 是已批准前缀)。
+	args, _ := json.Marshal(map[string]any{
+		"command":         "bash -c 'sleep 2'",
+		"timeout_seconds": 10,
+	})
+	res, err := o.toolRunWorkspaceCmd(ctx, args)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected IsError, content=%s", res.Content)
+	}
+
+	mu.Lock()
+	gotHeartbeats := heartbeats
+	gotStdout := stdoutLines
+	mu.Unlock()
+
+	if gotHeartbeats < 5 {
+		t.Errorf("expected >= 5 heartbeats in 2s sleep (interval=200ms), got %d (chunks=%d)",
+			gotHeartbeats, len(chunks))
+	}
+	// sleep 命令本身无 stdout,允许偶尔 0 行,绝不能比 heartbeats 多。
+	if gotStdout > gotHeartbeats {
+		t.Errorf("stdout lines (%d) > heartbeats (%d): heartbeat path likely broken",
+			gotStdout, gotHeartbeats)
+	}
+
+	// 心跳绝不能进 LLM 看到的工具结果(避免污染 stdout)
+	if strings.Contains(res.Content, "⏱") {
+		t.Errorf("heartbeat marker leaked into ToolResult.Content: %s", res.Content)
 	}
 }
 

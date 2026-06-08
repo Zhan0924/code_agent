@@ -80,9 +80,46 @@
 
 ### 流式变体（ProcessMessageStreamFull）
 
-外层自动续接循环（`absoluteMaxSteps = 200` 硬上限），内层批次循环使用 `getMaxSteps(intent)`。每个 ReAct 步骤发射 `ReactStreamEvent`（step_start / thinking / tool_call / tool_result / tool_progress / final / done）。
+外层自动续接循环（`absoluteMaxSteps = 200` 硬上限），内层批次循环使用 `getMaxSteps(intent)`。每个 ReAct 步骤发射 `ReactStreamEvent`（step_start / thinking / tool_call / tool_result / tool_progress / verification_warning / final / done）。
 
 **tool_progress 事件**：长时间运行的工具（如 `run_workspace_cmd`）通过 context 注入的 `ProgressCallback` 逐行流式输出 stdout，生成 `tool_progress` SSE 事件（含 step/toolCallID/toolName/content）。当前仅 `run_workspace_cmd` 支持此机制。定义见 `internal/orchestrator/tool_progress.go`。
+
+**tool_result.metadata 携带 diff**：`edit_file` / `apply_diff` 的工具结果在 `ToolResult.Metadata`（`json.RawMessage`）里塞入 `{path, diff_preview, rolled_back, lint_errors[]}`，沿 `reactEventSink` 透传到 `ReactStreamEvent.Metadata`。前端用 `diff_preview` 渲染 unified diff 块——「过程即产物」：用户不依赖 final answer 就能看到每一次编辑的实际改动。
+
+**verifyOutput 失败时的 retry-once 自修复**：`shouldVerifyOutput()` 在高风险意图或步数 > 5 时触发独立 LLM critique。若 `passed=false`，stream 路径会：
+
+1. emit `verification_warning` 事件（载荷 `{score, issues, reasoning, retrying}`），前端展示 ⚠️ 评分+issues；
+2. 通过 `decideVerificationFollowup()` 判断是否 retry：`!task.VerificationRetried && globalStep < absoluteMaxSteps-3` 时把 `formatVerificationFeedback(vResult)` 以 `RoleUser` push 回 messages，`continue` 外层 for 让 LLM 再跑一轮 ReAct 补救。
+
+每个 task 最多 retry 一次；sync 路径（`ProcessMessage`）不 retry，保留延迟预算。
+
+**LLM 调用进度心跳（callLLMWithProgress）**：每次非流式 `ChatCompletion` 由 `callLLMWithProgress(ctx, call, sink, ...)` 包住，发三个事件：`llm_call_started`（包含 `attempt/messages/tools`）、`llm_call_progress`（每 3s 一次，`{attempt,elapsed_ms}`）、`llm_call_completed`（`{attempt,elapsed_ms,err}`）。目的是 finalize 阶段（单次 LLM 可能阻塞 20+ 分钟）让 UI 看到稳定心跳，消除「假死」。事件经 `persistingSink` 自动入 Redis Stream，resume 链路一样可见。详见 `docs/architecture/09_orchestrator.md` §Q4.5。
+
+## SSE 断线恢复
+
+`GET /api/v1/chat/react-stream/status` / `/resume` 提供断线后的恢复入口，由 `internal/api/handlers.go::streamReplayFollow` 统一处理 **Replay → Status → Follow** 三段式：
+
+1. **Replay**：从 Redis Stream 缓存回放历史事件，让客户端追上进度；
+2. **Status**：读任务状态决定后续动作（running / done / error）；
+3. **Follow**：仍 running 时挂接实时流，否则直接收尾。
+
+**两处合成 `done` 兜底**：
+
+- `synthesized_after_replay`：Replay 后 history 末尾不是 `done`/`error` 且 Status not running；
+- `synthesized_after_follow`：Follow 退出后整段未见终态且 ctx 仍存活；
+- 守门变量 `hasTerminal` 保证幂等，避免重复合成真 `done`。
+
+详见 `docs/architecture/17_api.md` §5.3.1。
+
+**前端 UI 解锁不依赖 reader 自然退出**:即使后端 `done` 按时到 Redis Stream,浏览器 fetch 缓冲 / Vite dev proxy 仍可能让 `body.getReader().read()` 卡数十秒,期间 `consumeReactStream` 不返回 → `finally` 块的 `setLoading(false)` 永远不跑,UI spinner 永转。约定:
+
+- `consumeReactStream` 收到 `done`/`error` 立即调 `onTerminal` 回调 → `controller.abort()` 强制 reader 退出
+- `ReActTrace` `finalMessage` **反向取末**(原代码 `find` 取首,告警提示会遮蔽真 finalize 报告)
+- spinner 关掉条件叠加 `!finalMessage`:即使 done 丢失,只要 `reconcileFinalMessage` 从 PG 补出报告,spinner 立即关
+- 告警提示一律 `type:"thinking"`,绝不用 `type:"message"` —— 后者会污染 finalMessage 检测
+- `useEffect` resume 静默超时后自动二次 resume,对称 `runReactStream` 的双层 fallback
+
+详见 `docs/architecture/17_api.md` §5.3.2。
 
 ## PromptBuilder 5 区域结构
 
