@@ -27,6 +27,7 @@ type configMsg struct {
 	config *tui.ConfigInfo
 }
 type errMsg struct{ err error }
+type copyDoneMsg struct{}
 
 // ─── Model ──────────────────────────────────────────────────────────────────
 
@@ -41,7 +42,7 @@ type appModel struct {
 	statusBar statusBar
 
 	// State
-	chatLines []string
+	messages  *MessageModel
 	streaming bool
 	eventCh   <-chan models.ReactStreamEvent
 	width     int
@@ -64,13 +65,8 @@ func newAppModel(backend tui.Backend) appModel {
 		backend:   backend,
 		textarea:  ta,
 		spinner:   sp,
-		statusBar:newStatusBar(),
-		chatLines: []string{
-			titleStyle.Render("Code Agent TUI"),
-			"",
-			thinkingStyle.Render("Type a message to start chatting. Commands: /new, /sessions, /quit"),
-			"",
-		},
+		statusBar: newStatusBar(),
+		messages:  newMessageModel(),
 	}
 }
 
@@ -113,7 +109,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if !m.ready {
 			m.viewport = viewport.New(m.width, vpH)
-			m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+			m.viewport.SetContent(m.messages.Render(m.width))
 			m.ready = true
 		} else {
 			m.viewport.Width = m.width
@@ -137,12 +133,42 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.handleCommand(input)
 			}
 
-			m.chatLines = append(m.chatLines, userMsgStyle.Render("You: "+input), "")
-			m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+			// Add user message
+			m.messages.AddEvent(models.ReactStreamEvent{
+				Type:    "message",
+				Content: "You: " + input,
+			})
+			m.messages.blocks[len(m.messages.blocks)-1].IsFinal = false
+			
+			m.viewport.SetContent(m.messages.Render(m.width))
 			m.viewport.GotoBottom()
 			m.streaming = true
 			m.statusBar.state = "thinking"
 			return m, m.startStreamCmd(input)
+			
+		case msg.Type == tea.KeyCtrlE && !m.streaming:
+			// Toggle expand current block
+			// Find first collapsed block and expand it
+			for i, block := range m.messages.blocks {
+				if !block.IsFinal && !block.Expanded {
+					m.messages.ToggleExpand(i)
+					break
+				}
+			}
+			m.viewport.SetContent(m.messages.Render(m.width))
+			
+		case msg.Type == tea.KeyCtrlY && !m.streaming:
+			// Copy final output to clipboard
+			output := m.messages.GetFinalOutput()
+			if output != "" {
+				// Write to clipboard file (simplified approach)
+				copyToClipboard(output)
+				m.statusBar.state = "copied"
+				// Reset state after a moment
+				cmds = append(cmds, func() tea.Msg {
+					return copyDoneMsg{}
+				})
+			}
 		}
 
 	case streamStartMsg:
@@ -151,7 +177,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamEventMsg:
 		ev := models.ReactStreamEvent(msg)
-		rendered := renderEvent(ev)
+		
+		// Add to message model
+		m.messages.AddEvent(ev)
 
 		switch ev.Type {
 		case "step_start":
@@ -172,11 +200,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusBar.state = "idle"
 		}
 
-		if rendered != "" {
-			m.chatLines = append(m.chatLines, rendered)
-			m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
-			m.viewport.GotoBottom()
-		}
+		// Update viewport
+		m.viewport.SetContent(m.messages.Render(m.width))
+		m.viewport.GotoBottom()
 
 		if m.streaming {
 			return m, waitForEvent(m.eventCh)
@@ -185,8 +211,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDoneMsg:
 		m.streaming = false
 		m.statusBar.state = "idle"
-		m.chatLines = append(m.chatLines, "")
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		m.viewport.SetContent(m.messages.Render(m.width))
 
 	case sessionCreatedMsg:
 		m.sessionID = string(msg)
@@ -201,17 +226,27 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case sessionListMsg:
-		m.chatLines = append(m.chatLines, []string(msg)...)
-		m.chatLines = append(m.chatLines, "")
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		for _, line := range msg {
+			m.messages.AddEvent(models.ReactStreamEvent{
+				Type:    "message",
+				Content: line,
+			})
+		}
+		m.viewport.SetContent(m.messages.Render(m.width))
 		m.viewport.GotoBottom()
 
 	case errMsg:
 		m.streaming = false
 		m.statusBar.state = "idle"
-		m.chatLines = append(m.chatLines, errorMsgStyle.Render("Error: "+msg.err.Error()), "")
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		m.messages.AddEvent(models.ReactStreamEvent{
+			Type:    "error",
+			Content: msg.err.Error(),
+		})
+		m.viewport.SetContent(m.messages.Render(m.width))
 		m.viewport.GotoBottom()
+
+	case copyDoneMsg:
+		m.statusBar.state = "idle"
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -240,13 +275,20 @@ func (m appModel) View() string {
 	}
 
 	var sections []string
+	
+	// Main viewport
 	sections = append(sections, m.viewport.View())
+	
+	// Status bar
 	sections = append(sections, m.statusBar.View())
 
 	if m.streaming {
 		sections = append(sections, m.spinner.View()+" Agent is working...")
 	} else {
-		sections = append(sections, m.textarea.View())
+		// Input area with help text
+		input := m.textarea.View()
+		help := helpStyle.Render("Ctrl+E: expand | Ctrl+Y: copy result | Enter: send")
+		sections = append(sections, input+"\n"+help)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
@@ -290,8 +332,8 @@ func (m appModel) handleCommand(input string) (tea.Model, tea.Cmd) {
 	case input == "/quit" || input == "/exit":
 		return m, tea.Quit
 	case input == "/new":
-		m.chatLines = append(m.chatLines, thinkingStyle.Render("Creating new session..."), "")
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		m.messages = newMessageModel()
+		m.viewport.SetContent(m.messages.Render(m.width))
 		return m, m.createSessionCmd()
 	case input == "/sessions":
 		return m, func() tea.Msg {
@@ -311,8 +353,11 @@ func (m appModel) handleCommand(input string) (tea.Model, tea.Cmd) {
 			return sessionListMsg(lines)
 		}
 	default:
-		m.chatLines = append(m.chatLines, errorMsgStyle.Render("Unknown command: "+input), "")
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		m.messages.AddEvent(models.ReactStreamEvent{
+			Type:    "error",
+			Content: "Unknown command: " + input,
+		})
+		m.viewport.SetContent(m.messages.Render(m.width))
 		return m, nil
 	}
 }
