@@ -67,9 +67,24 @@ func (r *RemoteBackend) readSSE(_ context.Context, body io.ReadCloser, ch chan<-
 			continue
 		}
 		data := strings.TrimPrefix(line, "data:")
+		
+		// Parse the outer wrapper
+		var wrapper struct {
+			Type string                 `json:"type"`
+			Data map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(data), &wrapper); err != nil {
+			continue
+		}
+		
+		// Re-marshal the data field to parse as ReactStreamEvent
+		dataBytes, err := json.Marshal(wrapper.Data)
+		if err != nil {
+			continue
+		}
+		
 		var ev models.ReactStreamEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			// Log parse error but continue
+		if err := json.Unmarshal(dataBytes, &ev); err != nil {
 			continue
 		}
 		ch <- ev
