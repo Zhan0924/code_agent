@@ -26,6 +26,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock   # Sandbox needs Docker
       - ./configs/config.yaml:/etc/code-agent/configs/config.yaml:ro  # Mount local config
       - agent-workspaces:/tmp/agent-workspaces     # Generated projects survive container restart
+      - /Users:/Users                               # Mount host home directories for project access
     depends_on:
       redis:
         condition: service_healthy
