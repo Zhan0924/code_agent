@@ -2,7 +2,7 @@
 # Multi-stage build for production-grade Code Agent
 # ============================================================
 # Use a reachable Docker Hub mirror (dockerhub.icu is currently unavailable).
-FROM docker.m.daocloud.io/library/golang:1.25-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates tzdata
 
@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     ./cmd/agent
 
 # ============================================================
-FROM docker.m.daocloud.io/library/alpine:3.20 AS runtime
+FROM alpine:3.20 AS runtime
 
 # Dev toolchains for LLM-executed workspace commands. The agent runs
 # `exec.Command("sh","-c", ...)` directly inside this container

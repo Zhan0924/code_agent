@@ -53,7 +53,7 @@ services:
     image: docker.m.daocloud.io/library/redis:7-alpine
     container_name: agent-redis
     ports:
-      - "6379:6379"
+      - "16379:6379"
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redis-data:/data
@@ -70,7 +70,7 @@ services:
     image: docker.m.daocloud.io/pgvector/pgvector:pg16
     container_name: agent-postgres
     ports:
-      - "5432:5432"
+      - "15432:5432"
     environment:
       POSTGRES_DB: code_agent
       POSTGRES_USER: agent

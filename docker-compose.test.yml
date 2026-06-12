@@ -26,7 +26,7 @@ services:
     networks: [p0-net]
 
   redis-p0:
-    image: docker.m.daocloud.io/library/redis:7-alpine
+    image: redis:7-alpine
     container_name: redis-p0
     command: redis-server --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
     healthcheck:
@@ -37,7 +37,7 @@ services:
     networks: [p0-net]
 
   qdrant-p0:
-    image: docker.m.daocloud.io/qdrant/qdrant:v1.12.4
+    image: qdrant/qdrant:v1.12.4
     container_name: qdrant-p0
     networks: [p0-net]
 

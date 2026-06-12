@@ -236,6 +236,11 @@ type RAGConfig struct {
 	//   ""       - auto: try openai first, fall back to local if credentials missing
 	EmbeddingProvider string `mapstructure:"embedding_provider"`
 
+	// EmbeddingDimension specifies the output vector dimension for the embedding model.
+	// DashScope text-embedding-v3 supports: 64, 128, 256, 512, 768, 1024.
+	// Must match qdrant.vector_size. Defaults to 1024 if unset.
+	EmbeddingDimension int `mapstructure:"embedding_dimension"`
+
 	// Embedding API credentials (OpenAI-compatible endpoint)
 	EmbeddingBaseURL string `mapstructure:"embedding_base_url"` // e.g., "https://api.openai.com/v1" or compatible proxy
 	EmbeddingAPIKey  string `mapstructure:"embedding_api_key"`  // API key for the embedding endpoint

@@ -32,7 +32,7 @@
 
 > "我做了一个用 **Go 写的生产级代码 Agent 系统**——类似 Cursor / Cline，但是为**企业内部**场景设计，核心差异是三点：  
 > **可控**（敏感命令走 Temporal 工作流挂起等人审批）、**准确**（Tree-sitter AST 切分 + Qdrant 双路召回 + Rerank，检索准确率比文本切分高 20 个点）、**安全**（每次执行脚本开一次性 Docker 容器，network=none + cgroups）。  
-> 整体 **100+ Go 包、22 篇架构文档、单测 68% 覆盖**。我是主力开发，从架构设计到落地全程参与。"
+> 整体 **47k 行 Go / 33 个 internal package / 667 个单测、覆盖率 68%**，还实现了 Multi-Agent 并行协作和工具自学习机制。我是主力开发，从架构设计到落地全程参与。"
 
 ---
 
@@ -515,6 +515,75 @@
 4. **如果追问"最大的踩坑"**：选 **难点 5** 的第一次重构失败 + rollback，真诚反思比吹牛加分。
 
 **口诀：问难点 → 说 5 个 → 展开 1~2 个 → 给数字 → 给反思**。
+
+---
+
+## 8.5 已实现高级模块（补充亮点）
+
+> 以下三个模块已完整��现，可在面试中作为"架构进阶"或"最近在做什么"的回答素材。
+
+---
+
+### Q8.5.1：Multi-Agent 协作是怎么做的？
+
+**架构**：`internal/multiagent/`（13 个文件），核心组件：
+
+- **Supervisor**（`supervisor.go`）：接收 DAG Plan → `TopologicalSort` 拓扑排序 → 按层级并行派发子任务，单层内多 goroutine + `sync.WaitGroup` 并发执行；
+- **SubAgent**（`sub_agent.go`）：双模式执行——
+  - **Fast Path**：单次工具直接 dispatch（低延迟）；
+  - **ReAct Path**：依赖 `agentloop.Runner` 做多步推理（`ReasoningRequired=true` 时触发）；
+- **AgentPool**（`agent_pool.go`）：channel-based semaphore 控制并发上限（默认 MaxParallel=3），空闲 agent 复用；
+- **ConflictResolver**（`conflict_resolver.go`）：检测多 agent 并发写同一文件的冲突，支持三种策略——`LastWriter` / `FirstWriter` / `Priority`（code > test > review）；
+- **RoleSelector**（`role_selector.go`）：基于历史成功率 + 亲和度 + 时间衰减的加权评分（60% 成功率 + 20% 亲和度 + 20% 时间近度），动态选最优 agent 类型；
+- **MessageBus**（`message_bus.go`）：进程内 pub/sub 消息总线，支持 Subscribe/Publish/Broadcast；
+- **ToolFilter**（`tool_filter.go`）：每个 SubAgent 只暴露白名单内的工具（最小权限原则）。
+
+**面试亮点句**：
+> "我做了一个轻量级的 Multi-Agent 框架——Supervisor 拿到 DAG Plan 后按拓扑层级并行派发，每层内的 sub-agent 独立执行，冲突通过 ConflictResolver 检测同文件写入并按优先级仲裁。Pool 用 channel semaphore 控并发，RoleSelector 根据历史成功率动态选 agent 类型——本质是把'谁来做这一步'变成了一个在线学习问题。"
+
+---
+
+### Q8.5.2：工具自学习（Tool Learning）机制？
+
+**架构**：`internal/toollearn/`（9 个文件），形成"采集 → 提取 → 蒸馏 → 策略 → 建议"闭环：
+
+| 组件 | 职责 |
+|------|------|
+| **Collector** | 记录每次工具调用的 Feedback（工具名、参数哈希、成功/失败、耗时、错误信息、SessionID） |
+| **Extractor** | 分析 Collector 缓冲区，提取 ToolPattern（失败率、平均耗时、高频错误） |
+| **Distiller** | 从成功 session 中识别**工具调用链模式**（StrategyEntry），找出"A→B→C 这样做成功率高" |
+| **AdaptivePolicy** | 基于历史数据动态排序工具：成功率 + 趋势（前后半段对比） + 序列加分（上一步是 X，下一步用 Y 成功率高）→ `RankTools()` / `SuggestNext()` |
+| **Advisor** | 工具调用前给 LLM 注入 warning/hint（失败率 >50% 警告、平均耗时 >10s 建议替代） |
+
+**关键设计**：
+- **衰减因子（0.9）**：近期数据权重更高，适应工具质量变化；
+- **滑动窗口（windowSize=50）**：避免早期噪声永久影响策略；
+- **序列模式**：`toolA→toolB` 的成功率作为上下文感知的推荐依据；
+- **可选持久化**：`Store` 接口 + `pg_store.go` PostgreSQL 实现，也可纯内存运行。
+
+**面试亮点句**：
+> "我做了一个工具自学习模块——每次工具调用的结果都被 Collector 记录，Extractor 提取失败模式，AdaptivePolicy 根据历史成功率 + 序列模式动态重排工具优先级。本质是让 Agent 的工具选择从'LLM 随机选'演化为'基于实际执行反馈的在线学习策略'。效果是高失败率工具被自动降权，高成功序列被强化推荐。"
+
+---
+
+### Q8.5.3：Skill Registry（动态工具注册）？
+
+**架构**：`internal/skill/`（6 个文件），核心设计：
+
+- **统一�图**：将内置工具、MCP 工具、用户自定义 Skill 统一成单一 `map[string]*Definition`，对 LLM 透明；
+- **热插拔**：`Register()` / `Unregister()` 即时生效，下次 LLM 调用自动看到新工具（无需重启）；
+- **双执行器**：
+  - `webhook`：HTTP POST 到外部服务（超时可配、Headers 可扩展）；
+  - `function`：Go 闭包注册，内置工具走这条路（零网络开销）；
+- **Schema 快照**（`schema_snapshot.go`）：
+  - `atomic.Pointer` 实现 lock-free 读（热路径 99% 直接 Load）；
+  - 注册/注销后 `Bump()` 失效快照，下次 Snapshot 重建；
+  - 保证字节确定性 → 最大化 LLM provider 的 prompt caching 命中率；
+  - 附带 ETag 字段可做 HTTP If-None-Match。
+- **风险分级联动 HITL**：`RiskLevel=2` 的 Skill 被 Invoke 时返回 `ErrNeedApproval` → Orchestrator 触发 Temporal workflow.Await 等人工批准。
+
+**面试亮点句**：
+> "Skill Registry 解决的核心问题是——LLM 的 function_call 要求每次请求都带完整工具列表，但这些工具来自三个异构源（内置/MCP/用户webhook）。我用 RWMutex + map 做统一注册表，Snapshot 走 atomic.Pointer lock-free 读保证字节确定性，让 LLM provider 的 prompt cache 能命中。热路径实测比 sync.Map 全量扫描快 3~5 倍。"
 
 ---
 

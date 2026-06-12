@@ -17,17 +17,18 @@
 
 | 维度 | 真实数字 | 核验方法 |
 |---|---|---|
-| Go 代码量 | **35 375 LOC / 129 文件** | `find . -name '*.go' \| wc -l` |
-| Package 数 | **27 个 internal package** | `find ./internal -type d \| wc -l` |
+| Go 代码量 | **47 216 LOC / 160+ 文件** | `find . -name '*.go' \| xargs cat \| wc -l` |
+| Package 数 | **33 个 internal package** | `ls -d ./internal/*/` |
 | 架构文档 | **12 篇 docs/*.md** | `ls docs/` |
-| 测试函数 | **290 个 Test***、**13 个 Benchmark*** | `grep -r '^func Test' --include='*.go' ./internal` |
+| 测试函数 | **667 个 Test***、**15 个 Benchmark*** | `grep -r '^func Test' --include='*.go' ./internal \| wc -l` |
+| 高级模块 | Multi-Agent 协作 / 工具自学习 / Skill Registry（均已实现） | `internal/multiagent/` / `internal/toollearn/` / `internal/skill/` |
 | 最新优化 | P0 四项 + MCP 连接池（P1） | `docs/OPTIMIZATION_P0_IMPLEMENTED.md` + `internal/mcp/pool.go` |
 
 ---
 
 ## 1. 30 秒电梯稿（开场）
 
-> "这是一个 **35k 行 Go 代码** 的生产级代码智能 Agent。它不是又一个 ChatGPT 套壳，而是要解决三个让 LLM Agent 无法落地的工程难题：
+> "这是一个 **47k 行 Go 代码** 的生产级代码智能 Agent。它不是又一个 ChatGPT 套壳，而是要解决三个让 LLM Agent 无法落地的工程难题：
 >
 > - **可控**——危险命令（`DROP DATABASE` / `kubectl apply`）命中敏感规则就 Temporal `workflow.Await` 挂起，等审批 Signal 唤醒；
 > - **准确**——代码 RAG 走 Tree-sitter AST 切分 + BM25/Dense 双路召回 + Cross-Encoder 重排，且对 embedding 做内容哈希缓存；
@@ -55,7 +56,7 @@
 
 ### 段落 3 · 结果（15 秒）
 
-> "工程度量可以现场核验：35k LOC / 27 package / 290 个单测 / 13 个 benchmark / 12 篇架构文档；`go test -race -count=3` 全绿。性能上，最近一轮 P0 + P1 优化后，MCP 工具调用按压测估算能做到 3~4x 提速，关键是**把瓶颈从 Go 侧挪到了单子进程 Node server 侧并做了水平扩展**。"
+> "工程度量可以现场核验：47k LOC / 33 package / 667 个单测 / 15 个 benchmark / 12 篇架构文档；`go test -race -count=3` 全绿。性能上，最近一轮 P0 + P1 优化后，MCP 工具调用按压测估算能做到 3~4x 提速，关键是**把瓶颈从 Go 侧挪到了单子进程 Node server 侧并做了水平扩展**。此外还实现了 **Multi-Agent 并行协作**（基于 DAG 拓扑分层调度）和 **工具自学习**（Tool Learning，基于历史执行反馈动态优化工具选择策略）。"
 
 ### 段落 4 · 我的角色（5 秒）
 
@@ -162,9 +163,10 @@
 
 | 维度 | 数据 |
 |---|---|
-| Go 代码量 | 35 375 LOC / 129 文件 |
-| Internal packages | 27 个 |
-| 测试函数 | 290 个 `Test*`，13 个 `Benchmark*` |
+| Go 代码量 | 47 216 LOC / 160+ 文件 |
+| Internal packages | 33 个 |
+| 测试函数 | 667 个 `Test*`，15 个 `Benchmark*` |
+| 高级模块 | **Multi-Agent 协作**（Supervisor + DAG 拓扑调度 + ConflictResolver）/ **工具自学习**（Collector→Extractor→AdaptivePolicy 闭环）/ **Skill Registry**（atomic Snapshot + webhook/function 双执行器） |
 | 最新重头戏 | **MCP 连接池**：11 个 `-race -count=3` 全绿用例（1.8s）；**P0 四件套**：Prompt Schema ETag 缓存 / Embedding 缓存 / Speculative Tool Cache / Warm Pool |
 | 可观测端点 | `/api/v1/debug/p0*`（实时 hit/miss/alive），`/api/v1/tools` 返 `X-Tools-Etag`（304 Not Modified 优化） |
 | CI | `Dockerfile.p0test` 三段式：unit → 集成 → benchmark |

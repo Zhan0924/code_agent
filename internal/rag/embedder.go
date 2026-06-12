@@ -16,9 +16,10 @@ import (
 // OpenAIEmbedder implements the Embedder interface using OpenAI's embedding API.
 // It supports any OpenAI-compatible endpoint (OpenAI, Azure, local vLLM, Ollama, etc.)
 type OpenAIEmbedder struct {
-	client *openai.Client
-	model  string
-	logger *zap.Logger
+	client    *openai.Client
+	model     string
+	dimension int
+	logger    *zap.Logger
 }
 
 // NewOpenAIEmbedder creates a new embedder using dedicated RAG embedding credentials.
@@ -55,18 +56,25 @@ func NewOpenAIEmbedder(ragCfg *config.RAGConfig, llmFallback *config.LLMProvider
 		model = "text-embedding-3-small"
 	}
 
+	dimension := ragCfg.EmbeddingDimension
+	if dimension <= 0 {
+		dimension = 1024 // Default for DashScope text-embedding-v3
+	}
+
 	logger.Info("embedding client configured",
 		zap.String("model", model),
 		zap.String("base_url", baseURL),
+		zap.Int("dimension", dimension),
 		zap.Bool("has_api_key", apiKey != ""),
 		zap.Bool("using_rag_credentials", ragCfg.EmbeddingAPIKey != ""),
 		zap.Bool("egress_client", httpClient != nil),
 	)
 
 	return &OpenAIEmbedder{
-		client: openai.NewClientWithConfig(clientCfg),
-		model:  model,
-		logger: logger.With(zap.String("component", "embedder"), zap.String("model", model)),
+		client:    openai.NewClientWithConfig(clientCfg),
+		model:     model,
+		dimension: dimension,
+		logger:    logger.With(zap.String("component", "embedder"), zap.String("model", model)),
 	}
 }
 
@@ -91,7 +99,7 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 		req := openai.EmbeddingRequest{
 			Input:      batch,
 			Model:      openai.EmbeddingModel(e.model),
-			Dimensions: 1536, // Match pgvector column size
+			Dimensions: e.dimension,
 		}
 
 		resp, err := e.client.CreateEmbeddings(ctx, req)

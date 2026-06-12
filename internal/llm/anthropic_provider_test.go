@@ -294,10 +294,13 @@ func TestAnthropicProvider_ChatCompletion(t *testing.T) {
 			t.Errorf("expected /messages path, got %s", r.URL.Path)
 		}
 
-		// Verify Authorization header
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			t.Errorf("expected Bearer token, got %s", auth)
+		// Verify Authorization header (Anthropic uses x-api-key header)
+		auth := r.Header.Get("X-Api-Key")
+		if auth == "" {
+			auth = r.Header.Get("Authorization")
+		}
+		if auth == "" {
+			t.Errorf("expected api key in X-Api-Key or Authorization header, got empty")
 		}
 
 		// Read request body

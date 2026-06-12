@@ -58,7 +58,7 @@ postgres:
 qdrant:
   addr: "localhost:6334"
   collection: "code_embeddings"
-  vector_size: 1536
+  vector_size: 1024
   timeout: 10s
 
 temporal:
@@ -102,7 +102,8 @@ mcp:
 rag:
   chunk_max_tokens: 512
   overlap_tokens: 64
-  embedding_model: "text-embedding-3-small"
+  embedding_model: "text-embedding-v3"
+  embedding_dimension: 1024
 
   # Embedding API — requires OpenAI-compatible endpoint (separate from LLM provider).
   # Override via env: CODE_AGENT_RAG_EMBEDDING_BASE_URL / CODE_AGENT_RAG_EMBEDDING_API_KEY

@@ -4310,7 +4310,7 @@ Agent 在 ReAct 循环中可能需要执行用户代码（运行测试、编译�
 ```
 
 **代码位置：**
-- 沙箱管理器：`internal/sandbox/manager.go` — `Manager.Run`
+- 沙箱管理器：`internal/sandbox/manager.go` — `Manager.Execute`
 - 容器配置：`internal/sandbox/manager.go` — `buildContainerConfig`
 - 多语言镜像：`internal/sandbox/volume.go` — 镜像与挂载配置
 
@@ -6388,6 +6388,194 @@ func (e *Executor) executeNodeWithDynamicAdjustment(ctx context.Context, node *N
 
 ---
 
+## 九（补）、Multi-Agent 协作与工具自学习
+
+### 9.5 Multi-Agent 协作：如何让多个 Agent 并行工作且不冲突？
+
+**回答：**
+
+**Multi-Agent 架构设计（`internal/multiagent/`，13 个文件）：**
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    Supervisor                          │
+│  ┌──────────┐  ┌────────────┐  ┌───────────────┐    │
+│  │AgentPool │  │RoleSelector│  │ConflictResolver│    │
+│  │(semaphore)│  │(动态评分)   │  │(写冲突仲裁)   │    │
+│  └──────────┘  └────────────┘  └───────────────┘    │
+│         │              │               │              │
+│    ┌────┴────┐    ┌────┴────┐    ┌────┴────┐        │
+│    │SubAgent │    │SubAgent │    │SubAgent │        │
+│    │ (code)  │    │ (test)  │    │(review) │        │
+│    └─────────┘    └─────────┘    └─────────┘        │
+│         │              │               │              │
+│         └──────────────┼───────────────┘              │
+│                        ▼                              │
+│               ┌──────────────┐                        │
+│               │  MessageBus  │                        │
+│               │ (pub/sub 通信)│                        │
+│               └──────────────┘                        │
+└─────────────────────────────────────────────────────┘
+```
+
+**核心组件职责：**
+
+1. **Supervisor**（编排者）：
+   - 接收 `planner.Plan`（DAG 格式）；
+   - 调用 `planner.TopologicalSort()` 得到执行层级；
+   - 按层级并行派发，同层内 goroutine + WaitGroup 并发；
+   - 每层全部成功才进入下一层，任一失败则终止。
+
+2. **SubAgent**（执行者，双模式）：
+   - **Fast Path**：单次工具调用��直接通过 `ToolDispatcher.Dispatch()`，最低延迟；
+   - **ReAct Path**：当 `ReasoningRequired=true` 且注入了 LLM 依赖，启动完整的 `agentloop.Runner` 做多步推理；
+   - 每个 SubAgent 只能访问 `AllowedTools` 白名单内的工具（`FilteredToolExecutor`）。
+
+3. **AgentPool**（并发控制）：
+   - channel-based semaphore（`make(chan struct{}, MaxParallel)`）；
+   - `Acquire()` 阻塞获取 + 优先复用已有实例；
+   - `Release()` 归还到类型池 → 减少 GC 压力。
+
+4. **ConflictResolver**（冲突仲裁）：
+   - 检测：多 Agent 对同一文件的并发写操作；
+   - 冲突类型：`ConcurrentWrite` / `DeleteModify`；
+   - 解决策略：`Priority`（code > test > review）、`FirstWriter`、`LastWriter`；
+   - `CommitEdit()` 确认后清除 pending 状态。
+
+5. **RoleSelector**（动态选角）：
+   - 评分公式：`0.6 * 成功率 + 0.2 * 亲和度 + 0.2 * 时间近度`；
+   - 亲和度矩阵：code agent → write_file(1.0)；test agent → run_tests(1.0)；review agent → read_file(1.0)；
+   - 滑动窗口记录最近 10 次结果，避免早期数据偏置。
+
+**并发安全关键点：**
+- panic recovery：每个 goroutine 有 `defer recover()`，防止单个 sub-agent panic 导致全部崩溃；
+- 文件写入检测：`fileWriteClassifier` 判断 action 是否写文件，避免并行调度写同一文件的任务；
+- 超时控制：`StepTimeout`（单步 5min）+ `TotalTimeout`（全局 30min）双重 context。
+
+**代码位置：**
+- 核心编排：`internal/multiagent/supervisor.go`
+- 子 Agent：`internal/multiagent/sub_agent.go`
+- 冲突解决：`internal/multiagent/conflict_resolver.go`
+- 角色选择：`internal/multiagent/role_selector.go`
+- 并发池：`internal/multiagent/agent_pool.go`
+- 消息总线：`internal/multiagent/message_bus.go`
+- 工具过滤：`internal/multiagent/tool_filter.go`
+
+---
+
+### 9.6 工具自学习（Tool Learning）：Agent 如何从历史执行中优化工具选择？
+
+**回答：**
+
+**核心思路：** 把工具调用的结果反馈（成功/失败/耗时/错误类型）作为信号，在线学习出"哪个工具在什么上下文下最可靠"的策略。
+
+**闭环数据流：**
+
+```
+工具调用 → Collector 记录 Feedback
+                ↓
+        Extractor 提取 ToolPattern（失败率/高频错误）
+                ↓
+        Distiller 蒸馏 StrategyEntry（成功工具链模式）
+                ↓
+        AdaptivePolicy 动态排序（RankTools / SuggestNext）
+                ↓
+        Advisor 注入 LLM 上下文（warning / hint）
+                ↓
+        LLM 做出更优工具选择 → 工具调用 → ...（循环）
+```
+
+**各组件详解：**
+
+1. **Collector**（`collector.go`）：
+   - 每次工具调用记录 `Feedback{ToolName, ArgsHash(SHA256[:10]), Success, DurationMs, ErrorMsg, SessionID}`；
+   - 内存环形缓冲（cap=1024）+ 可选 `Store` 接口持久化（`pg_store.go`）；
+   - `SetStore()` 支持运行时热挂载数据库。
+
+2. **Extractor**（`extractor.go`）：
+   - `Analyze(toolName)` → 统计最近 50 条 feedback 的 `FailureRate`、`AvgDuration`、`CommonErrors`；
+   - `FailureSequences(toolName, minStreak=3)` → 检测连续失败模式（触发熔断预警）。
+
+3. **Distiller**（`distiller.go`）：
+   - 从成功 session 中提取 **ToolChain**（工具调用序列模式）；
+   - `StrategyEntry{TaskPattern, ToolChain, SuccessRate, SampleCount}`；
+   - 要求 `minSamples=5` 才产出策略（避免过拟合）。
+
+4. **AdaptivePolicy**（`policy.go`）：
+   - **工具评分**：按 `windowSize=50` 滑动窗口计算成功率；
+   - **趋势检测**：前半段 vs 后半段成功率差值，正 = 改善中，负 = 退化中；
+   - **序列模式**：记录 `toolA→toolB` 的转移成功率；
+   - `RankTools(toolNames, lastTool)` → 综合 base score + trend bonus + sequence bonus 重排；
+   - `SuggestNext(lastTool)` → 推荐下一步最优工具（成功率 >70% 才推荐）。
+
+5. **Advisor**（`advisor.go`）：
+   - 在工具 dispatch 前调用 `FormatForLLM(toolName)`；
+   - 失败率 >50% → 注入 `[Tool Learning Warning]`；
+   - 平均耗时 >10s → 注入 `[Hint] 考虑更快的替代方案`。
+
+**设计亮点：**
+- **零侵入**：Collector 只需在工具执行后调用 `Record()`，不修改工具本身；
+- **渐进式**：无历史数据时退化为原始 LLM 选择，有数据后逐步优化；
+- **可解释**：Advisor 给出的建议直接以自然语言注入 LLM，而非黑箱调整。
+
+**代码位置：** `internal/toollearn/`（9 个文件，含 2 个测试文件）
+
+---
+
+### 9.7 Skill Registry：如何实现动态工具注册与 Prompt Cache 优化？
+
+**回答：**
+
+**问题背景：** LLM 的 function_call 要求每次请求携带完整工具 JSON Schema。工具来自三个异构源：
+- 内置工具（Go 函数）；
+- MCP 工具（子进程运行时才知道）；
+- 用户自定义 Skill（webhook 热插拔）。
+
+**Registry 设计（`internal/skill/registry.go`）：**
+
+```
+┌────────────┐    ┌────────────┐    ┌────────────┐
+│  Builtin   │    │    MCP     │    │   User     │
+│   tools    │    │   tools    │    │  webhook   │
+└─────┬──────┘    └─────┬──────┘    └─────┬──────┘
+      │                 │                  │
+      └─────────────┬───┴──────────────────┘
+                    ▼
+      ┌──────────────────────────────┐
+      │   skill.Registry              │
+      │   sync.RWMutex + map[string] │
+      │   Snapshot() / Invoke()      │
+      └──────────────┬───────────────┘
+                     ▼
+          LLM function_call schema
+```
+
+**核心机制：**
+
+1. **RWMutex + map 选型**：
+   - 读（Snapshot 全量扫描）远多于写（注册/注销）；
+   - `sync.Map` 优化的是单 key 读多写少，不适合全量遍历；
+   - 实测 RWMutex + map 比 sync.Map 快 3~5 倍。
+
+2. **Schema 快照 + Prompt Caching**（`schema_snapshot.go`）：
+   - `atomic.Pointer[ToolSchemaSnapshot]` 实现 lock-free 热读；
+   - 注册/注销时 `Bump()` 递增 generation → 旧快照失效；
+   - 快照保证字节确定性（排序后构建）→ 同一 generation 的多次调用返回同一指针；
+   - **效果**：Anthropic/OpenAI 的 prompt caching 按 prefix 匹配，工具列表不变 = cache hit。
+
+3. **双执行器**：
+   - `webhook`：HTTP POST 外部服务，可配 Headers/Timeout/Method；
+   - `function`：Go 闭包直接调用，内置工具走此路径（0 网络开销）。
+
+4. **风险分级联动 HITL**：
+   - `RiskLevel=0`（安全）→ 直接执行；
+   - `RiskLevel=1`（需审计）→ 执行 + 记录审计日志；
+   - `RiskLevel=2`（高危）→ 返回 `ErrNeedApproval` → Orchestrator 触发 Temporal workflow.Await。
+
+**代码位置：** `internal/skill/`（6 个文件，含 snapshot bench test）
+
+---
+
 ## 十、Agent 性能优化与可观测性
 
 ### 10.1 性能问题：如何优化 ReAct 循环的端到端延迟？瓶颈在哪里？
@@ -6979,6 +7167,9 @@ else:
 - **Docker 沙箱**：多层隔离，安全执行用户代码
 - **记忆系统**：短期/情景/长期三层协同
 - **DAG 规划**：动态调整，支持复杂任务分解
+- **Multi-Agent**：Supervisor + DAG 拓扑并行 + ConflictResolver 写冲突仲裁
+- **工具自学习**：Collector→Extractor→AdaptivePolicy 在线学习闭环
+- **Skill Registry**：动态工具注册 + atomic Snapshot + prompt cache 优化
 - **可观测性**：Metrics + Logs + Traces 全链路追踪
 
 ---
