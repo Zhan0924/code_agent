@@ -1,4 +1,4 @@
-.PHONY: build run test test-short test-cover lint clean docker-build docker-up docker-down migrate tidy generate openapi
+.PHONY: build build-tui run run-tui test test-short test-cover lint clean docker-build docker-up docker-down migrate tidy generate openapi
 
 APP_NAME := code-agent
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0")
@@ -11,9 +11,17 @@ build:
 	@echo "==> Building $(APP_NAME)..."
 	go build $(LDFLAGS) -o bin/$(APP_NAME) ./cmd/agent
 
+build-tui:
+	@echo "==> Building $(APP_NAME)-tui..."
+	go build $(LDFLAGS) -o bin/$(APP_NAME)-tui ./cmd/tui
+
 run: build
 	@echo "==> Running $(APP_NAME)..."
 	./bin/$(APP_NAME)
+
+run-tui: build-tui
+	@echo "==> Running $(APP_NAME)-tui..."
+	./bin/$(APP_NAME)-tui --remote --url http://localhost:18080
 
 # ─── Testing ───────────────────────────────────────────────
 test:
@@ -72,7 +80,9 @@ openapi:
 help:
 	@echo "Available targets:"
 	@echo "  build        - Build the binary"
+	@echo "  build-tui    - Build the TUI binary"
 	@echo "  run          - Build and run"
+	@echo "  run-tui      - Build and run TUI (connects to localhost:18080)"
 	@echo "  test         - Run all tests with race detector"
 	@echo "  test-short   - Run short tests (no external deps)"
 	@echo "  test-cover   - Run tests with coverage report"
