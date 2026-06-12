@@ -129,17 +129,23 @@ func buildUserMessage(req DelegationRequest) string {
 func (a *SubAgent) allowedTools() []string {
 	switch a.Type {
 	case AgentCode:
-		return []string{"read_file", "write_file", "edit_file", "patch_file", "apply_diff",
-			"list_files", "create_directory", "git_status", "git_diff",
-			"git_commit", "git_branch", "git_log", "run_workspace_cmd",
-			"shell_exec", "goto_definition", "find_references", "hover_info", "rename_symbol"}
+		return []string{
+			models.ToolReadFile, models.ToolWriteFile, models.ToolEditFile, models.ToolPatchFile, models.ToolApplyDiff,
+			models.ToolListFiles, models.ToolCreateDirectory, models.ToolGitStatus, models.ToolGitDiff,
+			models.ToolGitCommit, models.ToolGitBranch, models.ToolGitLog, models.ToolRunWorkspaceCmd,
+			models.ToolShellExec, models.ToolGotoDefinition, models.ToolFindReferences, models.ToolHoverInfo, models.ToolRenameSymbol,
+		}
 	case AgentTest:
-		return []string{"run_tests", "execute_code", "read_file", "run_workspace_cmd", "shell_exec"}
+		return []string{
+			models.ToolRunTests, models.ToolExecuteCode, models.ToolReadFile, models.ToolRunWorkspaceCmd, models.ToolShellExec,
+		}
 	case AgentReview:
-		return []string{"read_file", "search_code", "list_files", "git_diff", "git_log",
-			"goto_definition", "find_references", "hover_info"}
+		return []string{
+			models.ToolReadFile, models.ToolSearchCode, models.ToolListFiles, models.ToolGitDiff, models.ToolGitLog,
+			models.ToolGotoDefinition, models.ToolFindReferences, models.ToolHoverInfo,
+		}
 	default:
-		return []string{"read_file", "search_code"}
+		return []string{models.ToolReadFile, models.ToolSearchCode}
 	}
 }
 

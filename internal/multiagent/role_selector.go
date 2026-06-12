@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent/code_agent/internal/models"
 	"go.uber.org/zap"
 )
 
@@ -133,17 +134,17 @@ func (rs *RoleSelector) recencyScore(lastUsed time.Time) float64 {
 func defaultAffinity(agentType AgentType, action string) float64 {
 	affinities := map[AgentType]map[string]float64{
 		AgentCode: {
-			"write_file": 1.0, "edit_file": 1.0, "patch_file": 1.0,
-			"create_directory": 0.9, "git_commit": 0.9,
-			"read_file": 0.5, "run_tests": 0.3,
+			models.ToolWriteFile: 1.0, models.ToolEditFile: 1.0, models.ToolPatchFile: 1.0,
+			models.ToolCreateDirectory: 0.9, models.ToolGitCommit: 0.9,
+			models.ToolReadFile: 0.5, models.ToolRunTests: 0.3,
 		},
 		AgentTest: {
-			"run_tests": 1.0, "execute_code": 1.0,
-			"read_file": 0.6, "write_file": 0.3,
+			models.ToolRunTests: 1.0, models.ToolExecuteCode: 1.0,
+			models.ToolReadFile: 0.6, models.ToolWriteFile: 0.3,
 		},
 		AgentReview: {
-			"read_file": 1.0, "search_code": 1.0, "list_files": 0.9,
-			"git_diff": 0.9, "git_log": 0.8,
+			models.ToolReadFile: 1.0, models.ToolSearchCode: 1.0, models.ToolListFiles: 0.9,
+			models.ToolGitDiff: 0.9, models.ToolGitLog: 0.8,
 		},
 	}
 

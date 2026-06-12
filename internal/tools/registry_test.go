@@ -173,13 +173,13 @@ func TestRegistry_Execute_NotFound(t *testing.T) {
 // closest registered names so the next turn can recover instead of looping.
 func TestRegistry_Execute_NotFound_SuggestsAlternatives(t *testing.T) {
 	r := NewRegistry()
-	for _, name := range []string{"run_workspace_cmd", "run_tests", "read_file", "write_file", "git_diff"} {
+	for _, name := range []string{models.ToolRunWorkspaceCmd, models.ToolRunTests, models.ToolReadFile, models.ToolWriteFile, models.ToolGitDiff} {
 		_ = r.Register(newStub(name, "builtin"))
 	}
 
 	// Hallucinated `shell_exec` — should surface run_workspace_cmd / run_tests
 	// (both share the "exec/run" semantic via the substring/token match).
-	_, err := r.Execute(context.Background(), "shell_exec", nil)
+	_, err := r.Execute(context.Background(), models.ToolShellExec, nil)
 	if !errors.Is(err, ErrToolNotFound) {
 		t.Fatalf("err = %v, want ErrToolNotFound", err)
 	}

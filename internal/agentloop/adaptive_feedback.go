@@ -1,6 +1,10 @@
 package agentloop
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/agent/code_agent/internal/models"
+)
 
 const (
 	maxErrorHistory    = 10
@@ -44,11 +48,11 @@ func (af *AdaptiveFeedback) IsBlacklisted(toolName string) bool {
 // SuggestAlternative returns a strategy hint when a tool is blacklisted.
 func (af *AdaptiveFeedback) SuggestAlternative(toolName string) string {
 	switch toolName {
-	case "read_file":
+	case models.ToolReadFile:
 		return "read_file 多次失败，改用 list_dir 或 grep 定位文件"
-	case "execute_code":
+	case models.ToolExecuteCode:
 		return "execute_code 不可用，改用 run_workspace_cmd 或描述预期结果"
-	case "edit_file", "write_file", "patch_file":
+	case models.ToolEditFile, models.ToolWriteFile, models.ToolPatchFile:
 		return fmt.Sprintf("%s 多次失败，检查文件路径是否正确或用 list_dir 确认", toolName)
 	case "grep":
 		return "grep 多次失败，改用 rag_search 或 read_file 逐步排查"

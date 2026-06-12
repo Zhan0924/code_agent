@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/planner"
 	"go.uber.org/zap"
 )
@@ -57,7 +58,7 @@ func TestSubAgent_Execute(t *testing.T) {
 	d := &mockDispatcher{}
 	agent := NewSubAgent(AgentCode, zap.NewNop())
 
-	params := json.RawMessage(`{"tool":"read_file","args":{"path":"main.go"}}`)
+	params := json.RawMessage(`{"tool":"` + models.ToolReadFile + `","args":{"path":"main.go"}}`)
 	output, err := agent.Execute(context.Background(), DelegationRequest{
 		StepID:     "step-1",
 		AgentType:  AgentCode,
@@ -71,7 +72,7 @@ func TestSubAgent_Execute(t *testing.T) {
 	if output != "ok: read_file" {
 		t.Errorf("unexpected output: %s", output)
 	}
-	if len(d.calls) != 1 || d.calls[0] != "read_file" {
+	if len(d.calls) != 1 || d.calls[0] != models.ToolReadFile {
 		t.Errorf("unexpected dispatch calls: %v", d.calls)
 	}
 }
@@ -84,7 +85,7 @@ func TestSubAgent_Execute_UsesActionFallback(t *testing.T) {
 	output, err := agent.Execute(context.Background(), DelegationRequest{
 		StepID:     "step-1",
 		AgentType:  AgentCode,
-		Action:     "read_file",
+		Action:     models.ToolReadFile,
 		Task:       "read a file",
 		Parameters: params,
 	}, d)
@@ -95,7 +96,7 @@ func TestSubAgent_Execute_UsesActionFallback(t *testing.T) {
 	if output != "ok: read_file" {
 		t.Errorf("unexpected output: %s", output)
 	}
-	if len(d.calls) != 1 || d.calls[0] != "read_file" {
+	if len(d.calls) != 1 || d.calls[0] != models.ToolReadFile {
 		t.Errorf("unexpected dispatch calls: %v", d.calls)
 	}
 }
@@ -104,7 +105,7 @@ func TestSubAgent_DisallowedTool(t *testing.T) {
 	d := &mockDispatcher{}
 	agent := NewSubAgent(AgentReview, zap.NewNop())
 
-	params := json.RawMessage(`{"tool":"write_file","args":{}}`)
+	params := json.RawMessage(`{"tool":"` + models.ToolWriteFile + `","args":{}}`)
 	_, err := agent.Execute(context.Background(), DelegationRequest{
 		StepID:     "step-1",
 		AgentType:  AgentReview,
@@ -124,9 +125,9 @@ func TestSupervisor_Execute(t *testing.T) {
 
 	plan := &planner.Plan{
 		Steps: []planner.Step{
-			{ID: "s1", Action: "read_file", Description: "read main", DependsOn: nil},
-			{ID: "s2", Action: "read_file", Description: "read util", DependsOn: nil},
-			{ID: "s3", Action: "write_file", Description: "write output", DependsOn: []string{"s1", "s2"}},
+			{ID: "s1", Action: models.ToolReadFile, Description: "read main", DependsOn: nil},
+			{ID: "s2", Action: models.ToolReadFile, Description: "read util", DependsOn: nil},
+			{ID: "s3", Action: models.ToolWriteFile, Description: "write output", DependsOn: []string{"s1", "s2"}},
 		},
 	}
 

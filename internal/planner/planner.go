@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent/code_agent/internal/models"
 	"go.uber.org/zap"
 )
 
@@ -69,10 +70,10 @@ type Planner struct {
 // NewPlanner creates a new Planner instance.
 func NewPlanner(llm LLMCaller, logger *zap.Logger) *Planner {
 	defaultActions := []string{
-		"read_file", "write_file", "edit_file", "execute_code",
-		"search_code", "run_tests", "think", "patch_file", "apply_diff",
-		"list_files", "create_directory", "run_workspace_cmd",
-		"shell_exec", "goto_definition", "find_references", "hover_info", "rename_symbol",
+		models.ToolReadFile, models.ToolWriteFile, models.ToolEditFile, models.ToolExecuteCode,
+		models.ToolSearchCode, models.ToolRunTests, "think", models.ToolPatchFile, models.ToolApplyDiff,
+		models.ToolListFiles, models.ToolCreateDirectory, models.ToolRunWorkspaceCmd,
+		models.ToolShellExec, models.ToolGotoDefinition, models.ToolFindReferences, models.ToolHoverInfo, models.ToolRenameSymbol,
 	}
 	return &Planner{
 		llm:       llm,

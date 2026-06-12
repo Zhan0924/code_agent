@@ -2,10 +2,12 @@ package planner
 
 import (
 	"testing"
+
+	"github.com/agent/code_agent/internal/models"
 )
 
 func TestPlanEvaluator_EmptyPlan(t *testing.T) {
-	e := NewPlanEvaluator([]string{"read_file", "write_file"})
+	e := NewPlanEvaluator([]string{models.ToolReadFile, models.ToolWriteFile})
 	plan := &Plan{Goal: "test", Steps: []Step{}}
 
 	q := e.Evaluate(plan, "test")
@@ -18,13 +20,13 @@ func TestPlanEvaluator_EmptyPlan(t *testing.T) {
 }
 
 func TestPlanEvaluator_GoodPlan(t *testing.T) {
-	e := NewPlanEvaluator([]string{"read_file", "edit_file", "run_tests"})
+	e := NewPlanEvaluator([]string{models.ToolReadFile, models.ToolEditFile, models.ToolRunTests})
 	plan := &Plan{
 		Goal: "fix the authentication bug in login handler",
 		Steps: []Step{
-			{ID: "step_1", Action: "read_file", Description: "Read the login handler to understand the authentication flow"},
-			{ID: "step_2", Action: "edit_file", Description: "Fix the bug in authentication logic", DependsOn: []string{"step_1"}},
-			{ID: "step_3", Action: "run_tests", Description: "Run tests to verify the fix works", DependsOn: []string{"step_2"}},
+			{ID: "step_1", Action: models.ToolReadFile, Description: "Read the login handler to understand the authentication flow"},
+			{ID: "step_2", Action: models.ToolEditFile, Description: "Fix the bug in authentication logic", DependsOn: []string{"step_1"}},
+			{ID: "step_3", Action: models.ToolRunTests, Description: "Run tests to verify the fix works", DependsOn: []string{"step_2"}},
 		},
 	}
 
@@ -38,11 +40,11 @@ func TestPlanEvaluator_GoodPlan(t *testing.T) {
 }
 
 func TestPlanEvaluator_UnknownActions(t *testing.T) {
-	e := NewPlanEvaluator([]string{"read_file", "write_file"})
+	e := NewPlanEvaluator([]string{models.ToolReadFile, models.ToolWriteFile})
 	plan := &Plan{
 		Goal: "deploy the app",
 		Steps: []Step{
-			{ID: "step_1", Action: "read_file", Description: "Read config"},
+			{ID: "step_1", Action: models.ToolReadFile, Description: "Read config"},
 			{ID: "step_2", Action: "deploy_to_prod", Description: "Deploy to production", DependsOn: []string{"step_1"}},
 			{ID: "step_3", Action: "notify_slack", Description: "Notify team", DependsOn: []string{"step_2"}},
 		},
@@ -58,13 +60,13 @@ func TestPlanEvaluator_UnknownActions(t *testing.T) {
 }
 
 func TestPlanEvaluator_RedundantSteps(t *testing.T) {
-	e := NewPlanEvaluator([]string{"read_file", "edit_file"})
+	e := NewPlanEvaluator([]string{models.ToolReadFile, models.ToolEditFile})
 	plan := &Plan{
 		Goal: "update config",
 		Steps: []Step{
-			{ID: "step_1", Action: "read_file", Description: "Read the config file"},
-			{ID: "step_2", Action: "read_file", Description: "Read the config file"},
-			{ID: "step_3", Action: "edit_file", Description: "Edit config", DependsOn: []string{"step_1", "step_2"}},
+			{ID: "step_1", Action: models.ToolReadFile, Description: "Read the config file"},
+			{ID: "step_2", Action: models.ToolReadFile, Description: "Read the config file"},
+			{ID: "step_3", Action: models.ToolEditFile, Description: "Edit config", DependsOn: []string{"step_1", "step_2"}},
 		},
 	}
 

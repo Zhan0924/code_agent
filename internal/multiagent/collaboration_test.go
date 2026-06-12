@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent/code_agent/internal/models"
 	"go.uber.org/zap"
 )
 
@@ -75,12 +76,12 @@ func TestRoleSelector_SelectBest_NoHistory(t *testing.T) {
 	rs := NewRoleSelector(zap.NewNop())
 
 	// With no history, should use default affinity
-	best := rs.SelectBest("write_file", []AgentType{AgentCode, AgentTest, AgentReview})
+	best := rs.SelectBest(models.ToolWriteFile, []AgentType{AgentCode, AgentTest, AgentReview})
 	if best != AgentCode {
 		t.Errorf("expected AgentCode for write_file, got %s", best)
 	}
 
-	best = rs.SelectBest("run_tests", []AgentType{AgentCode, AgentTest, AgentReview})
+	best = rs.SelectBest(models.ToolRunTests, []AgentType{AgentCode, AgentTest, AgentReview})
 	if best != AgentTest {
 		t.Errorf("expected AgentTest for run_tests, got %s", best)
 	}
@@ -98,7 +99,7 @@ func TestRoleSelector_SelectBest_WithHistory(t *testing.T) {
 		rs.RecordResult(AgentCode, false, 500*time.Millisecond)
 	}
 
-	best := rs.SelectBest("read_file", []AgentType{AgentCode, AgentReview})
+	best := rs.SelectBest(models.ToolReadFile, []AgentType{AgentCode, AgentReview})
 	if best != AgentReview {
 		t.Errorf("expected AgentReview (high success rate), got %s", best)
 	}
@@ -124,7 +125,7 @@ func TestRoleSelector_RecordResult(t *testing.T) {
 }
 
 func TestCandidatesForAction(t *testing.T) {
-	candidates := CandidatesForAction("write_file")
+	candidates := CandidatesForAction(models.ToolWriteFile)
 	if len(candidates) == 0 {
 		t.Fatal("expected at least one candidate for write_file")
 	}

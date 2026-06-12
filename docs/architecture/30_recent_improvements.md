@@ -691,6 +691,26 @@ SSE 长任务心跳契约 / SSE 断线恢复与合成 done 兜底`、
 
 ---
 
+### G.4 Tool Names Centralization — 跨包常量化解决硬编码（2026-06-12）
+
+**现象**
+工具名称（如 `"read_file"`、`"write_file"`、`"execute_code"` 等）作为硬编码字符串字面量散落在 `multiagent`、`agentloop`、`planner` 和 `tools` 等多个包中，每次增删或重命名工具都极度脆弱、易错，且增加维护成本。
+
+**根因**
+虽然 `internal/orchestrator` 包内部收敛了自身的常量，但由于包依赖顺序，其他包如果 import `orchestrator` 获取这些常量会引发 Go 循环导入依赖（import cycle）。
+
+**修复**
+- 新建 [internal/models/tool_names.go](file:///Users/zhanqiankun.1/code/code_agent/internal/models/tool_names.go)，将所有内置及常用工具名常量集中放置在无任何外部依赖的叶子包 `internal/models` 中。
+- 修改 [internal/orchestrator/tool_names.go](file:///Users/zhanqiankun.1/code/code_agent/internal/orchestrator/tool_names.go)，将其内部常量全部重定向/别名至 `models` 常量，保持 orchestrator 内部向前兼容，避免大规模代码改动。
+- 重构 `multiagent`、`agentloop`、`planner` 和 `tools` 等包（包含对应的单测文件），将散落的所有硬编码字符串字面量彻底替换为 `models.Tool*` 常量。
+
+**验证**
+- 所有重构包的单元测试（如 `go test ./internal/multiagent/...` 等）编译并全部通过，零 Regression，也未产生任何 import cycle。
+
+**相关章节**：`llmdoc/must/working-agreement.md::工具分发拆分` / `::死代码清单`
+
+---
+
 ## 参考
 
 - [`API_TEST_GUIDE.md`](../API_TEST_GUIDE.md) — 每条修复对应的 API 级回归测试

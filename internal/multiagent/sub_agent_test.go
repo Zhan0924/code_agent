@@ -29,17 +29,17 @@ func (m *mockLLMCaller) ChatCompletion(_ context.Context, _ *llm.ChatRequest) (*
 func TestSubAgent_ReActPath_MultiStep(t *testing.T) {
 	ml := &mockLLMCaller{responses: []*llm.ChatResponse{
 		{Content: "Reading file first.", ToolCalls: []models.ToolCall{
-			{ID: "tc1", Name: "read_file", Args: json.RawMessage(`{"path":"main.go"}`)},
+			{ID: "tc1", Name: models.ToolReadFile, Args: json.RawMessage(`{"path":"main.go"}`)},
 		}},
 		{Content: "Now editing.", ToolCalls: []models.ToolCall{
-			{ID: "tc2", Name: "edit_file", Args: json.RawMessage(`{"path":"main.go"}`)},
+			{ID: "tc2", Name: models.ToolEditFile, Args: json.RawMessage(`{"path":"main.go"}`)},
 		}},
 		{Content: "Task complete. File has been updated."},
 	}}
 
 	te := &mockToolExecutor{result: &models.ToolResult{Content: "file content"}}
 	tp := &mockToolProvider{defs: []models.ToolDefinition{
-		{Name: "read_file"}, {Name: "edit_file"}, {Name: "write_file"},
+		{Name: models.ToolReadFile}, {Name: models.ToolEditFile}, {Name: models.ToolWriteFile},
 	}}
 
 	agent := NewSubAgent(AgentCode, zap.NewNop())
@@ -73,12 +73,12 @@ func TestSubAgent_ReActPath_StepLimitReturnsError(t *testing.T) {
 	for i := range responses {
 		responses[i] = &llm.ChatResponse{
 			Content:   "still working",
-			ToolCalls: []models.ToolCall{{ID: "tc", Name: "read_file", Args: json.RawMessage(`{}`)}},
+			ToolCalls: []models.ToolCall{{ID: "tc", Name: models.ToolReadFile, Args: json.RawMessage(`{}`)}},
 		}
 	}
 	ml := &mockLLMCaller{responses: responses}
 	te := &mockToolExecutor{result: &models.ToolResult{Content: "ok"}}
-	tp := &mockToolProvider{defs: []models.ToolDefinition{{Name: "read_file"}}}
+	tp := &mockToolProvider{defs: []models.ToolDefinition{{Name: models.ToolReadFile}}}
 
 	agent := NewSubAgent(AgentCode, zap.NewNop())
 	deps := &AgentDeps{
@@ -105,7 +105,7 @@ func TestSubAgent_FallsBackToDirectWhenNoDeps(t *testing.T) {
 	// ReasoningRequired=true but deps=nil → should fall back to direct
 	output, err := agent.ExecuteWithDeps(context.Background(), DelegationRequest{
 		StepID:            "s1",
-		Action:            "read_file",
+		Action:            models.ToolReadFile,
 		Task:              "read file",
 		ReasoningRequired: true,
 	}, dispatcher, nil)
