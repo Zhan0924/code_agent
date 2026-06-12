@@ -23,6 +23,9 @@ type streamStartMsg struct {
 }
 type sessionCreatedMsg string
 type sessionListMsg []string
+type configMsg struct {
+	config *tui.ConfigInfo
+}
 type errMsg struct{ err error }
 
 // ─── Model ──────────────────────────────────────────────────────────────────
@@ -76,7 +79,18 @@ func (m appModel) Init() tea.Cmd {
 		textarea.Blink,
 		m.spinner.Tick,
 		m.createSessionCmd(),
+		m.fetchConfigCmd(),
 	)
+}
+
+func (m *appModel) fetchConfigCmd() tea.Cmd {
+	return func() tea.Msg {
+		config, err := m.backend.GetConfig(context.Background())
+		if err != nil {
+			return errMsg{err}
+		}
+		return configMsg{config}
+	}
 }
 
 // ─── Update ─────────────────────────────────────────────────────────────────
@@ -177,6 +191,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionCreatedMsg:
 		m.sessionID = string(msg)
 		m.statusBar.sessionID = string(msg)
+
+	case configMsg:
+		if msg.config != nil {
+			m.statusBar.model = msg.config.Model
+			m.statusBar.branch = msg.config.Branch
+			m.statusBar.tokensMax = msg.config.MaxTokens
+			m.statusBar.tokensUsed = msg.config.UsedTokens
+		}
 
 	case sessionListMsg:
 		m.chatLines = append(m.chatLines, []string(msg)...)

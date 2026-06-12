@@ -26,53 +26,88 @@ func init() {
 func renderEvent(ev models.ReactStreamEvent) string {
 	switch ev.Type {
 	case "step_start":
+		intent := ev.Intent
+		if intent == "" {
+			intent = "processing"
+		}
 		return stepDividerStyle.Render(
-			fmt.Sprintf("--- Step %d/%d [%s] ---", ev.Step, ev.MaxSteps, ev.Intent),
+			fmt.Sprintf("━━━ Step %d/%d [%s] ━━━", ev.Step, ev.MaxSteps, intent),
 		)
 
 	case "thinking":
 		content := ev.Content
-		if len(content) > 200 {
-			content = content[:200] + "..."
+		if len(content) > 300 {
+			content = content[:300] + "..."
 		}
-		return thinkingStyle.Render("thinking: " + content)
+		if content == "" {
+			return ""
+		}
+		return thinkingStyle.Render("💭 " + content)
+
+	case "llm_call_started":
+		return thinkingStyle.Render("⏳ Calling LLM...")
+
+	case "llm_call_completed":
+		return thinkingStyle.Render("✓ LLM call completed")
 
 	case "tool_call":
-		args := ev.ToolArgs
-		if len(args) > 100 {
-			args = args[:100] + "..."
+		toolName := ev.ToolName
+		if toolName == "" {
+			toolName = "unknown"
 		}
-		return toolCallStyle.Render(fmt.Sprintf("tool: %s(%s)", ev.ToolName, args))
+		args := ev.ToolArgs
+		if len(args) > 150 {
+			args = args[:150] + "..."
+		}
+		if args != "" {
+			return toolCallStyle.Render(fmt.Sprintf("🔧 %s(%s)", toolName, args))
+		}
+		return toolCallStyle.Render(fmt.Sprintf("🔧 %s", toolName))
 
 	case "tool_result":
 		content := ev.Content
-		if len(content) > 300 {
-			content = content[:300] + "\n    ... (truncated)"
+		if len(content) > 400 {
+			content = content[:400] + "\n    ... (truncated)"
 		}
 		if ev.IsError {
-			return toolErrorStyle.Render("FAIL: " + content)
+			return toolErrorStyle.Render("❌ FAIL: " + content)
 		}
-		return toolResultStyle.Render("OK: " + content)
+		return toolResultStyle.Render("✓ OK: " + content)
 
 	case "message":
+		if ev.Content == "" {
+			return ""
+		}
 		rendered := ev.Content
 		if markdownRenderer != nil {
 			if md, err := markdownRenderer.Render(ev.Content); err == nil {
 				rendered = strings.TrimSpace(md)
 			}
 		}
-		return assistantMsgStyle.Render(rendered)
+		return assistantMsgStyle.Render("🤖 Assistant:\n" + rendered)
 
 	case "rag_context":
-		return thinkingStyle.Render("rag: " + ev.Content)
+		content := ev.Content
+		if len(content) > 200 {
+			content = content[:200] + "..."
+		}
+		return thinkingStyle.Render("📚 RAG: " + content)
 
 	case "error":
-		return errorMsgStyle.Render("Error: " + ev.Content)
+		return errorMsgStyle.Render("⚠️  Error: " + ev.Content)
 
 	case "done":
-		return stepDividerStyle.Render("--- Complete ---")
+		return stepDividerStyle.Render("━━━ Complete ━━━")
+
+	case "session":
+		// Session event usually just contains session_id, skip rendering
+		return ""
 
 	default:
-		return thinkingStyle.Render(fmt.Sprintf("[%s] %s", ev.Type, ev.Content))
+		// For unknown events, show type only if there's content
+		if ev.Content != "" {
+			return thinkingStyle.Render(fmt.Sprintf("[%s] %s", ev.Type, ev.Content))
+		}
+		return ""
 	}
 }

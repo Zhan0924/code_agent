@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os/exec"
 	"strings"
 
 	"github.com/agent/code_agent/internal/models"
@@ -107,6 +108,33 @@ func (r *RemoteBackend) CreateSession(ctx context.Context) (string, error) {
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
 	return result.SessionID, nil
+}
+
+func (r *RemoteBackend) GetConfig(ctx context.Context) (*tui.ConfigInfo, error) {
+	// For remote backend, try to get config from server or use defaults
+	// Try to fetch from health endpoint or use reasonable defaults
+	info := &tui.ConfigInfo{
+		Model:      "unknown",
+		Branch:     "unknown",
+		MaxTokens:  128000,
+		UsedTokens: 0,
+	}
+
+	// Try to get branch from local git
+	if branch := getGitBranch(); branch != "" {
+		info.Branch = branch
+	}
+
+	return info, nil
+}
+
+func getGitBranch() string {
+	cmd := exec.Command("git", "branch", "--show-current")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func (r *RemoteBackend) ListSessions(ctx context.Context) ([]tui.SessionSummary, error) {

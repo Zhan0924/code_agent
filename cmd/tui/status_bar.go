@@ -8,64 +8,112 @@ import (
 )
 
 type statusBar struct {
-	sessionID string
-	step      int
-	maxSteps  int
-	state     string // "idle", "thinking", "tool_call", "streaming"
-	width     int
+	sessionID  string
+	step       int
+	maxSteps   int
+	state      string // "idle", "thinking", "tool_call", "streaming"
+	width      int
+	model      string
+	branch     string
+	tokensUsed int
+	tokensMax  int
 }
 
 func newStatusBar() statusBar {
-	return statusBar{state: "idle"}
+	return statusBar{
+		state:  "idle",
+		model:  "unknown",
+		branch: "unknown",
+	}
+}
+
+func truncateID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
 
 func (s statusBar) View() string {
-	left := fmt.Sprintf(" Session: %s", truncateID(s.sessionID))
+	// Left section: Session ID with icon
+	sessionText := "No Session"
+	if s.sessionID != "" {
+		sessionText = truncateID(s.sessionID)
+	}
+	left := statusBarStyle.Render(fmt.Sprintf(" ● %s", sessionText))
 
-	var stateIcon string
+	// Center section: State with icon
+	var stateDisplay string
 	switch s.state {
 	case "idle":
-		stateIcon = "Ready"
+		stateDisplay = statusBarIdleStyle.Render("◯ Ready")
 	case "thinking":
-		stateIcon = "Thinking..."
+		stateDisplay = statusBarActiveStyle.Render("◉ Thinking...")
 	case "tool_call":
-		stateIcon = "Executing tool..."
+		stateDisplay = statusBarToolStyle.Render("⚙ Executing...")
 	case "streaming":
-		stateIcon = "Responding..."
+		stateDisplay = statusBarActiveStyle.Render("◉ Responding...")
 	default:
-		stateIcon = s.state
+		stateDisplay = statusBarStyle.Render(s.state)
 	}
-	center := stateIcon
 
-	var right string
+	// Right section: Model + Branch + Tokens
+	var rightParts []string
+	
+	if s.model != "" && s.model != "unknown" {
+		rightParts = append(rightParts, statusBarModelStyle.Render(fmt.Sprintf("🤖 %s", s.model)))
+	}
+	
+	if s.branch != "" && s.branch != "unknown" {
+		rightParts = append(rightParts, statusBarBranchStyle.Render(fmt.Sprintf("📦 %s", s.branch)))
+	}
+	
+	if s.tokensMax > 0 {
+		tokenPercent := 0
+		if s.tokensUsed > 0 {
+			tokenPercent = (s.tokensUsed * 100) / s.tokensMax
+		}
+		tokenColor := successColor
+		if tokenPercent > 80 {
+			tokenColor = errorColor
+		} else if tokenPercent > 50 {
+			tokenColor = lipgloss.Color("#F59E0B")
+		}
+		tokenStyle := lipgloss.NewStyle().Foreground(tokenColor).Padding(0, 1)
+		rightParts = append(rightParts, tokenStyle.Render(fmt.Sprintf("📊 %d/%d", s.tokensUsed, s.tokensMax)))
+	}
+	
 	if s.maxSteps > 0 {
-		right = fmt.Sprintf("Step %d/%d ", s.step, s.maxSteps)
-	} else {
-		right = "Ready "
+		stepText := fmt.Sprintf("Step %d/%d", s.step, s.maxSteps)
+		rightParts = append(rightParts, statusBarStepStyle.Render(stepText))
 	}
+	
+	right := strings.Join(rightParts, " ")
 
+	// Calculate widths
 	leftW := lipgloss.Width(left)
-	centerW := lipgloss.Width(center)
+	centerW := lipgloss.Width(stateDisplay)
 	rightW := lipgloss.Width(right)
+	
+	// Distribute space
 	gap := s.width - leftW - centerW - rightW
 	if gap < 0 {
 		gap = 0
 	}
-	leftGap := gap / 2
+	
+	leftGap := gap / 3
 	rightGap := gap - leftGap
-
-	bar := left +
-		strings.Repeat(" ", leftGap) +
-		center +
-		strings.Repeat(" ", rightGap) +
-		right
-
-	return statusBarStyle.Width(s.width).Render(bar)
-}
-
-func truncateID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
+	if rightGap < 0 {
+		rightGap = 0
 	}
-	return id
+
+	// Build status bar
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		left,
+		strings.Repeat(" ", leftGap),
+		stateDisplay,
+		strings.Repeat(" ", rightGap),
+		right,
+	)
 }

@@ -21,8 +21,19 @@ type Backend interface {
 	// ListSessions returns a list of existing session summaries.
 	ListSessions(ctx context.Context) ([]SessionSummary, error)
 
+	// GetConfig returns current configuration info (model, branch, etc.)
+	GetConfig(ctx context.Context) (*ConfigInfo, error)
+
 	// Close releases any resources held by the backend.
 	Close() error
+}
+
+// ConfigInfo contains configuration information for display.
+type ConfigInfo struct {
+	Model       string
+	Branch      string
+	MaxTokens   int
+	UsedTokens  int
 }
 
 // SessionSummary is a minimal view of a session for TUI display.
