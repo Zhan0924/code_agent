@@ -547,6 +547,150 @@ sparse vector 或 Meilisearch，见 bm25.go 的类型注释）。
 
 ---
 
+## G. 2026-06 后续大改动时间线
+
+> 本节按发生时序记录 06 月后 3 件成体系的改进。每条沿 A–D 同款 5 段式
+> （现象 / 根因 / 修复 / 验证 / 相关章节）。完整反思见
+> `llmdoc/memory/reflections/2026-06-07-*.md`。
+
+### G.1 Session 持久化 PG 双层 — 对抗 Redis TTL（commit `86572f9`，2026-06-07）
+
+**现象**
+长会话（>24h）若 Redis 单实例 TTL 过期或 OOM evict，session 历史完全丢失；
+前端重连后从空白 messages 起步，丢失上下文。
+
+**根因**
+`session.Manager` 单层 Redis 既是热路径又是唯一持久化层 ——
+TTL/evict 即丢数据，无"冷"备份。
+
+**修复**
+- 新增 `internal/session/pg_store.go`（+ `pg_store_test.go`），冷层持久化
+  到 `sessions` 表（`id / user_id / messages_jsonb / updated_at`）。
+- `session.Manager` 改为"Redis 热 + PG 冷"双层：Get 命中 Redis 直返；
+  miss 时 fallback PG 回填热层。Set 双写 Redis（TTL 24h）+ PG（无 TTL）。
+- `internal/store/postgres.go` 启动 AutoMigrate 新表。
+- `cmd/agent/main.go` 在 PG DSN 存在时注入 PG store；PG 不可用降级为
+  纯 Redis（行为不变）。
+
+**验证**
+- `internal/session/pg_store_test.go`：CRUD 双写 + miss 回填 + JSON
+  round-trip。
+- 跑 `docker compose stop redis` 后 `start redis` 验证 PG fallback 重建
+  热层。
+
+**相关章节**：[12_session](12_session.md) §双层架构、[16_store](16_store.md) §sessions 表
+
+---
+
+### G.2 Verifier retry-once 门控 + 过程化为可见证据（2026-06-07）
+
+**现象**
+verifier 检测到 output 不合规时只 `logger.Warn`，LLM 不感知评判结果，
+下一轮不会自修；但盲目 retry 又会让 sync 路径（调用方等 HTTP response）
+超时。同时评判过程对前端不可见。
+
+**根因**
+原始路径走 `formatVerificationFeedback` 转字符串 → 仅 log，无回流机制；
+sync 与 stream 路径延迟预算不同，需差异化策略。
+
+**修复**
+- `internal/orchestrator/verification.go::decideVerificationFollowup`
+  抽出纯函数：`(retried, globalStep, absoluteMaxSteps, vResult) →
+  (retry, feedback)`，所有 retry 决策在此一处。
+- 一次性哨兵 `task.VerificationRetried bool` 加 `json:"-"` tag
+  （`internal/models/models.go`），避免持久化串轮。
+- **仅 stream 路径**（`ProcessMessageStreamFull`）消费 retry-once；sync
+  路径保留旧 Warn 行为（延迟预算不允许二次 LLM 调用）。
+- 步数预算 guard：`globalStep < absoluteMaxSteps - 3`，给二次 ReAct 至少
+  3 步落实 feedback。
+- 同时引入 SSE `verification_warning` 事件（`Metadata={score, issues,
+  reasoning, retrying}`），前端 ChatPage 渲染 ⚠️ 评分条 + issues 清单 ——
+  评判过程产品化为可见证据，遵循 ToolResult.Metadata 透传契约。
+
+**验证**
+- `internal/orchestrator/verification_test.go`（+80 行）覆盖
+  `decideVerificationFollowup` 4 维真值表 + guard 边界。
+- `internal/orchestrator/react_core_test.go`（新增 +203 行）覆盖三件套
+  心跳 `llm_call_started / progress / completed` 经 `persistingSink`
+  入 Redis Stream 的端到端契约。
+
+**相关章节**：[09_orchestrator](09_orchestrator.md) §9.2、
+`llmdoc/must/working-agreement.md::Verifier retry-once 门控` /
+`::决策模式：跨传输路径差异化`、
+`llmdoc/memory/reflections/2026-06-07-verifier-retry-and-process-as-artifact.md`
+
+---
+
+### G.3 UI 假死链纵深防御（commit `7b13a3b`，2026-06-08）
+
+**现象**
+长任务跑 `run_workspace_cmd` 时 UI 在 `Step 36/50` 卡死数十秒，然后弹
+红字"连接静默超时"，且把**上一轮**的 final report 错绑成本轮输出；
+F5 刷新后又能拿到正确报告。
+
+**根因**（5 层并存）
+1. SSE 协议级 25s 心跳走 `: ping\n\n` **注释行** —— 不触发前端
+   `ReadableStream onByte` 回调 → `lastEventAt` 不重置 → 90s watchdog
+   误判为"静默"。
+2. `toolRunWorkspaceCmd` 的 `bufio.Scanner.Scan()` **同步**等 stdout 新
+   行，工具长跑（如 `go run` 编译冷启动）期间无任何业务进度事件。
+3. watchdog 触发后立刻 `controller.abort()` + push `error` step ——
+   即便后端实际跑完也无法消除，红字"粘屏"。
+4. `reconcileFinalMessage` 用 `timestamp > entry.createdAt` 启发式判定
+   本轮，可被 NaN / 时钟偏差 / 历史 entry 无 createdAt 击穿，导致"串轮"。
+5. status endpoint 仅返 `running/event_count`，前端无法独立判定
+   "后端是否真活着"。
+
+**修复**（5 层一一对应）
+- **B1 工具长跑业务心跳**：`internal/orchestrator/file_tools.go::
+  toolRunWorkspaceCmd` 把 scanner 单 goroutine 改为 `select(lineCh,
+  tick.C, cmdCtx.Done)` + 5s `time.Ticker`；心跳走
+  `progressCb → react_core.WithProgressCallback("tool_progress") →
+  persistingSink` 写 Redis Stream → SSE 推前端。心跳间隔
+  `workspaceCmdHeartbeatInterval` 改 `var`（测试可压到 200ms）。
+- **B2 命令组合 SIGPIPE warning**：`validateWorkspaceCommand` 签名扩展
+  为 `(rejection, warning string)`，检测 `| head`/`| tail` 类 SIGPIPE
+  截断风险，作为非阻断 warning 附加到 ToolResult.Content；`pty_tools.go`
+  调用点用 `_` 忽略 warning。
+- **P1 SSE 心跳改业务事件**：`runSSEHeartbeat` 把 `: ping\n\n` 改为合规
+  `data: {"type":"ping","ts":<ms>}\n\n`；前端 traceSteps filter 显式 drop
+  `type=ping`，只为 `lastEventAt` 重置服务。
+- **B3 status 加 `last_event_at_ms`**：`StreamCache.LastEventAt` 用
+  `XREVRANGE COUNT 1` 拿最近一条 event ID 前段 ms 戳；
+  `handleChatReactStreamStatus` 响应新增此字段。
+- **F1–F5 前端三道防御**：
+  - F1 PG polling 兜底：watchdog 触发后 `pollSessionUntilFinal` 每 5s 拉
+    `GET /api/v1/sessions/:id`，最多 2 分钟，拉到本轮 assistant message
+    即静默续接，不抛 error；
+  - F2 error 软化：`type=message` 已落 final 时 `type=error` step 标
+    `softHidden=true`，灰显 +"（已自动恢复）"；
+  - F3 reconcile 三重 guard：NaN 拒判 + `reconciledEntryIds` Set 幂等 +
+    错误路径不调 reconcile；
+  - F4 历史 entry 派生 `createdAt`：`messagesToEntries` 给 restored 历史
+    entry 补 `createdAt: ts > 0 ? ts : undefined`，根除串轮根源；
+  - F5 错误文案精确化：分级提示"已尝试 2 分钟 PG 兜底，如需查看本次任务
+    结果请刷新页面"。
+
+**验证**
+- `internal/orchestrator/file_tools_test.go::TestToolRunWorkspaceCmd_EmitsHeartbeat`：
+  把间隔压到 200ms 跑 `bash -c 'sleep 2'`，断言 heartbeats >= 5 且不污染
+  ToolResult.Content。
+- `internal/orchestrator/stream_cache_test.go::TestStreamCache_LastEventAt`：
+  空流 → 0、3 次 Append → ms 戳在 ±10s 窗口、nil 接收者 → 0。
+- `internal/api/sse_ping_test.go`：断言心跳输出含 `data: {"type":"ping"`
+  前缀 + 反断言无 `: ping\n` 注释行（防回归）。
+- `internal/api/stream_replay_followup_test.go`（新增 +139 行）：
+  Replay+Status+Follow 三段式 + 合成 `done` 不变量端到端契约。
+- Docker 重建后 `docker logs` 可见 `tool_progress` 与 `ping` 每 5s 推送；
+  切换历史 session 不再"串轮"。
+
+**相关章节**：[09_orchestrator](09_orchestrator.md) §Q4.5 / §Q4.6、
+[17_api](17_api.md) §5.3、`llmdoc/must/working-agreement.md::
+SSE 长任务心跳契约 / SSE 断线恢复与合成 done 兜底`、
+`llmdoc/memory/reflections/2026-06-07-ui-freeze-chain-defense-in-depth.md`
+
+---
+
 ## 参考
 
 - [`API_TEST_GUIDE.md`](../API_TEST_GUIDE.md) — 每条修复对应的 API 级回归测试

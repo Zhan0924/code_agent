@@ -507,15 +507,18 @@ PGStore.ListByUser(userID, limit)
 
 ### 7.5.3 Get 的 rehydrate
 
+入口在 `manager.go:244 rehydrateFromPG`(从 `Get` 在 hot miss + `PGStore != nil` 时调用,`manager.go:320`):
+
 ```
-Get(sid):
-  data := rdb.Get(hotKey)
-  if redis.Nil && PGStore != nil:
-      session := PGStore.Get(sid)   // 从 PG JSONB 反序列化整 Session
-      saveHot(session)              // 回写 hot,后续 Get 走 fast path
-      return session
-  ...
+rehydrateFromPG(sid):
+  session := PGStore.Get(sid)   // 从 PG JSONB 反序列化整 Session
+  saveHot(session)              // ① 回写 hot,后续 Get 走 fast path
+  rdb.ZAdd(sessionIndexKey(userID), {score: UpdatedAt, member: sid})
+                                 // ② 刷新 user ZSET 索引,侧栏立刻反映 recency
+  return session
 ```
+
+两个副作用任一失败仅 `logger.Warn`,**仍返回 session**——读路径已经成功,写回失败下一次会再 rehydrate 一次,不影响功能正确性。
 
 PG 命中后自动回写 hot,意味着用户点开一个超过 24h 的会话,**第一次 Get 慢一点(多 1 个 PG round-trip),后续都是热路径**。
 

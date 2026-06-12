@@ -442,6 +442,57 @@ req.Params = nil
 每次 Get **总是覆盖所有字段**——不能依赖 pool 复用时字段保留。如果某处忘了赋值（比如 `ID`），仍会得到稳定的零值，不会泄露上次请求的数据。
 Put 时 `Params = nil` 是为了让 GC 能回收 Params 引用的对象——否则 pool 持有 RPCRequest，间接持有大 params 对象，造成内存泄露。
 
+### 5.12 SSE 长任务可观测性：心跳事件 + Stream Cache 探针（2026-06-08）
+
+长任务（finalize 阶段单次非流式 LLM 调用可能 20+ 分钟，或工具长跑期间 stdout 沉默）的可观测性是「**前端 watchdog 不能误判为静默 + 运维能从外部判定后端是否真活着**」两个目标的合成。本节记录 06-08 起这两个目标各自的探针。
+
+#### 5.12.1 SSE 心跳从注释行升级为业务 `ping` 事件（P1）
+
+历史上 `runSSEHeartbeat`（`internal/api/handlers.go::runSSEHeartbeat`）每 25s 写 `: ping\n\n` 注释行。注释行**不**触发浏览器 `fetch ReadableStream` 的 `onByte` 回调 → 前端 `lastEventAt` 不重置 → 90s watchdog 在"只剩心跳"的连接上误判为静默超时。
+
+2026-06-08 改为合规业务事件：
+
+```
+data: {"type":"ping","ts":<unix_millis>}\n\n
+```
+
+可观测性副作用：
+
+- 前端 `onByte` 自然触发，`lastEventAt` 重置 → watchdog 不误判；
+- 前端 `traceSteps` filter 显式 drop `type=ping`，不入 UI 列表；
+- 服务端日志无新增（心跳路径仍保持 zero log，避免 25s/连接的噪音）；
+- 抓包 / Network 面板能直接看到心跳节奏（每 25s 一帧 `data:` 行），便于现场排查。
+
+回归测试 `internal/api/sse_ping_test.go`：双重断言「输出含 `data: {"type":"ping"` 前缀 + **不含** `: ping\n` 注释行」防止 P1 被回退。
+
+#### 5.12.2 `/chat/react-stream/status` 加 `last_event_at_ms` 字段（B3）
+
+`StreamCache.LastEventAt`（`internal/orchestrator/stream_cache.go`）用 `XREVRANGE COUNT 1` 拿最近一条事件的 Redis Stream ID 前段 ms 戳（Redis Stream ID 形如 `1717843200000-0`）。`handleChatReactStreamStatus` 响应新增 `last_event_at_ms`：
+
+```json
+{
+  "running": true,
+  "task_id": "task-abc",
+  "event_count": 47,
+  "last_event_at_ms": 1717843259812
+}
+```
+
+用途：
+
+- **前端 polling 兜底**（参见 `17_api.md` §5.3）可拿 `last_event_at_ms` 区分"后端真挂了"vs"后端在跑但 SSE 链路有问题"；
+- 运维探针：`curl /api/v1/chat/react-stream/status?session_id=xxx` 配合 `event_count` 单调递增即可判断后端心跳节奏，无需翻日志。
+
+回归测试 `internal/orchestrator/stream_cache_test.go::TestStreamCache_LastEventAt` 覆盖空流 → 0、3 次 Append → ms 戳在 ±10s 窗口、nil 接收者 → 0、空 sessionID → 0 四种边界。
+
+#### 5.12.3 工具长跑业务心跳进入 `tool_progress` 事件总线（B1）
+
+`toolRunWorkspaceCmd`（`file_tools.go::toolRunWorkspaceCmd`）的 5s `tick.C` 心跳通过 `progressCb → react_core.WithProgressCallback("tool_progress") → persistingSink` 写入 Redis Stream，与"真"业务事件同一总线。运维副作用：
+
+- `EventCount` / `LastEventAt` 探针对"心跳填充期"和"真实业务事件期"一视同仁；
+- Replay 时心跳事件随业务事件一起回放，refresh 后用户看到的 trace 与原始观察一致；
+- `streamMaxLen=2000` 截断阈值无需调整（5min × 5s = 60 条心跳 ≈ 5KB）。
+
 ---
 
 ## 6. 设计权衡

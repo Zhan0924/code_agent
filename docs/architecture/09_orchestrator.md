@@ -178,6 +178,17 @@ LLM provider（OpenAI / Anthropic / 自部署 vLLM）在以下场景会瞬时失
 
 **心跳文案不污染 stdout**:心跳走 progressCb,**不**写入 `stdout.WriteString`,LLM 看到的工具结果仍然是纯净的 stdout/stderr,只是用户在 UI trace 中看到一条 progress hint。
 
+**心跳间隔可调**:`workspaceCmdHeartbeatInterval` 是包级 `var`(`file_tools.go:37`),仅用于测试压到 200ms 跑短命令断言节奏,不要改成 `const`。
+
+**命令组合 SIGPIPE warning(B2)**:`validateWorkspaceCommand`(`file_tools.go:127`)签名为 `(rejection, warning string)`:
+- `rejection != ""` → 命令被拒绝,直接返错;
+- `rejection == "" && warning != ""` → 命令放行,但检测到 `| head` / `| tail` 类管道 —— 长跑生产者会在 N 行后被 `SIGPIPE` 截断,导致"命令成功但输出残缺"的歧义语义。
+- 调用方 `toolRunWorkspaceCmd`(`file_tools.go:776-777`)把 warning 拼到 ToolResult.Content 末尾(`⚠️ workspace cmd warning: %s`),让 LLM 下一步可改命令或忽略;PTY 工具 `pty_tools.go` 调用点用 `_` 忽略 warning。
+
+**测试矩阵**:
+- `file_tools_test.go::TestToolRunWorkspaceCmd_EmitsHeartbeat` 压间隔到 200ms 跑 `bash -c 'sleep 2'`,断言 heartbeats >= 5 且 `⏱` 不进 ToolResult.Content。
+- `file_tools_test.go::TestValidateWorkspaceCommand_*` 覆盖 reject / warn / pass 三态。
+
 ### Q5：为什么并发执行只覆盖纯读工具？
 
 写工具（`edit_file` / `write_file` / `git_commit`）有副作用，并发执行会触发竞态：
@@ -874,24 +885,41 @@ final answer 但 meta.NeedsReflection → 强制验证一轮
 
 仅当 `shouldVerifyOutput(intent, stepsUsed)` 为 true 时触发（高风险 Intent —— Deploy/CodeExecute/Diagnose —— 或 stepsUsed > 5）。流程：
 
-1. 用一个独立 LLM 调用让模型自评 "答案是否充分回答用户问题"；
+1. 用一个独立 LLM 调用让模型自评 "答案是否充分回答用户问题"（`verification.go:24` 入口，`verification.go:29` `verifyOutputWithLLM` 可测实现）；
 2. 返回 `{passed, score, issues, suggestions, reasoning}`；
-3. `passed=false` 时分两步处理（**仅 stream 路径**，见 `orchestrator.go:ProcessMessageStreamFull`）：
+3. `passed=false` 时分两步处理（**仅 stream 路径**，见 `orchestrator.go:1107` `ProcessMessageStreamFull` 内调点）：
 
-   **a. emit `verification_warning` SSE 事件**（`Metadata = {score, issues, reasoning, retrying}`）。这是「独立审查可见」的接线：前端 ChatPage 渲染 ⚠️ 评分条 + issues 清单，把评判者视角直接展示给用户。
+   **a. emit `verification_warning` SSE 事件**（`orchestrator.go:1128`，`Metadata = {score, issues, reasoning, retrying}`）。这是「独立审查可见」的接线：前端 ChatPage 渲染 ⚠️ 评分条 + issues 清单，把评判者视角直接展示给用户。
 
-   **b. retry-once 自修复**：通过 `decideVerificationFollowup(retried, globalStep, absoluteMaxSteps, vResult)` 做决策 —— 若 `!task.VerificationRetried && globalStep < absoluteMaxSteps-3`，则：
-   - 置 `task.VerificationRetried = true`（运行时哨兵，不入 JSON）；
+   **b. retry-once 自修复**：通过 `decideVerificationFollowup(retried, globalStep, absoluteMaxSteps, vResult)`（`verification.go:193`）做决策 —— 若 `!task.VerificationRetried && globalStep < absoluteMaxSteps-3`，则：
+   - 置 `task.VerificationRetried = true`（`orchestrator.go:1136`，运行时哨兵，定义在 `internal/models/models.go:99` 带 `json:"-"`，**不入 JSON 序列化**避免污染持久化的 task 状态）；
    - 把刚才的 assistant content + `formatVerificationFeedback(vResult)` push 回 `messages`；
    - `continue` 外层 for 循环，让 LLM 看到 critique 后重新决定是否调工具补救。
 
    每个 task 最多 retry 一次，避免 0.2→0.2→0.2 死循环。若 retry 后第二轮再次失败，只发 warning（`retrying=false`）然后正常 done。
 
-**sync 路径**（`ProcessMessage`，`orchestrator.go:565` 附近）**保持仅 `logger.Warn`**，因为同步 API 通常有严格延迟预算，二次 LLM 调用会让调用方超时。
+**sync 路径**（`ProcessMessage`，`orchestrator.go:566` 调点）**保持仅 `logger.Warn`**，因为同步 API 通常有严格延迟预算，二次 LLM 调用会让调用方超时。
 
 **关键不变量**：
 - `formatVerificationFeedback` 永远以 `RoleUser` 入 messages —— 让 LLM 把它当用户反馈，触发再一轮 ReAct，而非误以为是上一轮自己的话；
-- warning payload 与前端 `VerificationWarningMetadata` 类型字段一一对应，新增字段须同步 `code_agent_ui/src/types/index.ts`。
+- warning payload 与前端 `VerificationWarningMetadata` 类型字段一一对应，新增字段须同步 `code_agent_ui/src/types/index.ts`；
+- `verification_warning` 是 `models.ReactStreamEvent.Type` 的合法值之一（`internal/models/models.go:360` 注释枚举）—— 新增需同步该注释 + 前端 ReactStreamEventType union。
+
+**测试矩阵**（`verification_test.go`）：
+
+| 测试 | 行号 | 覆盖 |
+|---|---|---|
+| `TestParseVerificationResponse_Valid` | 12 | 标准 JSON 解析 |
+| `TestParseVerificationResponse_WithCodeFence` | 37 | LLM 输出带 ```json fence 的鲁棒解析 |
+| `TestParseVerificationResponse_ClampsScore` | 53 | score 越界（>1 / <0）夹紧 |
+| `TestShouldVerifyOutput` | 73 | Intent + stepsUsed 阈值矩阵 |
+| `TestFormatVerificationFeedback_Passed` / `_Failed` | 97 / 119 | 格式化文案（passed 不含 critique，failed 含 issues+suggestions） |
+| `TestDecideVerificationFollowup_RetryOnLowScore` | 162 | 首次失败 → 准许 retry |
+| `TestDecideVerificationFollowup_NoDoubleRetry` | 192 | `task.VerificationRetried=true` → 第二次失败只 warning，禁止 retry |
+| `TestDecideVerificationFollowup_StepBudgetGuard` | 209 | `globalStep >= absoluteMaxSteps-3` → 步数预算耗尽，禁止 retry |
+| `TestVerifyOutput_Integration` | 236 | 端到端：mock LLMCaller 串联整个 verify 流程 |
+
+最后三个 `DecideVerificationFollowup_*` 测试构成 retry-once 门控的真值表：先决条件（`!retried`）、循环防御（`!retried && retried`）、预算护栏（`stepsUsed >= max-3`）。
 
 ---
 

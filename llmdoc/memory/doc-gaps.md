@@ -144,6 +144,19 @@
 
 ---
 
+## Pending-promotion（待累积证据的规则候选）
+
+> 反思中提出但**证据不足以推广为 must/ 规则**的候选。每条至少需要 **2 次独立场景**复现才考虑落地。
+
+| 候选 | 首次出处 | 复现次数 | 落地条件 |
+|---|---|---|---|
+| commit 至少更新 `30_recent_improvements.md` 时间线（commit hygiene） | `memory/reflections/2026-06-11-architecture-docs-drift-audit-c-tier.md`（G 节 3 条同批次回补） | 1（单批次内重复 3 次，非跨时间窗独立证据） | 下次再出现「commit 未同步文档→后续 audit 回补」时落地为 `must/working-agreement.md` 段落 |
+| 行号锚点策略「只在设计点/不变量/测试矩阵三场景写裸 `file:line`」 | `memory/reflections/2026-06-11-architecture-docs-drift-audit-c-tier.md`（`16_store.md::§4` 16 个行号集体漂移） | 1 | 下次再出现行号大规模漂移、或 `docs/architecture/` 行号违反密度统计完成后，新建 `guides/doc-line-anchor-policy.md` |
+
+> 「校准 vs 增量」commit message 二分类候选**已拒绝**（属反思自我形态背书，不影响后续 commit 行为）。
+
+---
+
 ## 2026-06-07 verifier retry-once 落地（收束）
 
 反思 `memory/reflections/2026-06-07-verifier-retry-and-process-as-artifact.md` 末段「已发现的潜在 doc gap」三条均已落地，**不再开新条目**：

@@ -515,6 +515,22 @@ POST /api/v1/tools  {name, parameters, executor_type, executor_config, risk_leve
 
 `run_workspace_cmd` 历史上是 RiskLevel=2，2026-06-05 起降为 1：`validateWorkspaceCommand` 命令白名单 + `minimalCommandEnv` 环境变量擦除 已对宿主 exec 提供静态护栏，常规工作区命令（`go test` / `pytest` / `ls` 等）不再走 HITL，留出审批容量给真正越界的远端写。如需收回到 2，调整 `file_tools.go::ToolRunWorkspaceCmd` 的 `RiskLevel` 字段即可（HITL 阈值 `>=2` 见 `orchestrator.go:1460`）。
 
+### 8.1 `validateWorkspaceCommand` 双返契约（2026-06-08 B2）
+
+`file_tools.go:127` 起的 `validateWorkspaceCommand(cmd) → (rejection, warning string)` 同时承担硬护栏与软提示两个职责，调用方按返回值组合处理：
+
+| `rejection` | `warning` | 调用方行为 |
+|---|---|---|
+| 非空 | — | 命令直接驳回（`ToolResult.Content` 为 `Command rejected: …`），不执行 |
+| 空 | 非空 | 命令放行，但 `toolRunWorkspaceCmd`（`file_tools.go:776-777`）把 warning 拼到 `ToolResult.Content` 末尾 `⚠️ workspace cmd warning: …` |
+| 空 | 空 | 默认快路径，无注释 |
+
+当前 warning 触发模式：
+
+- `| head` / `| tail` / `|head` / `|tail` —— 长跑生产者会在 N 行后被 `SIGPIPE` 截断，造成"命令成功但输出残缺"的歧义；推荐 LLM 改写为 `> file && head -N file` 拿全量再分页。
+
+非 stdio 路径的 `pty_tools.go` 调用点显式 `_` 忽略 warning（PTY 内交互命令的语义不适合软提示）。详细心跳与执行链路见 `09_orchestrator.md` §Q4.6。
+
 ---
 
 ## 9. 投机缓存（Speculative Cache）

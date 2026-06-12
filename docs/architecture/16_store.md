@@ -489,26 +489,30 @@ CREATE INDEX idx_sessions_updated      ON sessions(updated_at DESC);
 
 | 表 | 方法 | 行号 | 备注 |
 |---|---|---|---|
-| tasks | `CreateTask` | L243 | INSERT |
-| tasks | `UpdateTaskState` | L252 | UPDATE，终态填 completed_at |
-| tasks | `GetTask` | L265 | SELECT 全字段 |
-| tasks | `SavePlan` | L278 | UPDATE plan_json |
-| tasks | `LoadPlan` | L286 | SELECT plan_json |
-| audit_logs | `InsertAuditLog` | L311 | INSERT，append-only |
-| approvals | `CreateApproval` | L335 | INSERT ON CONFLICT DO NOTHING（幂等） |
-| approvals | `ResolveApproval` | L345 | UPDATE status + resolved_at |
-| approvals | `GetPendingApprovals` | L354 | SELECT 全部 pending，按时间升序 |
-| dynamic_tools | `SaveDynamicTool` | L394 | INSERT ON CONFLICT DO UPDATE（upsert） |
-| dynamic_tools | `LoadDynamicTools` | L416 | SELECT 非过期 |
-| dynamic_tools | `DeleteDynamicTool` | L444 | DELETE |
-| file_checksums | `BatchUpsertChecksums` | L458 | tx + prepared stmt + 循环 ExecContext |
-| file_checksums | `GetAllChecksums` | L489 | SELECT 全表 → map |
-| file_checksums | `DeleteChecksums` | L510 | tx + prepared stmt + 循环 DELETE |
-| 通用 | `Ping` | L375 | db.PingContext |
-| 通用 | `DB()` | L129 | 暴露原始 \*sql.DB（toollearn / memory 用） |
+| tasks | `CreateTask` | L266 | INSERT |
+| tasks | `UpdateTaskState` | L275 | UPDATE，终态填 completed_at |
+| tasks | `GetTask` | L288 | SELECT 全字段 |
+| tasks | `SavePlan` | L301 | UPDATE plan_json |
+| tasks | `LoadPlan` | L309 | SELECT plan_json |
+| audit_logs | `InsertAuditLog` | L334 | INSERT，append-only |
+| approvals | `CreateApproval` | L358 | INSERT ON CONFLICT DO NOTHING（幂等） |
+| approvals | `ResolveApproval` | L368 | UPDATE status + resolved_at |
+| approvals | `GetPendingApprovals` | L377 | SELECT 全部 pending，按时间升序 |
+| dynamic_tools | `SaveDynamicTool` | L417 | INSERT ON CONFLICT DO UPDATE（upsert） |
+| dynamic_tools | `LoadDynamicTools` | L439 | SELECT 非过期 |
+| dynamic_tools | `DeleteDynamicTool` | L467 | DELETE |
+| file_checksums | `BatchUpsertChecksums` | L481 | tx + prepared stmt + 循环 ExecContext |
+| file_checksums | `GetAllChecksums` | L512 | SELECT 全表 → map |
+| file_checksums | `DeleteChecksums` | L533 | tx + prepared stmt + 循环 DELETE |
+| sessions | (无)| —— | **CRUD 在 `internal/session/pg_store.go`,Store 仅声明表 schema(L223-235);见 §3.7** |
+| 通用 | `Ping` | L398 | db.PingContext |
+| 通用 | `DB()` | L129 | 暴露原始 \*sql.DB（toollearn / memory / session.pg_store 用） |
 | 通用 | `Close()` | L123 | defer 调用 |
+| 通用 | `Migrate` | L134 | 启动时一次性 IF NOT EXISTS 迁移所有表（含 sessions） |
 
 ⚠️ **没有 `DeleteTask` / `GetTasksBySession` / `ListAuditLogs`**：grep 整文件不存在——目前任务和审计**只能写，不能查**（除单条 GetTask）。前端要看任务列表必须自己绕过 store 或加方法。**P1**。
+
+⚠️ **`sessions` 表 CRUD 跨包**：schema 声明在 `store.Migrate`,但读写在 `session.PGSessionStore`（`internal/session/pg_store.go`），通过 `Manager.PGStore` 字段持有。这是为了避免 `store` 反向依赖 `models.Session` 类型——`store` 包刻意只持有 schema、不持有领域类型，详见 §1 头部说明。
 
 ### 4.1 `BatchUpsertChecksums` 的事务模式（L458-486）
 

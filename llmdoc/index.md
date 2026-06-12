@@ -47,6 +47,7 @@
 | `memory/reflections/2026-06-01-architecture-docs-rewrite.md` | 反思：21 篇 `docs/architecture/` 13 节模板深度重写（00–20）+ 8 篇新增包文档（21–28）；29/30 暂未纳入 |
 | `memory/reflections/2026-06-07-verifier-retry-and-process-as-artifact.md` | 反思：verifier retry-once 门控 + ToolResult.Metadata 透传契约；编排器减重模式（决策抽纯函数） |
 | `memory/reflections/2026-06-07-ui-freeze-chain-defense-in-depth.md` | 反思：消除 UI 假死链 5 层防御（LLM 进度三件套 + Replay 合成 done + 前端 watchdog/reconcile + 内联渲染）；编排器减重模式第二证据点 |
+| `memory/reflections/2026-06-11-architecture-docs-drift-audit-c-tier.md` | 反思：docs/architecture 飘移面 C 档对账（6 文件 +280 行）；commit hygiene + 行号锚点策略提案 |
 
 ---
 
