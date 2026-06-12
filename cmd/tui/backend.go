@@ -18,12 +18,14 @@ import (
 type RemoteBackend struct {
 	baseURL    string
 	httpClient *http.Client
+	workDir    string // Working directory for the project
 }
 
-func NewRemoteBackend(addr string) *RemoteBackend {
+func NewRemoteBackend(addr string, workDir string) *RemoteBackend {
 	return &RemoteBackend{
 		baseURL:    fmt.Sprintf("http://%s", addr),
 		httpClient: &http.Client{},
+		workDir:    workDir,
 	}
 }
 
@@ -93,7 +95,14 @@ func (r *RemoteBackend) readSSE(_ context.Context, body io.ReadCloser, ch chan<-
 }
 
 func (r *RemoteBackend) CreateSession(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", r.baseURL+"/api/v1/sessions", strings.NewReader(`{}`))
+	// Pass workDir as project_id so agent knows which project to work on
+	payload := map[string]string{}
+	if r.workDir != "" {
+		payload["project_id"] = r.workDir
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", r.baseURL+"/api/v1/sessions", strings.NewReader(string(body)))
 	if err != nil {
 		return "", err
 	}

@@ -109,6 +109,12 @@ var (
 				Bold(true).
 				Padding(0, 1)
 
+	statusBarProjectStyle = lipgloss.NewStyle().
+				Foreground(primaryColor).
+				Background(bgHighlightColor).
+				Bold(true).
+				Padding(0, 1)
+
 	statusBarModelStyle = lipgloss.NewStyle().
 				Foreground(secondaryColor).
 				Background(bgHighlightColor).

@@ -21,7 +21,7 @@ run: build
 
 run-tui: build-tui
 	@echo "==> Running $(APP_NAME)-tui..."
-	./bin/$(APP_NAME)-tui --addr localhost:18080
+	./bin/$(APP_NAME)-tui --addr localhost:18080 --dir $(PWD)
 
 # ─── Testing ───────────────────────────────────────────────
 test:

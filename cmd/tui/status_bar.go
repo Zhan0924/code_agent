@@ -17,6 +17,7 @@ type statusBar struct {
 	branch     string
 	tokensUsed int
 	tokensMax  int
+	workDir    string // Current working directory
 }
 
 func newStatusBar() statusBar {
@@ -35,12 +36,16 @@ func truncateID(id string) string {
 }
 
 func (s statusBar) View() string {
-	// Left section: Session ID with icon
-	sessionText := "No Session"
-	if s.sessionID != "" {
-		sessionText = truncateID(s.sessionID)
+	// Left section: Working directory (project name)
+	projectName := "unknown"
+	if s.workDir != "" {
+		// Show only the last directory name
+		parts := strings.Split(s.workDir, "/")
+		if len(parts) > 0 {
+			projectName = parts[len(parts)-1]
+		}
 	}
-	left := statusBarStyle.Render(fmt.Sprintf(" ● %s", sessionText))
+	left := statusBarProjectStyle.Render(fmt.Sprintf("📁 %s", projectName))
 
 	// Center section: State with icon
 	var stateDisplay string
@@ -57,30 +62,16 @@ func (s statusBar) View() string {
 		stateDisplay = statusBarStyle.Render(s.state)
 	}
 
-	// Right section: Model + Branch + Tokens
+	// Right section: Session + Branch + Step
 	var rightParts []string
 	
-	if s.model != "" && s.model != "unknown" {
-		rightParts = append(rightParts, statusBarModelStyle.Render(fmt.Sprintf("🤖 %s", s.model)))
+	// Show session ID
+	if s.sessionID != "" {
+		rightParts = append(rightParts, statusBarStyle.Render(fmt.Sprintf("● %s", truncateID(s.sessionID))))
 	}
 	
 	if s.branch != "" && s.branch != "unknown" {
 		rightParts = append(rightParts, statusBarBranchStyle.Render(fmt.Sprintf("📦 %s", s.branch)))
-	}
-	
-	if s.tokensMax > 0 {
-		tokenPercent := 0
-		if s.tokensUsed > 0 {
-			tokenPercent = (s.tokensUsed * 100) / s.tokensMax
-		}
-		tokenColor := successColor
-		if tokenPercent > 80 {
-			tokenColor = errorColor
-		} else if tokenPercent > 50 {
-			tokenColor = lipgloss.Color("#F59E0B")
-		}
-		tokenStyle := lipgloss.NewStyle().Foreground(tokenColor).Padding(0, 1)
-		rightParts = append(rightParts, tokenStyle.Render(fmt.Sprintf("📊 %d/%d", s.tokensUsed, s.tokensMax)))
 	}
 	
 	if s.maxSteps > 0 {
