@@ -21,7 +21,7 @@ run: build
 
 run-tui: build-tui
 	@echo "==> Running $(APP_NAME)-tui..."
-	./bin/$(APP_NAME)-tui --remote --url http://localhost:18080
+	./bin/$(APP_NAME)-tui --addr localhost:18080
 
 # ─── Testing ───────────────────────────────────────────────
 test:
