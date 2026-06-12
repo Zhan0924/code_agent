@@ -14,18 +14,22 @@ type MessageBlock struct {
 	Expanded  bool
 	IsFinal   bool // true for final output (message), false for intermediate
 	Metadata  map[string]interface{}
+	LineStart int // Starting line in rendered output (for click detection)
+	LineEnd   int // Ending line in rendered output
 }
 
 // MessageModel manages the display state of chat messages
 type MessageModel struct {
-	blocks      []MessageBlock
+	blocks       []MessageBlock
 	lastFinalIdx int // index of the last final message for copy
+	clickedBlock int // index of clicked block (-1 if none)
 }
 
 func newMessageModel() *MessageModel {
 	return &MessageModel{
-		blocks:      []MessageBlock{},
+		blocks:       []MessageBlock{},
 		lastFinalIdx: -1,
+		clickedBlock: -1,
 	}
 }
 
@@ -100,45 +104,84 @@ func (m *MessageModel) ToggleExpand(idx int) {
 	}
 }
 
+func (m *MessageModel) HandleClick(y int) int {
+	// Find which block was clicked based on line number
+	for i, block := range m.blocks {
+		if y >= block.LineStart && y <= block.LineEnd {
+			if !block.IsFinal {
+				m.ToggleExpand(i)
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func (m *MessageModel) Render(width int) string {
 	var lines []string
+	currentLine := 0
 	
 	for i, block := range m.blocks {
+		m.blocks[i].LineStart = currentLine
+		
 		if block.IsFinal {
 			// Final messages are always expanded
-			lines = append(lines, block.Content)
+			blockLines := strings.Split(block.Content, "\n")
+			lines = append(lines, blockLines...)
+			currentLine += len(blockLines)
 		} else {
 			// Intermediate steps can be collapsed
 			if block.Expanded {
-				lines = append(lines, block.Content)
+				blockLines := strings.Split(block.Content, "\n")
+				lines = append(lines, blockLines...)
+				currentLine += len(blockLines)
 			} else {
-				// Show collapsed preview
+				// Show collapsed preview with click indicator
 				preview := m.renderCollapsed(block, i)
 				lines = append(lines, preview)
+				currentLine++
 			}
 		}
-		lines = append(lines, "") // Add spacing
+		
+		m.blocks[i].LineEnd = currentLine - 1
+		
+		// Add spacing
+		lines = append(lines, "")
+		currentLine++
 	}
 	
 	return strings.Join(lines, "\n")
 }
 
 func (m *MessageModel) renderCollapsed(block MessageBlock, idx int) string {
-	// Show a collapsed line with toggle hint
+	// Show a collapsed line with click hint
+	var preview string
 	switch block.Type {
 	case "thinking":
-		return collapsedStyle.Render("💭 Thinking... [Press 'e' to expand]")
+		preview = fmt.Sprintf("💭 Thinking %s", collapsedStyle.Render("[click to expand]"))
+	case "llm_call_started":
+		preview = "⏳ Calling LLM..."
+	case "llm_call_completed":
+		preview = "✓ LLM call completed"
 	case "tool_call":
 		toolName := "unknown"
 		if name, ok := block.Metadata["tool_name"].(string); ok {
 			toolName = name
 		}
-		return collapsedStyle.Render(fmt.Sprintf("🔧 Tool: %s(...) [Press 'e' to expand]", toolName))
+		preview = fmt.Sprintf("🔧 %s(...) %s", toolName, collapsedStyle.Render("[click to expand]"))
+	case "tool_result":
+		if isErr, ok := block.Metadata["is_error"].(bool); ok && isErr {
+			preview = "❌ Tool failed"
+		} else {
+			preview = "✓ Tool success"
+		}
 	case "step_start":
 		return block.Content // Steps are always visible
 	default:
-		return collapsedStyle.Render("[...] [Press 'e' to expand]")
+		preview = fmt.Sprintf("... %s", collapsedStyle.Render("[click to expand]"))
 	}
+	
+	return collapsedBoxStyle.Render(preview)
 }
 
 func (m *MessageModel) GetFinalOutput() string {
@@ -156,6 +199,7 @@ func (m *MessageModel) GetFinalOutput() string {
 func (m *MessageModel) Clear() {
 	m.blocks = []MessageBlock{}
 	m.lastFinalIdx = -1
+	m.clickedBlock = -1
 }
 
 // stripANSI removes ANSI escape codes from a string

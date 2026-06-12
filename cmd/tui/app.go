@@ -171,6 +171,25 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseMsg:
+		if !m.streaming && msg.Type == tea.MouseRelease {
+			// Handle mouse click in viewport
+			// Convert mouse Y position to viewport-relative position
+			vpH := m.viewport.Height
+			mouseY := msg.Y
+			
+			// Check if click is in viewport area
+			if mouseY >= 0 && mouseY < vpH {
+				// Calculate actual line in content (accounting for scroll)
+				clickLine := m.viewport.YOffset + mouseY
+				clickedIdx := m.messages.HandleClick(clickLine)
+				if clickedIdx >= 0 {
+					// Re-render with expanded/collapsed state
+					m.viewport.SetContent(m.messages.Render(m.width))
+				}
+			}
+		}
+
 	case streamStartMsg:
 		m.eventCh = msg.ch
 		return m, waitForEvent(m.eventCh)
@@ -287,7 +306,7 @@ func (m appModel) View() string {
 	} else {
 		// Input area with help text
 		input := m.textarea.View()
-		help := helpStyle.Render("Ctrl+E: expand | Ctrl+Y: copy result | Enter: send")
+		help := helpStyle.Render("🖱️ Click to expand | Ctrl+Y: copy result | Enter: send | /help for commands")
 		sections = append(sections, input+"\n"+help)
 	}
 

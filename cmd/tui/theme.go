@@ -146,8 +146,12 @@ var (
 
 	// Collapsed block style
 	collapsedStyle = lipgloss.NewStyle().
-			Foreground(mutedColor).
-			Background(lipgloss.Color("#3B4252")).
-			Padding(0, 2).
+			Foreground(lipgloss.Color("#D8DEE9")).
 			Italic(true)
+
+	collapsedBoxStyle = lipgloss.NewStyle().
+				Foreground(textColor).
+				Background(lipgloss.Color("#4C566A")).
+				Padding(0, 2).
+				Margin(0, 1)
 )
