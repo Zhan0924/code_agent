@@ -81,6 +81,48 @@ func (m *Manager) CreateForSession(id, sessionID, projectName string) (*Workspac
 	return ws, nil
 }
 
+// CreateFromProject creates a workspace from an existing project directory.
+// This allows the agent to work directly on the user's project files.
+func (m *Manager) CreateFromProject(id, sessionID, projectPath string) (*Workspace, error) {
+	// If a workspace already exists for this ID, return it
+	if existing, ok := m.Get(id); ok {
+		return existing, nil
+	}
+
+	// Verify project path exists
+	info, err := os.Stat(projectPath)
+	if err != nil {
+		return nil, fmt.Errorf("project path does not exist: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("project path is not a directory: %s", projectPath)
+	}
+
+	// Resolve symlinks to get the real path
+	realDir, err := filepath.EvalSymlinks(projectPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project dir: %w", err)
+	}
+
+	// Extract project name from path
+	projectName := filepath.Base(realDir)
+
+	ws := &Workspace{
+		ID:        id,
+		SessionID: sessionID,
+		RootDir:   realDir,
+		Project:   projectName,
+		CreatedAt: time.Now(),
+	}
+	m.workspaces.Store(id, ws)
+	m.saveManifest(ws)
+	m.logger.Info("workspace created from project", 
+		zap.String("id", id), 
+		zap.String("session_id", sessionID), 
+		zap.String("project_path", realDir))
+	return ws, nil
+}
+
 // GetBySession returns the workspace tied to a specific session ID.
 func (m *Manager) GetBySession(sessionID string) (*Workspace, bool) {
 	var found *Workspace

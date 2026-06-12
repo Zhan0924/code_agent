@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ import (
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/orchestrator"
 	"github.com/agent/code_agent/internal/session"
+	"github.com/agent/code_agent/internal/workspace"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -562,13 +564,34 @@ func (s *Server) handleCreateSession(c *gin.Context) {
 		return
 	}
 
-	// Auto-create an isolated workspace for this session
+	// Auto-create a workspace for this session
 	var workspaceID string
 	if s.workspaceMgr != nil {
-		ws, err := s.workspaceMgr.CreateForSession(sess.ID, sess.ID, "session-"+sess.ID[:8])
-		if err != nil {
-			s.logger.Warn("failed to create workspace for session", zap.String("session_id", sess.ID), zap.Error(err))
-		} else {
+		var ws *workspace.Workspace
+		
+		// If project_id is a valid directory path, use it as the workspace root
+		if req.ProjectID != "" {
+			if _, err := os.Stat(req.ProjectID); err == nil {
+				// Project path exists, create workspace from project directory
+				ws, err = s.workspaceMgr.CreateFromProject(sess.ID, sess.ID, req.ProjectID)
+				if err != nil {
+					s.logger.Warn("failed to create workspace from project", 
+						zap.String("session_id", sess.ID), 
+						zap.String("project_path", req.ProjectID), 
+						zap.Error(err))
+				}
+			}
+		}
+		
+		// Fall back to isolated workspace if no valid project path
+		if ws == nil {
+			ws, err = s.workspaceMgr.CreateForSession(sess.ID, sess.ID, "session-"+sess.ID[:8])
+			if err != nil {
+				s.logger.Warn("failed to create workspace for session", zap.String("session_id", sess.ID), zap.Error(err))
+			}
+		}
+		
+		if ws != nil {
 			workspaceID = ws.ID
 		}
 	}
