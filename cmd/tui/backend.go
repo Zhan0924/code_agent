@@ -59,12 +59,17 @@ func (r *RemoteBackend) readSSE(_ context.Context, body io.ReadCloser, ch chan<-
 	scanner := bufio.NewScanner(body)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		// Skip empty lines and event lines
+		if line == "" || strings.HasPrefix(line, "event:") {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data:")
 		var ev models.ReactStreamEvent
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			// Log parse error but continue
 			continue
 		}
 		ch <- ev
@@ -83,10 +88,10 @@ func (r *RemoteBackend) CreateSession(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	var result struct {
-		ID string `json:"id"`
+		SessionID string `json:"session_id"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
-	return result.ID, nil
+	return result.SessionID, nil
 }
 
 func (r *RemoteBackend) ListSessions(ctx context.Context) ([]tui.SessionSummary, error) {
