@@ -37,7 +37,7 @@ type MemoryStore interface {
 	RetrieveByVector(embedding []float32, userID, projectID string, limit int) ([]Memory, error)
 	Update(m *Memory) error
 	Touch(id string) error
-	Decay(olderThan time.Duration, factor float64) (int, error)
+	Decay(ctx context.Context, olderThan time.Duration, factor float64) (int, error)
 }
 
 // RetrievalResult pairs a memory with its relevance score from search.

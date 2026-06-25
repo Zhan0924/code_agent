@@ -26,7 +26,7 @@ func TestRedisHot_Decay(t *testing.T) {
 	}
 	_ = hot.Store(context.Background(), m)
 	
-	count, err := hot.Decay(30*24*time.Hour, 0.8)
+	count, err := hot.Decay(context.Background(), 30*24*time.Hour, 0.8)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, count)
 	

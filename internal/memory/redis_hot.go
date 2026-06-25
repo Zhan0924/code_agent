@@ -158,17 +158,20 @@ func (r *RedisHot) RetrieveByQuery(ctx context.Context, userID, projectID string
 }
 
 // Decay implements the memory decay mechanism, reducing the score of old memories.
-func (r *RedisHot) Decay(olderThan time.Duration, factor float64) (int, error) {
-	ctx := context.Background()
-	keys, err := r.client.Keys(ctx, "memory:*").Result()
-	if err != nil {
+func (r *RedisHot) Decay(ctx context.Context, olderThan time.Duration, factor float64) (int, error) {
+	var allKeys []string
+	iter := r.client.Scan(ctx, 0, "memory:*", 100).Iterator()
+	for iter.Next(ctx) {
+		allKeys = append(allKeys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
 		return 0, err
 	}
 
 	cutoff := time.Now().Add(-olderThan)
 	count := 0
 
-	for _, key := range keys {
+	for _, key := range allKeys {
 		data, err := r.client.Get(ctx, key).Bytes()
 		if err != nil {
 			continue
@@ -181,10 +184,11 @@ func (r *RedisHot) Decay(olderThan time.Duration, factor float64) (int, error) {
 		if m.UpdatedAt.Before(cutoff) {
 			m.Score *= factor
 			m.UpdatedAt = time.Now()
-			updatedData, _ := json.Marshal(m)
-			// keep the original TTL if possible? The user code says: r.client.Set(ctx, key, updatedData, 0)
-			// Wait, r.ttl is used in Store. I'll just use 0 as the user code provided. But better yet, I should probably use r.ttl if 0 means no expiry. Let's just follow the user code precisely first.
-			r.client.Set(ctx, key, updatedData, 0)
+			updatedData, err := json.Marshal(m)
+			if err != nil {
+				continue
+			}
+			r.client.Set(ctx, key, updatedData, redis.KeepTTL)
 			count++
 		}
 	}
