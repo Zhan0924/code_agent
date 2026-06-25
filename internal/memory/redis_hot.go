@@ -156,3 +156,37 @@ func (r *RedisHot) RetrieveByQuery(ctx context.Context, userID, projectID string
 	}
 	return memories, nil
 }
+
+// Decay implements the memory decay mechanism, reducing the score of old memories.
+func (r *RedisHot) Decay(olderThan time.Duration, factor float64) (int, error) {
+	ctx := context.Background()
+	keys, err := r.client.Keys(ctx, "memory:*").Result()
+	if err != nil {
+		return 0, err
+	}
+
+	cutoff := time.Now().Add(-olderThan)
+	count := 0
+
+	for _, key := range keys {
+		data, err := r.client.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+		var m Memory
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+
+		if m.UpdatedAt.Before(cutoff) {
+			m.Score *= factor
+			m.UpdatedAt = time.Now()
+			updatedData, _ := json.Marshal(m)
+			// keep the original TTL if possible? The user code says: r.client.Set(ctx, key, updatedData, 0)
+			// Wait, r.ttl is used in Store. I'll just use 0 as the user code provided. But better yet, I should probably use r.ttl if 0 means no expiry. Let's just follow the user code precisely first.
+			r.client.Set(ctx, key, updatedData, 0)
+			count++
+		}
+	}
+	return count, nil
+}

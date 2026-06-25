@@ -26,6 +26,7 @@ type Memory struct {
 	Score          float64    `json:"score" db:"score"`
 	AccessCount    int        `json:"access_count" db:"access_count"`
 	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 	LastAccessedAt time.Time  `json:"last_accessed_at" db:"last_accessed_at"`
 }
 
