@@ -9,10 +9,12 @@ import (
 type MemoryType string
 
 const (
-	MemoryPreference MemoryType = "preference"
-	MemoryDecision   MemoryType = "decision"
-	MemoryKnowledge  MemoryType = "knowledge"
-	MemoryPattern    MemoryType = "pattern"
+	MemoryPreference   MemoryType = "preference"
+	MemoryDecision     MemoryType = "decision"
+	MemoryKnowledge    MemoryType = "knowledge"
+	MemoryPattern      MemoryType = "pattern"
+	MemoryTypeEpisodic MemoryType = "episodic"
+	MemoryTypeSemantic MemoryType = "semantic"
 )
 
 // Memory represents a single unit of long-term memory.
