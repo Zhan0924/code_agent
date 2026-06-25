@@ -18,8 +18,9 @@ type Embedder interface {
 type HybridStore struct {
 	hot      *RedisHot
 	cold     *PGCold
-	embedder Embedder
-	logger   *zap.Logger
+	embedder   Embedder
+	logger     *zap.Logger
+	blackboard *Blackboard
 }
 
 // NewHybridStore creates a hybrid memory store.
@@ -29,6 +30,11 @@ func NewHybridStore(hot *RedisHot, cold *PGCold, logger *zap.Logger) *HybridStor
 		cold:   cold,
 		logger: logger.With(zap.String("component", "memory.hybrid")),
 	}
+}
+
+// SetBlackboard sets the blackboard for publishing events.
+func (h *HybridStore) SetBlackboard(b *Blackboard) {
+	h.blackboard = b
 }
 
 // SetEmbedder injects an embedder for semantic operations.
@@ -87,6 +93,10 @@ func (h *HybridStore) Store(ctx context.Context, m *Memory) error {
 		if err := h.cold.Store(m); err != nil {
 			return err
 		}
+	}
+	
+	if h.blackboard != nil {
+		_ = h.blackboard.Publish(ctx, "added", m)
 	}
 	return nil
 }

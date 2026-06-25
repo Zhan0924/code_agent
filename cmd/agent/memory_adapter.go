@@ -58,5 +58,9 @@ func NewMemoryAdapter(rdb *redis.Client, pgStore *store.Store, embedder memory.E
 	if embedder != nil {
 		hybrid.SetEmbedder(embedder)
 	}
+
+	bb := memory.NewBlackboard(rdb, logger)
+	hybrid.SetBlackboard(bb)
+
 	return &memoryAdapter{store: hybrid}
 }
