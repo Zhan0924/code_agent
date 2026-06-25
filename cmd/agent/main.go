@@ -517,6 +517,16 @@ func main() {
 		memoryExtractor := memory.NewExtractor(memAdapter.HybridStore(), llmClient, logger)
 		orch.SetMemoryExtractor(memoryExtractor)
 		logger.Info("memory extractor wired into orchestrator")
+
+		// ─── Active Memory Tools ─────────────────────────────────────────────
+		coreManager := memory.NewRedisCoreMemory(rdb, logger)
+		memoryTools := tools.NewMemoryToolsProvider(coreManager)
+		for _, tool := range memoryTools.Tools() {
+			if err := orch.RegisterDynamicTool(tool); err != nil {
+				logger.Error("failed to register memory tool", zap.Error(err))
+			}
+		}
+		logger.Info("active memory tools registered")
 	}
 
 	// ─── Initialize API Server ───────────────────────────────────────────

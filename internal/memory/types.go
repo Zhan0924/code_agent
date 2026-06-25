@@ -1,6 +1,9 @@
 package memory
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // MemoryType categorizes what kind of information a memory holds.
 type MemoryType string
@@ -41,3 +44,24 @@ type RetrievalResult struct {
 	Memory    Memory  `json:"memory"`
 	Relevance float64 `json:"relevance"`
 }
+
+// CoreMemorySection represents a section of the core memory.
+type CoreMemorySection struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+// CoreMemory represents the active context that is always provided to the agent.
+type CoreMemory struct {
+	UserID    string                        `json:"user_id"`
+	ProjectID string                        `json:"project_id"`
+	Sections  map[string]*CoreMemorySection `json:"sections"`
+}
+
+// CoreMemoryManager defines operations for managing core memory.
+type CoreMemoryManager interface {
+	GetCoreMemory(ctx context.Context, userID, projectID string) (*CoreMemory, error)
+	AppendToSection(ctx context.Context, userID, projectID, section, content string) error
+	ReplaceInSection(ctx context.Context, userID, projectID, section, oldContent, newContent string) error
+}
+
