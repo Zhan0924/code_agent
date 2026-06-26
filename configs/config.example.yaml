@@ -69,7 +69,7 @@ temporal:
   activity_timeout: 5m
 
 sandbox:
-  docker_host: "unix:///var/run/docker.sock"
+  docker_host: "unix:///run/podman/podman.sock"
   default_image: "python:3.12-slim"
   images:
     python: "python:3.12-slim"
@@ -127,6 +127,16 @@ session:
   max_history_tokens: 32000       # ⬆ 4K→32K: Opus has 200K context; keep rich multi-turn history
   summary_threshold_tokens: 28000  # ⬆ 3.5K→28K: only summarize when truly approaching budget
   ttl: 24h
+  compaction_mode: "truncate"     # "truncate" or "summarize"
+
+memory:
+  distill:
+    enabled: true
+    interval: 1h
+    max_episodic_per_run: 50
+    min_episodic_to_trigger: 3
+    auto_discover: true
+    max_tenants_per_tick: 32
 
 security:
   sensitive_patterns:
@@ -203,3 +213,44 @@ lsp:
       command: "rust-analyzer"
       args: []
       languages: ["rust"]
+
+# ─── Long-term Memory System (HybridStore) ──────────────────
+memory:
+  hot_ttl: 24h
+  hot_scan_limit: 200
+  conflict_threshold: 0.85
+  conflict_margin: 0.2
+  preserve_high_score: true
+  max_conflicts_to_dedup: 32
+  duplicate_threshold: 0.7
+  max_per_run: 10
+  dedup_candidate_limit: 30
+  embedding_dim: 1536
+  promote:
+    enabled: true
+    threshold: 0.7
+    batch_size: 50
+    flush_interval: 5s
+    queue_size: 256
+  demote:
+    enabled: true
+    threshold: 0.3
+  access:
+    enabled: true
+    batch_size: 100
+    flush_interval: 5s
+    queue_size: 1024
+  decay:
+    enabled: true
+    interval: 24h
+    older_than: 720h # 30 days
+    factor: 0.95
+  distill:
+    enabled: false
+    interval: 6h
+    max_episodic_per_run: 50
+    min_episodic_to_trigger: 3
+    auto_discover: true
+    max_tenants_per_tick: 32
+    min_episodic_for_discovery: 0
+    targets: []
