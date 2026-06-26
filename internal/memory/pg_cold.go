@@ -69,8 +69,11 @@ func (p *PGCold) Migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_memories_user_project ON memories(user_id, project_id);
 		CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 		CREATE INDEX IF NOT EXISTS idx_memories_score ON memories(score DESC);
-		CREATE INDEX IF NOT EXISTS idx_memories_embedding
-			ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+		-- Drop legacy IVFFlat index which severely underfits small agent memory tables
+		DROP INDEX IF EXISTS idx_memories_embedding;
+		-- Use HNSW for robust exact-like recall on small tables and fast ANN on large tables
+		CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
+			ON memories USING hnsw (embedding vector_cosine_ops);
 		-- Partial index lets the Distiller's "next batch" query (WHERE
 		-- type = 'episodic' AND distilled_at IS NULL ORDER BY created_at)
 		-- run without a full type-scan.
@@ -220,6 +223,19 @@ func (p *PGCold) TouchBatch(ctx context.Context, ids []string) error {
 		SET access_count = access_count + 1, last_accessed_at = NOW()
 		WHERE id = ANY($1)
 	`, pq.Array(ids))
+	return err
+}
+
+// BoostScoreBatch increases the score of specified memories by the given amount, capped at 1.0.
+func (p *PGCold) BoostScoreBatch(ctx context.Context, ids []string, boost float64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := p.db.ExecContext(ctx, `
+		UPDATE memories
+		SET score = LEAST(score + $1, 1.0)
+		WHERE id = ANY($2)
+	`, boost, pq.Array(ids))
 	return err
 }
 
@@ -463,9 +479,8 @@ func (p *PGCold) MarkDistilled(ctx context.Context, ids []string) error {
 		return nil
 	}
 	_, err := p.db.ExecContext(ctx, `
-		UPDATE memories
-		SET distilled_at = NOW()
-		WHERE id = ANY($1) AND distilled_at IS NULL
+		DELETE FROM memories
+		WHERE id = ANY($1)
 	`, pq.Array(ids))
 	return err
 }
