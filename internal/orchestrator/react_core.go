@@ -70,14 +70,33 @@ type reactCoreResult struct {
 	done         bool             // true if LLM produced a final answer
 	stepsUsed    int
 	hitStepLimit bool
+	// toolsUsed is the in-order sequence of tool *names* invoked during
+	// the loop (one entry per tool call, dedupe-then-execute already
+	// applied). Used by memory_bridge.recordTaskEpisodeAsync to capture
+	// the trajectory in the per-task episodic memory; downstream consumers
+	// must treat this as best-effort (some early-exit paths don't append).
+	toolsUsed []string
 }
 
 // reactLoopCore runs the shared inner ReAct loop. Both reactLoop (sync) and
 // ProcessMessageStreamFull (streaming) delegate here for the step-by-step
 // LLM → tool → observe cycle.
 func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, sink reactEventSink) reactCoreResult {
-	// Inject session ID into context for downstream use (e.g., tool feedback recording)
-	ctx = context.WithValue(ctx, ctxKeySessionID, opts.task.SessionID)
+	// Inject (sessionID, userID, projectID) triple into ctx — downstream
+	// consumers (tools, memory_tools, observability, audit) pull these from
+	// models.SessionIDFromContext / UserIDFromContext / ProjectIDFromContext
+	// so no downstream code needs to re-resolve the session by ID.
+	// We resolve userID/projectID once here from the cheapest source
+	// (sessionMgr.Get). If the lookup fails we still inject sessionID so
+	// the tool feedback / workspace resolution paths keep working.
+	userID, projectID := "", ""
+	if o.sessionMgr != nil && opts.task.SessionID != "" {
+		if sess, err := o.sessionMgr.Get(ctx, opts.task.SessionID); err == nil && sess != nil {
+			userID = sess.UserID
+			projectID = sess.ProjectID
+		}
+	}
+	ctx = models.WithSessionContext(ctx, opts.task.SessionID, userID, projectID)
 	// Tool-level HITL plumbing: executeTool reads task + sink from ctx to
 	// decide whether to surface an approval_request event or fall back to a
 	// blocking error. Keep this scoped to the loop's ctx; downstream callers
@@ -131,13 +150,15 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 			o.toolDistiller.Distill()
 		}
 		if o.trajectoryMem != nil && opts.task.Intent != "" && len(toolSequence) > 0 {
-			o.trajectoryMem.Record(string(opts.task.Intent), toolSequence, loopDone)
+			// Errors are intentionally swallowed: trajectory recording is
+			// a best-effort learning signal, not a request-blocking step.
+			_ = o.trajectoryMem.Record(ctx, string(opts.task.Intent), toolSequence, loopDone)
 		}
 	}()
 
 	// Inject trajectory hint from historical successful patterns
 	if o.trajectoryMem != nil && opts.task.Intent != "" {
-		if hint := o.trajectoryMem.FormatHint(string(opts.task.Intent)); hint != "" {
+		if hint := agentloop.FormatTrajectoryHint(ctx, o.trajectoryMem, string(opts.task.Intent)); hint != "" {
 			messages = append(messages, models.Message{Role: models.RoleSystem, Content: hint})
 		}
 	}
@@ -158,7 +179,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				Step:    globalStep,
 				Content: "Task cancelled: " + ctx.Err().Error(),
 			})
-			return reactCoreResult{content: "Request cancelled", messages: messages, stepsUsed: step, done: true}
+			return reactCoreResult{content: "Request cancelled", messages: messages, stepsUsed: step, done: true, toolsUsed: toolSequence}
 		default:
 		}
 
@@ -180,7 +201,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 					content = fmt.Sprintf("Task %s by user. Rolled back %d file(s).", sig.Type, n)
 				}
 				sink.Emit(models.ReactStreamEvent{Type: "message", Content: content})
-				return reactCoreResult{content: content, messages: messages, stepsUsed: step, done: true}
+				return reactCoreResult{content: content, messages: messages, stepsUsed: step, done: true, toolsUsed: toolSequence}
 			default:
 			}
 		}
@@ -278,13 +299,13 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 						Step:    globalStep,
 						Content: "Context cancelled during LLM retry: " + ctx.Err().Error(),
 					})
-					return reactCoreResult{content: "Context cancelled during LLM retry", messages: messages, stepsUsed: step, done: true}
+					return reactCoreResult{content: "Context cancelled during LLM retry", messages: messages, stepsUsed: step, done: true, toolsUsed: toolSequence}
 				}
 			}
 		}
 		if llmErr != nil {
 			sink.Emit(models.ReactStreamEvent{Type: "error", Content: "LLM call failed: " + llmErr.Error()})
-			return reactCoreResult{content: "LLM call failed after 3 retries: " + llmErr.Error(), messages: messages, stepsUsed: step, done: true}
+			return reactCoreResult{content: "LLM call failed after 3 retries: " + llmErr.Error(), messages: messages, stepsUsed: step, done: true, toolsUsed: toolSequence}
 		}
 
 		// Emit thinking if content present with tool calls
@@ -311,7 +332,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 				continue
 			}
 			loopDone = true
-			return reactCoreResult{content: resp.Content, messages: messages, stepsUsed: step + 1, done: true}
+			return reactCoreResult{content: resp.Content, messages: messages, stepsUsed: step + 1, done: true, toolsUsed: toolSequence}
 		}
 
 		// Dedupe identical ToolCalls within a single LLM step. Long ReAct loops
@@ -507,7 +528,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 					Step:    globalStep,
 					Content: fmt.Sprintf("ReAct loop aborted: tool '%s' failed %d times in a row.", pr.tc.Name, failTracker.failCount),
 				})
-				return reactCoreResult{messages: messages, stepsUsed: step + 1, hitStepLimit: false}
+				return reactCoreResult{messages: messages, stepsUsed: step + 1, hitStepLimit: false, toolsUsed: toolSequence}
 			}
 		}
 
@@ -527,7 +548,7 @@ func (o *Orchestrator) reactLoopCore(ctx context.Context, opts reactCoreOpts, si
 	}
 
 	// Step limit exhausted
-	return reactCoreResult{messages: messages, stepsUsed: opts.maxSteps, hitStepLimit: true}
+	return reactCoreResult{messages: messages, stepsUsed: opts.maxSteps, hitStepLimit: true, toolsUsed: toolSequence}
 }
 
 // llmProgressInterval 控制 llm_call_progress 心跳节奏。

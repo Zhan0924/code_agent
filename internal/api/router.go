@@ -370,6 +370,9 @@ func (s *Server) setupRoutes() {
 		// WebSocket endpoint for real-time communication
 		v1.GET("/ws", s.handleWebSocket)
 
+		// Testing endpoint
+		v1.POST("/test_memory", s.handleTestMemory)
+
 		// HMAC-protected webhook endpoints (§3 security hardening)
 		webhooks := v1.Group("/webhooks")
 		webhooks.Use(s.hmac.GinMiddleware())

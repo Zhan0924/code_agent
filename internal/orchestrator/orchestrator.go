@@ -34,10 +34,15 @@ import (
 	"go.uber.org/zap"
 )
 
-// Context keys for passing metadata through the call chain.
+// Context keys for orchestrator-local request metadata.
+//
+// Note: the (sessionID, userID, projectID) triple has moved to
+// `models.WithSessionContext` / `models.SessionIDFromContext` etc. so that
+// downstream packages (tools / memory / observability / audit) can read
+// the same values without re-fetching the session by ID.
+// The previous orchestrator-local `ctxKeySessionID` has been deleted —
+// any new orchestrator-local key should use this typed wrapper.
 type contextKey string
-
-const ctxKeySessionID contextKey = "session_id"
 
 // [P2-10] Adaptive step limits based on task complexity.
 // getMaxSteps returns the step limit for a given intent.
@@ -149,9 +154,16 @@ type Orchestrator struct {
 	memoryStore MemoryRetriever
 	// Optional memory extractor for learning from interactions.
 	memoryExtractor *memory.Extractor
+	// Optional MemGPT-style core memory (always-on persona / human / project
+	// sections). When wired, buildLongTermMemory pulls these sections and
+	// prepends them to the long-term-memory slot of the prompt so the LLM
+	// actually *reads* whatever core_memory_append / core_memory_replace
+	// tools wrote earlier. Without this read path, those tools were a pure
+	// write-only blackhole (the original bug).
+	coreMemory memory.CoreMemoryManager
 
 	// Trajectory memory: records successful tool sequences per intent.
-	trajectoryMem *agentloop.TrajectoryMemory
+	trajectoryMem agentloop.TrajectoryStore
 
 	// Dynamic context window budget (from LLM provider config)
 	maxContextTokens int
@@ -314,6 +326,18 @@ func (o *Orchestrator) SetToolLearnStore(s toollearn.Store) {
 	o.toolCollector.SetStore(s)
 }
 
+// SetTrajectoryStore replaces the default in-memory TrajectoryMemory with
+// any TrajectoryStore implementation — typically PGTrajectoryStore in
+// production so successful tool sequences survive restarts and benefit
+// from embedding-based intent recall. nil is a no-op so callers can wire
+// optimistically without checking embedder presence.
+func (o *Orchestrator) SetTrajectoryStore(s agentloop.TrajectoryStore) {
+	if s == nil {
+		return
+	}
+	o.trajectoryMem = s
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // F1: ReAct Multi-Step Reasoning Loop
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -402,7 +426,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	// Execute with ReAct loop
 	task.State = models.TaskStateExecuting
 	o.persistTaskState(ctx, task.ID, models.TaskStateExecuting)
-	response, err := o.reactLoop(ctx, task)
+	response, toolsUsed, err := o.reactLoop(ctx, task)
 	if err != nil {
 		task.State = models.TaskStateFailed
 		o.persistFailureAssistant(ctx, sessionID, task.ID, "⚠️ Task failed: "+err.Error())
@@ -418,8 +442,14 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 		Role: models.RoleAssistant, Content: response,
 	})
 
-	// Extract memories from this interaction (async, non-blocking)
+	// Extract memories from this interaction (async, non-blocking).
+	// extractMemoriesAsync produces typed memories via the LLM (preference
+	// / decision / knowledge / pattern), recordTaskEpisodeAsync persists
+	// the raw trajectory as a single episodic memory for the Distiller
+	// to consolidate later. Both run independently; either failing does
+	// not affect the other.
 	o.extractMemoriesAsync(ctx, sessionID, userMessage, response)
+	o.recordTaskEpisodeAsync(ctx, sessionID, userMessage, response, toolsUsed)
 
 	return &models.ChatResponse{
 		SessionID: sessionID, TaskID: task.ID,
@@ -501,7 +531,11 @@ func (o *Orchestrator) persistAudit(ctx context.Context, taskID, userID, action,
 
 // reactLoop implements the core ReAct (Reason + Act) cycle.
 // The LLM can call tools, receive results, then reason further — up to maxReActSteps.
-func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string, error) {
+// reactLoop returns (content, toolsUsed, error). toolsUsed is the
+// in-order sequence of tool names invoked during the loop, used by
+// recordTaskEpisodeAsync to capture the trajectory in per-task episodic
+// memory. Best-effort: some early-exit paths may return nil tools.
+func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string, []string, error) {
 	// [P2-E1] Register interrupt channel for this session
 	interruptCh := o.registerInterrupt(task.SessionID)
 	defer o.unregisterInterrupt(task.SessionID)
@@ -578,14 +612,14 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 				)
 			}
 		}
-		return result.content, nil
+		return result.content, result.toolsUsed, nil
 	}
 
 	// Step limit exhausted — save progress
 	o.saveProgressForContinuation(ctx, task)
 	return "⚠️ I reached the maximum reasoning steps. Your workspace files and .plan.md are intact.\n\n" +
 		"**To continue from where I left off**, send a follow-up message saying `continue` in the same session. " +
-		"I will read .plan.md and .progress.json to resume the remaining steps.", nil
+		"I will read .plan.md and .progress.json to resume the remaining steps.", result.toolsUsed, nil
 }
 
 // saveProgressForContinuation writes a .progress.json to the workspace
@@ -758,7 +792,7 @@ func (o *Orchestrator) suspendForApprovalInProcess(ctx context.Context, task *mo
 			if resp.Approved {
 				metrics.HITLApprovalTotal.WithLabelValues("approved").Inc()
 				o.logger.Info("task approved, executing", zap.String("task_id", task.ID))
-				result, err := o.reactLoop(waitCtx, task)
+				result, toolsUsed, err := o.reactLoop(waitCtx, task)
 				if err != nil {
 					o.logger.Error("post-approval execution failed", zap.Error(err))
 					return
@@ -766,6 +800,7 @@ func (o *Orchestrator) suspendForApprovalInProcess(ctx context.Context, task *mo
 				_ = o.sessionMgr.AddMessage(waitCtx, task.SessionID, models.Message{
 					Role: models.RoleAssistant, Content: result,
 				})
+				o.recordTaskEpisodeAsync(waitCtx, task.SessionID, task.UserInput, result, toolsUsed)
 			} else {
 				metrics.HITLApprovalTotal.WithLabelValues("rejected").Inc()
 				o.logger.Info("task rejected", zap.String("task_id", task.ID))
@@ -1151,6 +1186,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 					Role: models.RoleAssistant, Content: result.content,
 				})
 				o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
+				o.recordTaskEpisodeAsync(workCtx, sessionID, task.UserInput, result.content, result.toolsUsed)
 				sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
 				return
 			}
@@ -1667,7 +1703,7 @@ func (o *Orchestrator) executeTool(ctx context.Context, tc models.ToolCall) (*mo
 		} else if result != nil && result.IsError {
 			errMsg = result.Content
 		}
-		sessionID, _ := ctx.Value(ctxKeySessionID).(string)
+		sessionID := models.SessionIDFromContext(ctx)
 		o.toolCollector.Record(tc.Name, tc.Args, success, time.Since(start), errMsg, sessionID)
 	}
 
@@ -1794,10 +1830,14 @@ func (o *Orchestrator) toolSearchCode(ctx context.Context, args json.RawMessage)
 	}
 	return &models.ToolResult{Content: strings.Join(parts, "\n---\n")}, nil
 }
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tool Registry
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ToolRegistry returns the internal tool registry for testing and external execution.
+func (o *Orchestrator) ToolRegistry() *tools.Registry {
+	return o.toolRegistry
+}
 
 // GetAvailableTools returns all available tool definitions (builtin + MCP + dynamic + skills)
 func (o *Orchestrator) GetAvailableTools() []models.ToolDefinition {

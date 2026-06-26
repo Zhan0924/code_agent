@@ -74,6 +74,194 @@ type Config struct {
 	TreeSitter TreeSitterConfig `mapstructure:"tree_sitter"`
 	LSP        LSPConfig        `mapstructure:"lsp"`
 	Workspace  WorkspaceConfig  `mapstructure:"workspace"`
+	Memory     MemoryConfig     `mapstructure:"memory"`
+}
+
+// MemoryConfig 控制长期记忆 (internal/memory) 的运行时阈值。所有字段都是
+// optional —— 留空时走 NewExtractor / NewConflictResolver / NewRedisHot
+// 等构造器的代码内默认值，保持开箱即用。生产部署可以按需调高/降低。
+type MemoryConfig struct {
+	// HotTTL 是 Redis 热层每条记忆的 TTL。默认 24h；如果工作负载里
+	// 每日活跃 user 数较少（例如内部工具）可以调到 72h 提升热命中率。
+	HotTTL time.Duration `mapstructure:"hot_ttl"`
+
+	// HotScanLimit 是 RedisHot 单次 SCAN 命中 key 的上限（P1 #10）。
+	// 默认 200，clamp [50, 2000]：50 = 文档化"≤ 50 entries per
+	// (user, project)"的下限保护；2000 ≈ 20 个 SCAN batch + 20k
+	// unmarshal，单调用 ~30ms 上限。
+	//
+	// 调用方（HybridStore.RetrieveByType 等）传入的 `limit` 可以临时
+	// 把扫描窗口拉到 maxHotScanLimit；但稳态扫描预算由这个配置决定。
+	// 大 tenant 看到 memory_hot_scan_truncated_total 持续 > 0 时应调大。
+	// 0 = 使用代码默认 200。
+	HotScanLimit int `mapstructure:"hot_scan_limit"`
+
+	// ConflictThreshold 是 ConflictResolver.FindConflicts 的余弦相似度阈值。
+	// 不同 embedding 模型最优值差异极大：OpenAI text-embedding-3 在 0.7+
+	// 已可视作同义，bge-large 需要 0.85+。默认 0.85。
+	ConflictThreshold float64 `mapstructure:"conflict_threshold"`
+
+	// ConflictMargin 是 score-aware 合并里"新记忆要 override 老记忆所需
+	// 的分数差"。默认 0.2。
+	ConflictMargin float64 `mapstructure:"conflict_margin"`
+
+	// PreserveHighScore: 是否保留高分老记忆（true = 不被低分新记忆覆盖）。
+	// 默认 true。
+	PreserveHighScore bool `mapstructure:"preserve_high_score"`
+
+	// MaxConflictsToDedup 是 HybridStore.Store 单次最多消除的副本数（P1 #7）。
+	// 默认 32 — 防止候选集异常雪崩（一次 DELETE 几百行会拖慢事务）。
+	// 设为 0 退回默认值；设为 1 等效于禁用 dedup（仍合并 [0]，但不删其余）。
+	MaxConflictsToDedup int `mapstructure:"max_conflicts_to_dedup"`
+
+	// DuplicateThreshold 是 Extractor.isDuplicate 的 n-gram Jaccard 阈值。
+	// 默认 0.7；放低会更激进地去重，放高更宽松。
+	DuplicateThreshold float64 `mapstructure:"duplicate_threshold"`
+
+	// MaxPerRun 是单次 ExtractFromInteraction 接受的最多 candidate 数。
+	// 默认 10；LLM 偶尔会越界生成几十条，这是硬截断保护。
+	MaxPerRun int `mapstructure:"max_per_run"`
+
+	// DedupCandidateLimit 是 P1 #9 引入的 Extractor.isDuplicate 近邻
+	// 查询 K：每次写入前从 hot+cold 拉 K 条候选做 cosine ≥ 0.85 判断。
+	// 旧实现写死 5 → 大库 rank-6..30 的真重复被漏过。默认 30，clamp
+	// [5, 200]；超出区间会在 Extractor.SetDedupCandidateLimit 中自动钳制。
+	// 该路径不会触发 Touch / Promote，故调大不会影响 Decay 公平性。
+	DedupCandidateLimit int `mapstructure:"dedup_candidate_limit"`
+
+	// EmbeddingDim 是 pgvector 列的维度。0 = 使用 1536（text-embedding-3-small）。
+	// 切换到其他 embedding 模型时必须同时迁移 PG schema。
+	EmbeddingDim int `mapstructure:"embedding_dim"`
+
+	// Decay 控制周期性遗忘任务的运行参数。
+	Decay MemoryDecayConfig `mapstructure:"decay"`
+
+	// Distill 控制 episodic→semantic 的周期性蒸馏任务。
+	Distill MemoryDistillConfig `mapstructure:"distill"`
+
+	// Access 控制召回路径的 access_count / last_accessed_at 批量回写。
+	// 关闭后 Decay 会回到"读不推进 last_accessed_at"的不公平状态。
+	Access MemoryAccessConfig `mapstructure:"access"`
+
+	// Promote 控制召回路径的 cold→hot 异步回填（P1 #8）。关闭后
+	// "老但常用"的高分 memory 永远进不了 hot tier，所有 cold 命中都
+	// 走慢路径 pgvector。
+	Promote MemoryPromoteConfig `mapstructure:"promote"`
+
+	// Demote 控制 Decay 路径的 hot 主动驱逐（P1 #8）。关闭后 hot 副本
+	// 即使衰减到 0.05 分仍占用 hot 24h 直到 TTL，污染 tier-1 召回。
+	Demote MemoryDemoteConfig `mapstructure:"demote"`
+}
+
+// MemoryPromoteConfig 配置 cold→hot 异步回填批处理器。
+//
+// 读路径在 Retrieve / RetrieveByType 末尾扫描融合结果，识别"cold-only
+// 命中 + score ≥ Threshold"的条目，非阻塞入队由后台 goroutine 批 SET
+// 到 hot。后续相同 query 即可命中 5ms 路径。
+type MemoryPromoteConfig struct {
+	// Enabled 是否启用 Promote 批处理器；默认 true。设为 false 会让
+	// 高分老 memory 永远走 cold 慢路径。
+	Enabled bool `mapstructure:"enabled"`
+	// Threshold 只 Promote score ≥ 此值的条目。默认 0.7 —— 经验上
+	// 该值已是高价值 memory，低于此值的偶发命中不值得占用 hot 24h TTL。
+	Threshold float64 `mapstructure:"threshold"`
+	// BatchSize 单次 Pipeline SET 的最大条目数。默认 50。
+	BatchSize int `mapstructure:"batch_size"`
+	// FlushInterval 时间触发的 batch 间隔。默认 5s。
+	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// QueueSize Promote chan 容量；满则 drop + metric。默认 256。
+	QueueSize int `mapstructure:"queue_size"`
+}
+
+// MemoryDemoteConfig 配置 Decay 路径的 hot 主动驱逐。
+//
+// Decay 计算 newScore = m.Score * factor 之后，若 newScore < Threshold
+// 且 m.Score ≥ Threshold（"穿越阈值"），即从 hot DEL（cold 保留）。这
+// 防止低质量 memory 占用 hot 24h TTL 污染 tier-1 召回。
+type MemoryDemoteConfig struct {
+	// Enabled 显式开关。设为 false 时 Threshold=0 透传，禁用 demote 分支。
+	Enabled bool `mapstructure:"enabled"`
+	// Threshold 跌破此值的 memory 从 hot DEL。必须 > 0.01（score floor）。
+	// 默认 0.3 —— 经验上 0.3 已是低信号区间。
+	Threshold float64 `mapstructure:"threshold"`
+}
+
+// MemoryAccessConfig 配置召回路径的异步 Touch batcher。
+//
+// 读路径返回前把命中的 memory.ID 入队，由内部 goroutine 防抖批量
+// UPDATE access_count + last_accessed_at。写放大上限 = 1 QPS per
+// HybridStore 实例（每 FlushInterval 一次），与读 QPS 完全脱钩。
+type MemoryAccessConfig struct {
+	// Enabled 是否启用批量 Touch；默认 true。设为 false 会让 Decay 失
+	// 去对"读"信号的感知 — 仅在 cold-tier 写性能极其紧张时考虑关闭。
+	Enabled bool `mapstructure:"enabled"`
+	// BatchSize 单次 UPDATE 处理的 ID 上限。默认 100。
+	BatchSize int `mapstructure:"batch_size"`
+	// FlushInterval 时间触发的 batch 间隔。默认 5s。
+	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// QueueSize touch chan 的容量；满则 drop + metric 报警。默认 1024。
+	// 200 QPS Retrieve × 5 results = 1000 IDs/s 稳态下 1024 刚好够。
+	QueueSize int `mapstructure:"queue_size"`
+}
+
+// MemoryDistillConfig 配置 internal/memory.Distiller 的周期触发。
+// 与 Decay 一样默认禁用，避免空集群在没有 LLM 配额时被自动调用浪费 token。
+type MemoryDistillConfig struct {
+	// Enabled 显式开关；只有 true 时 main.go 才会启动 ticker。
+	Enabled bool `mapstructure:"enabled"`
+	// Interval 是两次蒸馏之间的间隔。默认 6h（一天 4 次）。
+	Interval time.Duration `mapstructure:"interval"`
+	// MaxEpisodicPerRun 是单次蒸馏从 episodic 池抽取的上限。默认 50。
+	MaxEpisodicPerRun int `mapstructure:"max_episodic_per_run"`
+	// MinEpisodicToTrigger 是触发蒸馏的最少 episodic 数。默认 3。低于
+	// 此值跳过 LLM 调用——少量样本只会产生噪声，不会产生 insight。
+	MinEpisodicToTrigger int `mapstructure:"min_episodic_to_trigger"`
+	// Targets 是要扫描的 (user_id, project_id) 列表，作为 forced
+	// inclusion：每个 tick 一定会蒸馏，即使 episodic 还没积累到
+	// MinEpisodicForDiscovery（Distiller 自己仍会按 MinEpisodicToTrigger
+	// 跳过空 tenant）。
+	//
+	// 单独使用 Targets 会让多租户部署不可扩展（每加一个 user/project
+	// 都要改 yaml）。生产应让 AutoDiscover=true 接管发现路径，Targets
+	// 仅留给"哪怕没数据也想跑一轮"的运维兜底。
+	Targets []MemoryDistillTarget `mapstructure:"targets"`
+
+	// AutoDiscover 控制 ticker 是否从 PG 自动发现需要蒸馏的活跃 tenant。
+	// 默认 true（与 Enabled=true 绑定）—— 没有它，新增 tenant 在 yaml
+	// reload 前永远拿不到蒸馏。设为 false 退回旧的"只扫 Targets"行为。
+	AutoDiscover bool `mapstructure:"auto_discover"`
+
+	// MaxTenantsPerTick 单 tick 处理的 tenant 上限（包括 AutoDiscover
+	// + Targets 合并去重后的总数）。默认 32：6h 一次 × 32 个 tenant ×
+	// 每 tenant 1 LLM call = 每天 128 LLM calls 的上限，对配额敏感的
+	// 部署可下调。
+	MaxTenantsPerTick int `mapstructure:"max_tenants_per_tick"`
+
+	// MinEpisodicForDiscovery 是 AutoDiscover 的活跃度阈值：只有
+	// undistilled episodic >= 此值的 tenant 才会被发现。默认 0 时
+	// 取 MinEpisodicToTrigger（避免发现到 tenant 又被 Distiller 立即
+	// skip 的浪费）。
+	MinEpisodicForDiscovery int `mapstructure:"min_episodic_for_discovery"`
+}
+
+// MemoryDistillTarget identifies a single (user, project) pair the
+// Distiller ticker should consolidate.
+type MemoryDistillTarget struct {
+	UserID    string `mapstructure:"user_id"`
+	ProjectID string `mapstructure:"project_id"`
+}
+
+// MemoryDecayConfig 配置定时衰减任务的触发节奏。零值禁用调度器（仅手动
+// 调用 HybridStore.Decay 时才会衰减）。
+type MemoryDecayConfig struct {
+	// Enabled 显式开关；只有 true 时 main.go 才会启动 ticker。
+	Enabled bool `mapstructure:"enabled"`
+	// Interval 是两次衰减扫描之间的间隔。默认 24h（每天一次）。
+	Interval time.Duration `mapstructure:"interval"`
+	// OlderThan 是 "多久没访问的记忆才参与衰减" 的阈值。默认 30 天。
+	OlderThan time.Duration `mapstructure:"older_than"`
+	// Factor 是衰减系数（每轮乘以这个数）。默认 0.95。
+	Factor float64 `mapstructure:"factor"`
 }
 
 // WorkspaceConfig 控制 host workspace 上 run_workspace_cmd 的执行行为。

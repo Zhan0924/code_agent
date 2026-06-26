@@ -1130,7 +1130,7 @@ func (o *Orchestrator) resolveWorkspaceCtx(ctx context.Context, id string) *work
 	if id != "" && id != "default" {
 		return o.resolveWorkspace(id)
 	}
-	if sid, _ := ctx.Value(ctxKeySessionID).(string); sid != "" {
+	if sid := models.SessionIDFromContext(ctx); sid != "" {
 		if ws := o.ResolveSessionWorkspace(sid); ws != nil {
 			return ws
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/agent/code_agent/internal/metrics"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
@@ -33,7 +34,10 @@ func (b *Blackboard) channel(projectID string) string {
 	return fmt.Sprintf("blackboard:project:%s", projectID)
 }
 
-// Publish broadcasts a memory event.
+// Publish broadcasts a memory event. Records publish-attempt outcome to
+// metrics so dashboards can detect "publishes succeed but subscribers
+// never see them" (channel-drop scenarios are tracked separately in
+// Subscribe's default branch).
 func (b *Blackboard) Publish(ctx context.Context, action string, m *Memory) error {
 	event := MemoryEvent{
 		Action:    action,
@@ -42,9 +46,15 @@ func (b *Blackboard) Publish(ctx context.Context, action string, m *Memory) erro
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
+		metrics.MemoryBlackboardPublishTotal.WithLabelValues(action, "err").Inc()
 		return err
 	}
-	return b.client.Publish(ctx, b.channel(m.ProjectID), data).Err()
+	if err := b.client.Publish(ctx, b.channel(m.ProjectID), data).Err(); err != nil {
+		metrics.MemoryBlackboardPublishTotal.WithLabelValues(action, "err").Inc()
+		return err
+	}
+	metrics.MemoryBlackboardPublishTotal.WithLabelValues(action, "ok").Inc()
+	return nil
 }
 
 // Subscribe returns a Go channel that receives memory events for a project.
@@ -84,7 +94,14 @@ func (b *Blackboard) Subscribe(ctx context.Context, projectID string) (<-chan Me
 				case <-ctx.Done():
 					return
 				default:
-					b.logger.Warn("blackboard event dropped, channel full")
+					// Subscriber's local channel is full → drop the event
+					// rather than block the goroutine pulling from Redis.
+					// We bump a counter so a slow consumer is visible on
+					// dashboards instead of being only a noisy Warn log.
+					metrics.MemoryBlackboardDroppedTotal.Inc()
+					b.logger.Warn("blackboard event dropped, channel full",
+						zap.String("action", event.Action),
+						zap.String("project_id", event.ProjectID))
 				}
 			}
 		}

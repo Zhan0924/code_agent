@@ -55,6 +55,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/agent/code_agent/internal/agentloop"
 	"github.com/agent/code_agent/internal/api"
 	"github.com/agent/code_agent/internal/auth"
 	"github.com/agent/code_agent/internal/config"
@@ -491,7 +492,7 @@ func main() {
 	logger.Info("multi-agent supervisor attached")
 
 	// ─── Wire Memory Store (optional) ───────────────────────────────────
-	memAdapter := NewMemoryAdapter(rdb, pgStore, embedder, logger)
+	memAdapter := NewMemoryAdapter(rdb, pgStore, embedder, logger, cfg.Memory)
 	if memAdapter != nil {
 		orch.SetMemoryStore(memAdapter)
 		logger.Info("long-term memory store wired into orchestrator")
@@ -510,23 +511,183 @@ func main() {
 		}
 	}
 
+	// ─── Wire Trajectory PG Store (optional) ────────────────────────────
+	// Successful tool sequences are recalled into the prompt as a "what
+	// worked last time" hint. Without PG, the default in-memory
+	// TrajectoryMemory caps at 50 entries and resets every restart;
+	// with PG + embedder, recall becomes KNN over intent embeddings so
+	// "fix a flaky test" can match a previous "stabilize an integration
+	// test" trajectory even though the intent strings differ.
+	if pgStore != nil {
+		// embedDim falls back to memCfg.EmbeddingDim when the operator
+		// has already pinned a value for the memory subsystem; the
+		// trajectory table reuses the same vector size to avoid running
+		// two embedding models in parallel.
+		dim := cfg.Memory.EmbeddingDim
+		if dim <= 0 {
+			dim = 1024
+		}
+		var ie agentloop.IntentEmbedder
+		if embedder != nil {
+			// memory.Embedder satisfies agentloop.IntentEmbedder
+			// structurally — same Embed(ctx, []string) signature.
+			ie = embedder
+		}
+		trajStore := agentloop.NewPGTrajectoryStore(pgStore.DB(), logger, ie, dim)
+		if err := trajStore.Migrate(); err != nil {
+			logger.Warn("trajectory pg migration failed; staying with in-memory store",
+				zap.Error(err))
+		} else {
+			orch.SetTrajectoryStore(trajStore)
+			logger.Info("trajectory PG store wired into orchestrator",
+				zap.Bool("knn_enabled", ie != nil),
+				zap.Int("embed_dim", dim))
+		}
+	}
+
+	// memoryDecayStop / memoryDistillStop / memoryAccessStop, when
+	// non-nil, can be called during shutdown to halt their respective
+	// background loops cleanly. Declared up here so the Drain block
+	// below can invoke them; nil-safe to keep main flow readable.
+	var (
+		memoryDecayStop   func()
+		memoryDistillStop func()
+		memoryAccessStop  func()
+		memoryPromoteStop func()
+	)
+
 	// ─── Wire Memory Extractor (optional) ────────────────────────────────
 	if memAdapter != nil {
-		// Get the underlying HybridStore from adapter to create extractor
-		// The extractor needs the store interface and LLM client
+		// Get the underlying HybridStore from adapter to create extractor.
+		// We pass the embedder so isDuplicate() can use cosine similarity
+		// instead of word-Jaccard (the latter collapses on Chinese text —
+		// historical bug fix).
 		memoryExtractor := memory.NewExtractor(memAdapter.HybridStore(), llmClient, logger)
+		if embedder != nil {
+			memoryExtractor.SetEmbedder(embedder)
+		}
+		if cfg.Memory.MaxPerRun > 0 {
+			memoryExtractor.SetMaxPerRun(cfg.Memory.MaxPerRun)
+		}
+		if cfg.Memory.DedupCandidateLimit != 0 {
+			memoryExtractor.SetDedupCandidateLimit(cfg.Memory.DedupCandidateLimit)
+		}
+		if cfg.Memory.DedupCandidateLimit > 0 {
+			memoryExtractor.SetDedupCandidateLimit(cfg.Memory.DedupCandidateLimit)
+		}
 		orch.SetMemoryExtractor(memoryExtractor)
-		logger.Info("memory extractor wired into orchestrator")
+		logger.Info("memory extractor wired into orchestrator",
+			zap.Bool("with_embedder_dedup", embedder != nil),
+			zap.Int("max_per_run", cfg.Memory.MaxPerRun))
 
-		// ─── Active Memory Tools ─────────────────────────────────────────────
+		// ─── Active Memory Tools (MemGPT-style core memory) ─────────────────
+		// Wires *both* directions:
+		//   1) Tools — core_memory_append / core_memory_replace let the LLM
+		//      write into persona / human_context / project_context sections.
+		//   2) Read path — orch.SetCoreMemory makes buildLongTermMemory
+		//      inject those sections into every prompt's [Core Memory] block.
+		// Without (2), the tools wrote to Redis but the LLM never saw it
+		// back (the original "write-only blackhole" bug).
 		coreManager := memory.NewRedisCoreMemory(rdb, logger)
+		orch.SetCoreMemory(coreManager)
 		memoryTools := tools.NewMemoryToolsProvider(coreManager)
 		for _, tool := range memoryTools.Tools() {
 			if err := orch.RegisterDynamicTool(tool); err != nil {
 				logger.Error("failed to register memory tool", zap.Error(err))
 			}
 		}
-		logger.Info("active memory tools registered")
+		logger.Info("active memory tools registered (read+write path wired)")
+
+		// ─── Periodic Memory Decay (optional) ───────────────────────────
+		// Without a scheduler, the Decay path lives but is never invoked
+		// (the "dead schedule" historical bug). Enable in config to apply
+		// Ebbinghaus-style forgetting to long-idle memories.
+		if cfg.Memory.Decay.Enabled {
+			interval := cfg.Memory.Decay.Interval
+			if interval <= 0 {
+				interval = 24 * time.Hour
+			}
+			olderThan := cfg.Memory.Decay.OlderThan
+			if olderThan <= 0 {
+				olderThan = 30 * 24 * time.Hour
+			}
+			factor := cfg.Memory.Decay.Factor
+			if factor <= 0 || factor >= 1 {
+				factor = 0.95
+			}
+			decayCtx, cancelDecay := context.WithCancel(context.Background())
+			memoryDecayStop = cancelDecay
+			go runMemoryDecayLoop(decayCtx, memAdapter.HybridStore(), interval, olderThan, factor, logger)
+			logger.Info("memory decay scheduler started",
+				zap.Duration("interval", interval),
+				zap.Duration("older_than", olderThan),
+				zap.Float64("factor", factor))
+		}
+
+		// ─── Periodic Memory Distillation (optional) ────────────────────
+		// Consolidates raw episodic traces into a smaller, higher-signal
+		// semantic memory. Disabled by default — costs LLM tokens, so
+		// production should opt in deliberately and configure Targets.
+		if cfg.Memory.Distill.Enabled {
+			distillCtx, cancelDistill := context.WithCancel(context.Background())
+			memoryDistillStop = cancelDistill
+			go runMemoryDistillLoop(
+				distillCtx,
+				memAdapter.HybridStore(),
+				&distillerLLMAdapter{c: llmClient},
+				memory.NewBlackboard(rdb, logger),
+				cfg.Memory.Distill,
+				logger,
+			)
+			logger.Info("memory distill scheduler started",
+				zap.Duration("interval", cfg.Memory.Distill.Interval),
+				zap.Int("targets", len(cfg.Memory.Distill.Targets)))
+		}
+
+		// ─── Async Access Batcher (read-path Touch) ─────────────────────
+		// Without this, every Retrieve returned memories WITHOUT advancing
+		// last_accessed_at, so Decay treated frequently-read entries the
+		// same as never-read ones. Enabling the batcher closes that loop
+		// at ≤ 1 UPDATE QPS per HybridStore replica (debounced).
+		// Default-on; explicit `enabled: false` retains legacy behaviour.
+		if cfg.Memory.Access.Enabled {
+			memAdapter.HybridStore().EnableAccessBatcher(memory.AccessBatcherOptions{
+				BatchSize:     cfg.Memory.Access.BatchSize,
+				FlushInterval: cfg.Memory.Access.FlushInterval,
+				QueueSize:     cfg.Memory.Access.QueueSize,
+			})
+			accessCtx, cancelAccess := context.WithCancel(context.Background())
+			memoryAccessStop = cancelAccess
+			go memAdapter.HybridStore().StartAccessBatcher(accessCtx)
+			logger.Info("memory access batcher started")
+		}
+
+		// ─── Async Promote Batcher (read-path cold→hot back-fill) ───────
+		// Without this, "old but frequently retrieved" memories never
+		// reach the hot tier, so every cold-only hit pays the 50-200ms
+		// pgvector cost instead of the 5ms hot path. P1 #8.
+		if cfg.Memory.Promote.Enabled {
+			memAdapter.HybridStore().EnablePromoteBatcher(memory.PromoteOptions{
+				Threshold:     cfg.Memory.Promote.Threshold,
+				BatchSize:     cfg.Memory.Promote.BatchSize,
+				FlushInterval: cfg.Memory.Promote.FlushInterval,
+				QueueSize:     cfg.Memory.Promote.QueueSize,
+			})
+			promoteCtx, cancelPromote := context.WithCancel(context.Background())
+			memoryPromoteStop = cancelPromote
+			go memAdapter.HybridStore().StartPromoteBatcher(promoteCtx)
+			logger.Info("memory promote batcher started",
+				zap.Float64("threshold", cfg.Memory.Promote.Threshold))
+		}
+
+		// ─── Demote Threshold (Decay-time hot eviction) ─────────────────
+		// Stand-alone setting (no batcher) — applied inline by the Decay
+		// path. P1 #8.
+		if cfg.Memory.Demote.Enabled && cfg.Memory.Demote.Threshold > 0.01 {
+			memAdapter.HybridStore().SetDemoteThreshold(cfg.Memory.Demote.Threshold)
+			logger.Info("memory demote threshold configured",
+				zap.Float64("threshold", cfg.Memory.Demote.Threshold))
+		}
 	}
 
 	// ─── Initialize API Server ───────────────────────────────────────────
@@ -812,6 +973,26 @@ func main() {
 	logger.Info("draining in-flight chat goroutines")
 	if err := apiServer.Drain(shutdownCtx); err != nil {
 		logger.Warn("drain timed out, exiting with detached agents still running", zap.Error(err))
+	}
+
+	// Stop background memory decay loop (if started). Doing this AFTER Drain
+	// avoids cancelling a Decay() call mid-flight; if one is in progress it
+	// will complete its current iteration before the goroutine exits.
+	if memoryDistillStop != nil {
+		memoryDistillStop()
+	}
+	if memoryDecayStop != nil {
+		memoryDecayStop()
+	}
+	// Stop access batcher LAST: its final flush captures the last 5s of
+	// access signal from any in-flight chat goroutines drained above.
+	// Cancellation triggers a final TouchBatch using a detached 5s
+	// context, so the goroutine exits within seconds even if PG is slow.
+	if memoryAccessStop != nil {
+		memoryAccessStop()
+	}
+	if memoryPromoteStop != nil {
+		memoryPromoteStop()
 	}
 
 	// Close Redis
