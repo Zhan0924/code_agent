@@ -53,6 +53,10 @@ func (a *memoryAdapter) Retrieve(ctx context.Context, userID, projectID, query s
 	return toEntries(memories), nil
 }
 
+func (a *memoryAdapter) BoostScoreBatch(ctx context.Context, refs []memory.TouchRef, boost float64) error {
+	return a.store.BoostScoreBatch(ctx, refs, boost)
+}
+
 // RetrieveByType implements orchestrator.MemoryRetriever by delegating to
 // HybridStore's type-filtered semantic search.
 func (a *memoryAdapter) RetrieveByType(ctx context.Context, userID, projectID, memType, query string, limit int) ([]orchestrator.MemoryEntry, error) {
@@ -67,6 +71,7 @@ func toEntries(memories []memory.Memory) []orchestrator.MemoryEntry {
 	entries := make([]orchestrator.MemoryEntry, 0, len(memories))
 	for _, m := range memories {
 		entries = append(entries, orchestrator.MemoryEntry{
+			ID:      m.ID,
 			Type:    string(m.Type),
 			Content: m.Content,
 			Score:   m.Score,
@@ -254,7 +259,7 @@ func runMemoryDistillLoop(
 		MinEpisodicToTrigger: minTrigger,
 	})
 
-	timer := time.NewTimer(5 * time.Minute)
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 
 	for {

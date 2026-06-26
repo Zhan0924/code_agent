@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -828,6 +829,37 @@ func (h *HybridStore) ListActiveDistillTenants(ctx context.Context, minEpisodic,
 func (h *HybridStore) Touch(id string) error {
 	if h.cold != nil {
 		return h.cold.Touch(id)
+	}
+	return nil
+}
+
+// BoostScoreBatch increases the score of specified memories by the given amount.
+func (h *HybridStore) BoostScoreBatch(ctx context.Context, refs []TouchRef, boost float64) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	var errs []error
+	
+	// Cold store only needs IDs
+	if h.cold != nil {
+		ids := make([]string, len(refs))
+		for i, r := range refs {
+			ids[i] = r.ID
+		}
+		if err := h.cold.BoostScoreBatch(ctx, ids, boost); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	
+	// Hot store needs full TouchRefs
+	if h.hot != nil {
+		if err := h.hot.BoostScoreBatch(ctx, refs, boost); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	
+	if len(errs) > 0 {
+		return fmt.Errorf("boost score errors: %v", errs)
 	}
 	return nil
 }

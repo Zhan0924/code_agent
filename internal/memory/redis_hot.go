@@ -87,6 +87,35 @@ func (r *RedisHot) Store(ctx context.Context, m *Memory) error {
 	return r.client.Set(ctx, key, data, r.ttl).Err()
 }
 
+// BoostScoreBatch increases the score of specified memories in Redis.
+func (r *RedisHot) BoostScoreBatch(ctx context.Context, refs []TouchRef, boost float64) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	
+	// A lua script to safely get, decode, increment score, and encode back
+	script := redis.NewScript(`
+		for i, key in ipairs(KEYS) do
+			local data = redis.call("GET", key)
+			if data then
+				local mem = cjson.decode(data)
+				if mem.score then
+					mem.score = math.min(mem.score + tonumber(ARGV[1]), 1.0)
+					redis.call("SET", key, cjson.encode(mem))
+				end
+			end
+		end
+		return 1
+	`)
+	
+	keys := make([]string, len(refs))
+	for i, ref := range refs {
+		keys[i] = r.keyPrefix(ref.UserID, ref.ProjectID) + ":" + ref.ID
+	}
+	
+	return script.Run(ctx, r.client, keys, boost).Err()
+}
+
 // TouchBatch refreshes hot copies of each ref: bumps AccessCount and
 // rewrites LastAccessedAt to "now". Run in two pipelines — GET all, then
 // SET only the ones that actually exist (TTL preserved with KeepTTL so

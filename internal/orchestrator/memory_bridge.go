@@ -21,10 +21,12 @@ import (
 type MemoryRetriever interface {
 	Retrieve(ctx context.Context, userID, projectID, query string, limit int) ([]MemoryEntry, error)
 	RetrieveByType(ctx context.Context, userID, projectID, memType, query string, limit int) ([]MemoryEntry, error)
+	BoostScoreBatch(ctx context.Context, refs []memory.TouchRef, boost float64) error
 }
 
 // MemoryEntry is a minimal representation of a memory item for prompt injection.
 type MemoryEntry struct {
+	ID      string
 	Type    string
 	Content string
 	Score   float64
@@ -194,11 +196,15 @@ func (o *Orchestrator) buildLongTermMemory(ctx context.Context, sessionSummary, 
 		memories := o.retrieveBucketedMemories(ctx, userID, projectID, query, 5)
 		if len(memories) > 0 {
 			o.logger.Debug("memories retrieved", zap.Int("count", len(memories)))
+			parts = append(parts, "### Long-Term Memory (Context from past interactions)")
+			parts = append(parts, "Use these memories to inform your answer. If you use a memory, explicitly cite its ID like `[mem:<id>]` in your response to boost its relevance.")
+
 			var memParts []string
 			for _, m := range memories {
-				memParts = append(memParts, fmt.Sprintf("[%s] %s", m.Type, m.Content))
+				memParts = append(memParts, fmt.Sprintf("[mem:%s] [%s] %s", m.ID, m.Type, m.Content))
 			}
-			parts = append(parts, "[Long-Term Memory]\n"+strings.Join(memParts, "\n"))
+			parts = append(parts, strings.Join(memParts, "\n\n"))
+			parts = append(parts, "")
 		} else {
 			o.logger.Debug("no memories found for query")
 		}

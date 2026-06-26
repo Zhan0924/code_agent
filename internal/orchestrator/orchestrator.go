@@ -34,6 +34,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var citedMemoryRegex = regexp.MustCompile(`\[mem:([a-zA-Z0-9-]+)\]`)
+
 // Context keys for orchestrator-local request metadata.
 //
 // Note: the (sessionID, userID, projectID) triple has moved to
@@ -131,7 +133,7 @@ type Orchestrator struct {
 	interruptCh map[string]chan InterruptSignal
 
 	// [P2-E2] Per-session tool transactions for rollback on interrupt
-	txMu sync.RWMutex
+	txMu  sync.RWMutex
 	txMap map[string]*ToolTransaction
 
 	// [OPT-10] Intent cache: avoid redundant LLM calls for repeated intents
@@ -264,13 +266,13 @@ FINAL-ANSWER STYLE (strict — applies to the last assistant message that ends a
 		logger:              logger.With(zap.String("component", "orchestrator")),
 		approvalCh:          make(map[string]chan models.ApprovalResponse),
 		toolApprovalCh:      make(map[string]chan models.ApprovalResponse),
-		interruptCh:      make(map[string]chan InterruptSignal),
-		txMap:            make(map[string]*ToolTransaction),
-		intentCache:      make(map[string]intentCacheEntry),
-		toolCache:        NewSpeculativeToolCache(0, logger),
-		ruleLoader:       NewRuleLoader(logger),
-		toolRegistry:     tools.NewRegistry(),
-		trajectoryMem:    agentloop.NewTrajectoryMemory(),
+		interruptCh:         make(map[string]chan InterruptSignal),
+		txMap:               make(map[string]*ToolTransaction),
+		intentCache:         make(map[string]intentCacheEntry),
+		toolCache:           NewSpeculativeToolCache(0, logger),
+		ruleLoader:          NewRuleLoader(logger),
+		toolRegistry:        tools.NewRegistry(),
+		trajectoryMem:       agentloop.NewTrajectoryMemory(),
 	}
 
 	// Register built-in tools into the unified registry
@@ -350,6 +352,7 @@ func (o *Orchestrator) SetTrajectoryStore(s agentloop.TrajectoryStore) {
 //	        execute each tool → append results to messages
 //	    else:
 //	        return response.content  // LLM decided it's done
+//
 // ProcessOptions holds optional parameters for ProcessMessage and streaming variants.
 type ProcessOptions struct {
 	OutputFormat *models.ResponseFormat
@@ -432,6 +435,9 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 		o.persistFailureAssistant(ctx, sessionID, task.ID, "⚠️ Task failed: "+err.Error())
 		return nil, err
 	}
+
+	// AUDIT-P0-1: Feedback loop for cited memories
+	o.boostCitedMemories(ctx, sessionID, response)
 
 	// Store assistant response
 	task.State = models.TaskStateCompleted
@@ -1830,6 +1836,7 @@ func (o *Orchestrator) toolSearchCode(ctx context.Context, args json.RawMessage)
 	}
 	return &models.ToolResult{Content: strings.Join(parts, "\n---\n")}, nil
 }
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tool Registry
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1967,4 +1974,40 @@ func (o *Orchestrator) GetTool(name string) (tools.Tool, bool) {
 		return nil, false
 	}
 	return o.toolRegistry.Get(name)
+}
+
+// boostCitedMemories parses the LLM's response for [mem:<id>] citations and boosts their scores.
+func (o *Orchestrator) boostCitedMemories(ctx context.Context, sessionID, response string) {
+	if o.memoryStore == nil {
+		return
+	}
+	matches := citedMemoryRegex.FindAllStringSubmatch(response, -1)
+	if len(matches) == 0 {
+		return
+	}
+	sess, err := o.sessionMgr.Get(ctx, sessionID)
+	if err != nil || sess == nil {
+		return
+	}
+
+	idMap := make(map[string]bool)
+	var refs []memory.TouchRef
+	for _, match := range matches {
+		if len(match) > 1 && !idMap[match[1]] {
+			idMap[match[1]] = true
+			refs = append(refs, memory.TouchRef{
+				UserID:    sess.UserID,
+				ProjectID: sess.ProjectID,
+				ID:        match[1],
+			})
+		}
+	}
+
+	if len(refs) > 0 {
+		if err := o.memoryStore.BoostScoreBatch(ctx, refs, 0.05); err != nil {
+			o.logger.Warn("failed to boost cited memories", zap.Error(err))
+		} else {
+			o.logger.Info("boosted cited memories", zap.Int("count", len(refs)))
+		}
+	}
 }
