@@ -5,7 +5,6 @@ import (
 	"sort"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/agent/code_agent/internal/memory"
 	"github.com/stretchr/testify/assert"
@@ -54,17 +53,17 @@ func (f *fakeDistillerStore) Store(_ context.Context, m *memory.Memory) error {
 func (f *fakeDistillerStore) MarkDistilled(_ context.Context, ids []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	now := time.Now()
 	idSet := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		idSet[id] = struct{}{}
 	}
+	var newMems []memory.Memory
 	for i := range f.mems {
-		if _, ok := idSet[f.mems[i].ID]; ok && f.mems[i].DistilledAt == nil {
-			t := now
-			f.mems[i].DistilledAt = &t
+		if _, ok := idSet[f.mems[i].ID]; !ok {
+			newMems = append(newMems, f.mems[i])
 		}
 	}
+	f.mems = newMems
 	return nil
 }
 
@@ -178,16 +177,16 @@ func TestDistiller_MarksConsumedEpisodes(t *testing.T) {
 	_, err := distiller.Distill(context.Background(), "u", "p")
 	assert.NoError(t, err)
 
-	// All 3 source episodes should now carry DistilledAt timestamps.
+	// All 3 source episodes should now be deleted.
 	for _, id := range []string{"e1", "e2", "e3"} {
 		var found bool
 		for _, m := range store.mems {
 			if m.ID == id {
 				found = true
-				assert.NotNilf(t, m.DistilledAt, "episode %s should be marked as distilled", id)
+				break
 			}
 		}
-		assert.True(t, found, "episode %s should still exist after distill", id)
+		assert.False(t, found, "episode %s should be deleted after distill", id)
 	}
 }
 
