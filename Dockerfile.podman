@@ -1,0 +1,60 @@
+# ============================================================
+# Multi-stage build for production-grade Code Agent
+# ============================================================
+FROM public.ecr.aws/docker/library/golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=off
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-w -s -X main.Version=$(git describe --tags --always 2>/dev/null || echo v0.1.0)" \
+    -o /build/bin/code-agent \
+    ./cmd/agent
+
+# ============================================================
+FROM public.ecr.aws/docker/library/alpine:3.20 AS runtime
+
+RUN apk add --no-cache \
+        ca-certificates tzdata curl git bash \
+        nodejs npm \
+        python3 py3-pip \
+        build-base && \
+    rm -f /usr/lib/python*/EXTERNALLY-MANAGED && \
+    addgroup -S agent && adduser -S agent -G agent
+
+COPY --from=builder /usr/local/go /usr/local/go
+
+ENV PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin \
+    GOTOOLCHAIN=auto \
+    GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=off \
+    GOPATH=/home/agent/go \
+    GOCACHE=/home/agent/.cache/go-build \
+    GOMODCACHE=/home/agent/go/pkg/mod \
+    NPM_CONFIG_REGISTRY=https://registry.npmmirror.com \
+    NPM_CONFIG_CACHE=/home/agent/.npm \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+RUN mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build /home/agent/.npm && \
+    chown -R agent:agent /home/agent
+
+COPY --from=builder /build/bin/code-agent /usr/local/bin/code-agent
+COPY --from=builder /build/configs/config.example.yaml /etc/code-agent/configs/config.example.yaml
+
+USER agent
+WORKDIR /home/agent
+
+EXPOSE 8080 8081
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/healthz || exit 1
+
+ENTRYPOINT ["code-agent"]
+CMD ["--config", "/etc/code-agent/configs/config.yaml"]

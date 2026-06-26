@@ -34,3 +34,7 @@ README.md
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local binaries and logs
+agent_bin
+*.log
