@@ -1866,6 +1866,41 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 - **默认开启 distill 的代价**：每个有 ≥ MinEpisodicToTrigger 的 (user, project) 都会产生一次 LLM 调用，单 tick 上限由 `max_tenants_per_tick` 约束（默认 32），可控。
 - **不与 P0-4 反馈闭环交叉**：feedback 调 `BoostScoreBatch`，蒸馏调 `Store(memType=semantic)`，路径互不重叠。
 
+## §37. AUDIT-P2-4: Failure Severity Classification
+
+### 病征
+`hybrid.go::Store` 在 cold（source of truth）失败时返回 error 但**不打分级日志、不上报独立 metric**；`publishEvent` 失败仅 Warn；hot store 失败也是 Warn。对 PromQL 来说"agent 丢了一条记忆"和"agent 没把缓存暖好"长得一模一样——运维写不出可靠 alert rule。
+
+### 修复策略
+新增 `code_agent_memory_failures_total{tier, op, severity}` counter，把所有错误路径分到三档：
+
+| severity | 语义 | 典型 alert 表达式 |
+|---|---|---|
+| `warn`     | 降级但有补偿（hot 写失败但 cold 成功；blackboard publish 失败仅订阅方丢一条事件）| `rate(...{severity="warn"}[15m]) > 0.5` 持续 30 分钟 → 工单 |
+| `error`    | 降级且**无**补偿（cold retrieve 失败 → 单次召回不全；不一定丢数据，但召回质量退化）| `rate(...{severity="error"}[5m]) > 0` 持续 10 分钟 → 工单 |
+| `critical` | source-of-truth 写入失败 → 数据真的丢了（cold.Store 失败）| `rate(...{severity="critical"}[5m]) > 0` → page on-call |
+
+接线位置：
+- `hybrid.go::Store`：cold 失败 `critical`；hot 失败 `warn`
+- `hybrid.go::Retrieve` / `RetrieveByType` / `RetrieveCandidates` / `List`：cold 失败 `error`，hot 失败 `warn`
+- `hybrid.go::publishEvent`：失败 `warn`（blackboard）
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `internal/metrics/memory.go` | 新增 `MemoryFailuresTotal{tier, op, severity}` |
+| `internal/memory/hybrid.go` | 7 处 hot/cold/blackboard 失败路径上报 |
+| `internal/memory/failures_metric_test.go` | `TestMemoryFailuresTotal_LabelMatrix` 锁定标签矩阵 |
+
+### 验证
+- `go test ./internal/memory/... -run TestMemoryFailuresTotal`
+- Docker：`scripts/verify-audit-p2-4.sh` 启动后 curl `/metrics` 验证 counter 已注册；停掉 PG 容器、调用 `/api/v1/memory/retrieve`、再 curl `/metrics` 看 `failures_total{tier="cold",severity="error"}` 是否递增。
+
+### 设计取舍
+- **不引入 DLQ**：cold 失败意味着 PG 不可用，DLQ 写盘只是把"不可达"转嫁给本地磁盘——重启后仍然要回放，运维成本不低于直接重试上游请求。
+- **三档而非五档**：fatal / page / warn / debug / info 这种分级在工程上看起来精细，但实际报警只有「值班 vs 工单」两档，三档（warn/error/critical）刚好覆盖。
+- **不带 user_id 标签**：MemoryFailuresTotal 故意只到 op 级，避免高基数；如需 per-tenant 排查走日志 `user_id` 字段。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

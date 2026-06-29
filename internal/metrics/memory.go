@@ -410,4 +410,46 @@ var (
 		Name:      "citation_boost_total",
 		Help:      "Automatic score adjustments from [mem:id] citations in assistant replies",
 	}, []string{"source", "status"})
+
+	// MemoryFailuresTotal is the AUDIT-P2-4 alertable error-classification
+	// counter. Previously a hot-store error and a cold-store error were
+	// both logged at Warn / Error with no machine-readable severity, so
+	// "data was just lost" and "cache miss happened" looked identical in
+	// dashboards.
+	//
+	// Labels:
+	//   - tier:     "hot" | "cold" | "blackboard"
+	//   - op:       "store" | "retrieve" | "list" | "publish" | "touch" | "decay"
+	//   - severity: "warn"     -> degraded, compensating path exists (e.g. hot miss while cold is fine)
+	//               "error"    -> degraded with no compensating path (e.g. cold retrieve failed
+	//                             so dedup K-NN missed candidates this call)
+	//               "critical" -> primary write to source-of-truth (cold) failed; data was lost.
+	//                             PromQL rule of thumb: `rate(memory_failures_total{severity="critical"}[5m]) > 0` → page.
+	MemoryFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "code_agent",
+		Subsystem: "memory",
+		Name:      "failures_total",
+		Help:      "Memory subsystem failures by tier/op/severity (AUDIT-P2-4 alertable error classification)",
+	}, []string{"tier", "op", "severity"})
 )
+
+// init pre-creates every documented {tier, op, severity} child of
+// MemoryFailuresTotal so the counter is visible in /metrics from the
+// first scrape onward — without this, prometheus would only emit a
+// counter row after the *first* increment, so an alert rule referencing
+// `code_agent_memory_failures_total{severity="critical"} == 0` would
+// trigger spurious "no data" alerts on a healthy fresh deployment.
+func init() {
+	warm := []struct{ tier, op, severity string }{
+		{"cold", "store", "critical"},
+		{"hot", "store", "warn"},
+		{"cold", "retrieve", "error"},
+		{"hot", "retrieve", "warn"},
+		{"cold", "list", "error"},
+		{"hot", "list", "warn"},
+		{"blackboard", "publish", "warn"},
+	}
+	for _, w := range warm {
+		MemoryFailuresTotal.WithLabelValues(w.tier, w.op, w.severity).Add(0)
+	}
+}

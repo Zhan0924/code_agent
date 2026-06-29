@@ -102,7 +102,7 @@ func (h *HybridStore) embedText(ctx context.Context, text string) []float32 {
 	}
 	vecs, err := h.embedder.Embed(ctx, []string{text})
 	if err != nil || len(vecs) == 0 {
-		h.logger.Debug("embedding failed", zap.Error(err))
+		h.logger.Warn("embedding failed (retrieval quality degraded)", zap.Error(err))
 		return nil
 	}
 	return vecs[0]
@@ -172,18 +172,22 @@ func (h *HybridStore) Store(ctx context.Context, m *Memory) (retErr error) {
 	// New-insert path: cold first (source of truth), then hot (cache).
 	if h.cold != nil {
 		if err := h.cold.Store(m); err != nil {
-			// Critical: do NOT write hot if cold failed. Otherwise hot has
-			// a record that will silently disappear at TTL expiry.
+			// AUDIT-P2-4 critical: cold is the source of truth, so failing
+			// here means the memory is *lost* — no other layer compensates.
+			// Emit an Error log + failures_total{severity="critical"} so
+			// dashboards can page on `rate(...{severity="critical"}[5m]) > 0`.
+			metrics.MemoryFailuresTotal.WithLabelValues("cold", "store", "critical").Inc()
+			h.logger.Error("cold store write failed (memory lost, no compensating path)",
+				zap.Error(err), zap.String("id", m.ID))
 			return err
 		}
 	}
 	if h.hot != nil {
 		if err := h.hot.Store(ctx, m); err != nil {
-			// Non-fatal — cold has the truth. Note the asymmetry vs the
-			// previous code which logged at Debug; we bump to Warn so this
-			// shows up in production dashboards (cache miss rate signal).
-			h.logger.Warn("hot store write failed", zap.Error(err),
-				zap.String("id", m.ID))
+			// AUDIT-P2-4 warn: cold has the truth — cache miss rate signal.
+			metrics.MemoryFailuresTotal.WithLabelValues("hot", "store", "warn").Inc()
+			h.logger.Warn("hot store write failed (cold succeeded, cache miss only)",
+				zap.Error(err), zap.String("id", m.ID))
 		}
 	}
 
@@ -199,8 +203,12 @@ func (h *HybridStore) publishEvent(ctx context.Context, action string, m *Memory
 		return
 	}
 	if err := h.blackboard.Publish(ctx, action, m); err != nil {
-		h.logger.Debug("blackboard publish failed",
-			zap.String("action", action), zap.Error(err))
+		metrics.MemoryBlackboardPublishTotal.WithLabelValues(action, "err").Inc()
+		metrics.MemoryFailuresTotal.WithLabelValues("blackboard", "publish", "warn").Inc()
+		h.logger.Warn("blackboard publish failed (subscribers will miss event)",
+			zap.String("action", action),
+			zap.String("memory_id", m.ID),
+			zap.Error(err))
 	}
 }
 
@@ -265,7 +273,10 @@ func (h *HybridStore) Retrieve(ctx context.Context, userID, projectID, query str
 	if h.hot != nil {
 		ms, err := h.hot.RetrieveByQuery(ctx, userID, projectID, queryEmbedding, overFetch)
 		if err != nil {
-			h.logger.Debug("hot retrieve failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("hot", "retrieve", "warn").Inc()
+			h.logger.Warn("hot retrieve failed (falling back to cold-only)",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		} else {
 			hotMems = ms
 		}
@@ -273,7 +284,10 @@ func (h *HybridStore) Retrieve(ctx context.Context, userID, projectID, query str
 	if h.cold != nil {
 		ms, err := h.cold.RetrieveByVector(queryEmbedding, userID, projectID, overFetch)
 		if err != nil {
-			h.logger.Debug("cold retrieve failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("cold", "retrieve", "error").Inc()
+			h.logger.Error("cold retrieve failed (PG query error, results degraded)",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		} else {
 			coldMems = ms
 		}
@@ -333,14 +347,20 @@ func (h *HybridStore) RetrieveCandidates(ctx context.Context, userID, projectID 
 		if ms, err := h.hot.RetrieveByQuery(ctx, userID, projectID, embedding, limit); err == nil {
 			hotMems = ms
 		} else {
-			h.logger.Debug("dedup candidate hot lookup failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("hot", "retrieve", "warn").Inc()
+			h.logger.Warn("dedup candidate hot lookup failed",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		}
 	}
 	if h.cold != nil {
 		if ms, err := h.cold.RetrieveByVector(embedding, userID, projectID, limit); err == nil {
 			coldMems = ms
 		} else {
-			h.logger.Debug("dedup candidate cold lookup failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("cold", "retrieve", "error").Inc()
+			h.logger.Error("dedup candidate cold lookup failed (PG query error)",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		}
 	}
 
@@ -441,7 +461,10 @@ func (h *HybridStore) RetrieveByType(ctx context.Context, userID, projectID, mem
 		// Acceptable because hot is small (≤ 50 entries).
 		all, err := h.hot.RetrieveByQuery(ctx, userID, projectID, queryEmbedding, overFetch*2)
 		if err != nil {
-			h.logger.Debug("hot retrieve failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("hot", "retrieve", "warn").Inc()
+			h.logger.Warn("hot retrieve by type failed",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		} else {
 			hotMems = filterByType(all, memType, overFetch)
 		}
@@ -449,7 +472,10 @@ func (h *HybridStore) RetrieveByType(ctx context.Context, userID, projectID, mem
 	if h.cold != nil {
 		ms, err := h.cold.RetrieveByVectorAndType(queryEmbedding, userID, projectID, memType, overFetch)
 		if err != nil {
-			h.logger.Debug("cold retrieve failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("cold", "retrieve", "error").Inc()
+			h.logger.Error("cold retrieve by type failed (PG query error)",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		} else {
 			coldMems = ms
 		}
@@ -484,7 +510,10 @@ func (h *HybridStore) List(ctx context.Context, userID, projectID string, limit 
 	if h.hot != nil {
 		ms, err := h.hot.Retrieve(ctx, userID, projectID, limit)
 		if err != nil {
-			h.logger.Debug("hot list failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("hot", "list", "warn").Inc()
+			h.logger.Warn("hot list failed",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		} else {
 			hotMems = ms
 		}
@@ -492,7 +521,10 @@ func (h *HybridStore) List(ctx context.Context, userID, projectID string, limit 
 	if h.cold != nil {
 		ms, err := h.cold.Retrieve(userID, projectID, "", limit)
 		if err != nil {
-			h.logger.Debug("cold list failed", zap.Error(err))
+			metrics.MemoryFailuresTotal.WithLabelValues("cold", "list", "error").Inc()
+			h.logger.Error("cold list failed (PG query error)",
+				zap.String("user_id", userID),
+				zap.Error(err))
 		} else {
 			coldMems = ms
 		}
