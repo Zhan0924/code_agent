@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/agent/code_agent/internal/models"
 	"github.com/gin-gonic/gin"
 )
 
@@ -42,6 +45,68 @@ func (s *Server) handleTestMemory(c *gin.Context) {
 		"append_result": toolRes,
 		"replace_result": replaceRes,
 		"message": "Core memory tools executed successfully",
+	})
+}
+
+// handleTestCoreMemoryPII appends content containing a known secret via
+// core_memory_append and returns the persisted section text from Redis.
+// Dev-only smoke test for REAUDIT-P0-2 verification.
+func (s *Server) handleTestCoreMemoryPII(c *gin.Context) {
+	if s.rdb == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "redis not configured"})
+		return
+	}
+
+	userID := c.Query("user_id")
+	if userID == "" {
+		userID = "verify_reaudit_p0_2"
+	}
+	projectID := c.Query("project_id")
+	if projectID == "" {
+		projectID = "default"
+	}
+	section := c.DefaultQuery("section", "human_context")
+
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	ctx := models.WithSessionContext(c.Request.Context(), "", userID, projectID)
+
+	appendArgs := json.RawMessage(fmt.Sprintf(
+		`{"section":%q,"content":"my backup key is %s","scope":"project"}`,
+		section, secret,
+	))
+	if _, err := s.orchestrator.ToolRegistry().Execute(ctx, "core_memory_append", appendArgs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "core_memory_append failed: " + err.Error()})
+		return
+	}
+
+	redisKey := fmt.Sprintf("core_memory:project:%s:%s", userID, projectID)
+	raw, err := s.rdb.Get(c.Request.Context(), redisKey).Bytes()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "redis get failed: " + err.Error()})
+		return
+	}
+
+	var payload struct {
+		Sections map[string]struct {
+			Content string `json:"content"`
+		} `json:"sections"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unmarshal failed: " + err.Error()})
+		return
+	}
+
+	stored := ""
+	if sec, ok := payload.Sections[section]; ok {
+		stored = sec.Content
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user_id":    userID,
+		"project_id": projectID,
+		"section":    section,
+		"stored":     stored,
+		"masked":     !strings.Contains(stored, secret),
 	})
 }
 

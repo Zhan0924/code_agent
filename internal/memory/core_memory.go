@@ -15,6 +15,7 @@ import (
 type RedisCoreMemory struct {
 	client *redis.Client
 	logger *zap.Logger
+	masker *PIIMasker
 }
 
 // NewRedisCoreMemory creates a new CoreMemoryManager backed by Redis.
@@ -22,6 +23,7 @@ func NewRedisCoreMemory(client *redis.Client, logger *zap.Logger) *RedisCoreMemo
 	return &RedisCoreMemory{
 		client: client,
 		logger: logger.With(zap.String("component", "memory.core_memory")),
+		masker: NewPIIMasker(),
 	}
 }
 
@@ -168,9 +170,30 @@ func (r *RedisCoreMemory) AppendToSectionScoped(ctx context.Context, userID, pro
 	if sec.Content != "" {
 		sec.Content += "\n"
 	}
-	sec.Content += content
+	sec.Content += r.maskForPersist("core_memory_append", section, userID, projectID, scope, content)
 
 	return r.saveCoreMemory(ctx, scope, mem)
+}
+
+// maskForPersist applies PIIMasker before any core-memory write path.
+// All writers (tools, extractor auto-promote, future backfill) funnel here.
+func (r *RedisCoreMemory) maskForPersist(op, section, userID, projectID string, scope CoreMemoryScope, raw string) string {
+	if r.masker == nil {
+		return raw
+	}
+	masked := r.masker.Mask(raw)
+	if masked != raw && r.logger != nil {
+		r.logger.Info("core_memory content masked",
+			zap.String("audit_id", "REAUDIT-P0-2"),
+			zap.String("op", op),
+			zap.String("tenant.user_id", userID),
+			zap.String("tenant.project_id", projectID),
+			zap.String("scope", string(scope)),
+			zap.String("section", section),
+			zap.Bool("pii_masked", true),
+			zap.String("result", "ok"))
+	}
+	return masked
 }
 
 // ReplaceInSection replaces text in a project-scoped section (backward-compatible).
@@ -197,6 +220,7 @@ func (r *RedisCoreMemory) ReplaceInSectionScoped(ctx context.Context, userID, pr
 		return fmt.Errorf("old content not found in section %s (scope=%s)", section, scope)
 	}
 
-	sec.Content = strings.Replace(sec.Content, oldContent, newContent, 1)
+	maskedNew := r.maskForPersist("core_memory_replace", section, userID, projectID, scope, newContent)
+	sec.Content = strings.Replace(sec.Content, oldContent, maskedNew, 1)
 	return r.saveCoreMemory(ctx, scope, mem)
 }
