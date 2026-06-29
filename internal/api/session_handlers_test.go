@@ -109,6 +109,52 @@ func TestHandleMessageFeedback_NegativeBoost(t *testing.T) {
 	}
 }
 
+func TestHandleMessageFeedback_StructuredCitedIDs(t *testing.T) {
+	_, srv, sessionMgr, store, cleanup := newFeedbackHarness(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	sess, err := sessionMgr.Create(ctx, "alice", "p1")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	now := time.Now()
+	if err := store.Store(ctx, &memory.Memory{
+		ID: "mem-structured", UserID: "alice", ProjectID: "p1",
+		Type: memory.MemoryPreference, Content: "pref", Score: 0.5,
+		CreatedAt: now, LastAccessedAt: now,
+	}); err != nil {
+		t.Fatalf("store memory: %v", err)
+	}
+
+	if err := sessionMgr.AddMessage(ctx, sess.ID, models.Message{
+		Role:           models.RoleAssistant,
+		Content:        "sanitized answer without citation tags",
+		CitedMemoryIDs: []string{"mem-structured"},
+	}); err != nil {
+		t.Fatalf("add message: %v", err)
+	}
+
+	updated, err := sessionMgr.Get(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	msgID := updated.Messages[len(updated.Messages)-1].ID
+
+	url := srv.URL + "/api/v1/sessions/" + sess.ID + "/messages/" + msgID + "/feedback"
+	code, body := postFeedback(t, url, -1)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%v", code, body)
+	}
+	if body["cited_source"] != "structured" {
+		t.Fatalf("expected structured cited_source, got %v", body["cited_source"])
+	}
+	if int(body["memories_affected"].(float64)) != 1 {
+		t.Fatalf("expected 1 memory affected, got %v", body)
+	}
+}
+
 func TestHandleMessageFeedback_NoMemoryStore(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {

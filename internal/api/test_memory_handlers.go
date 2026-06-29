@@ -9,6 +9,7 @@ import (
 	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 // NOTE: these endpoints exist for local smoke-tests of memory subsystem
@@ -297,6 +298,61 @@ func (s *Server) handleTestCoreMemoryDedup(c *gin.Context) {
 		"line_hits":   strings.Count(stored, line),
 		"deduped":     deduped,
 		"stored":      stored,
+	})
+}
+
+// handleTestFeedbackCitedResolve exercises REAUDIT-P1-4 structured cited_memory_ids
+// resolution when assistant content no longer contains [mem:id] tags.
+func (s *Server) handleTestFeedbackCitedResolve(c *gin.Context) {
+	if s.sessionMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session manager not configured"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	userID := c.DefaultQuery("user_id", "verify_reaudit_p1_4")
+	projectID := c.DefaultQuery("project_id", "default")
+	memID := c.DefaultQuery("mem_id", "mem-structured-test")
+
+	sess, err := s.sessionMgr.Create(ctx, userID, projectID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "session create failed: " + err.Error()})
+		return
+	}
+
+	if err := s.sessionMgr.AddMessage(ctx, sess.ID, models.Message{
+		Role:           models.RoleAssistant,
+		Content:        "answer stripped of markdown citations",
+		CitedMemoryIDs: []string{memID},
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "add message failed: " + err.Error()})
+		return
+	}
+
+	updated, err := s.sessionMgr.Get(ctx, sess.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "get session failed: " + err.Error()})
+		return
+	}
+	msg := updated.Messages[len(updated.Messages)-1]
+	ids, source := memory.ResolveCitedMemoryIDs(msg.CitedMemoryIDs, msg.Content)
+	if len(ids) == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "no cited ids resolved"})
+		return
+	}
+
+	s.logger.Info("feedback cited memory ids resolved",
+		zap.String("audit_id", "REAUDIT-P1-4"),
+		zap.String("op", "feedback_cited_resolve"),
+		zap.String("cited_source", source),
+		zap.Int("cited_count", len(ids)))
+
+	c.JSON(http.StatusOK, gin.H{
+		"audit_id":     "REAUDIT-P1-4",
+		"session_id":   sess.ID,
+		"cited_source": source,
+		"cited_ids":    ids,
+		"resolved":     source == "structured" && len(ids) > 0,
 	})
 }
 

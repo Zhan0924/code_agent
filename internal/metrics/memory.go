@@ -403,6 +403,15 @@ var (
 		Help:      "User feedback events that adjusted cited memory scores",
 	}, []string{"direction"})
 
+	// MemoryFeedbackCitedMissTotal counts feedback events where no cited memory
+	// IDs could be resolved from structured fields or content regex (REAUDIT-P1-4).
+	MemoryFeedbackCitedMissTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "code_agent",
+		Subsystem: "memory",
+		Name:      "feedback_cited_miss_total",
+		Help:      "User feedback on assistant messages with zero resolvable cited memory IDs",
+	})
+
 	// MemoryCitationBoostTotal counts automatic score bumps from LLM citations.
 	MemoryCitationBoostTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "code_agent",

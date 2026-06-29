@@ -418,9 +418,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 		now := time.Now()
 		task.CompletedAt = &now
 		o.persistTaskState(ctx, task.ID, models.TaskStateCompleted)
-		_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
-			Role: models.RoleAssistant, Content: resp.Message,
-		})
+		_ = o.sessionMgr.AddMessage(ctx, sessionID, assistantMessage(resp.Message, nil))
 		return resp, nil
 	}
 
@@ -442,9 +440,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	now := time.Now()
 	task.CompletedAt = &now
 	o.persistTaskState(ctx, task.ID, models.TaskStateCompleted)
-	_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
-		Role: models.RoleAssistant, Content: response,
-	})
+	_ = o.sessionMgr.AddMessage(ctx, sessionID, assistantMessage(response, nil))
 
 	// Extract memories from this interaction (async, non-blocking).
 	// extractMemoriesAsync produces typed memories via the LLM (preference
@@ -472,10 +468,7 @@ func (o *Orchestrator) persistFailureAssistant(ctx context.Context, sessionID, t
 	if o.sessionMgr == nil || sessionID == "" {
 		return
 	}
-	if err := o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
-		Role:    models.RoleAssistant,
-		Content: message,
-	}); err != nil {
+	if err := o.sessionMgr.AddMessage(ctx, sessionID, assistantMessage(message, nil)); err != nil {
 		o.logger.Warn("failed to persist failure-state assistant message",
 			zap.String("session_id", sessionID),
 			zap.String("task_id", taskID),
@@ -803,9 +796,7 @@ func (o *Orchestrator) suspendForApprovalInProcess(ctx context.Context, task *mo
 					o.logger.Error("post-approval execution failed", zap.Error(err))
 					return
 				}
-				_ = o.sessionMgr.AddMessage(waitCtx, task.SessionID, models.Message{
-					Role: models.RoleAssistant, Content: result,
-				})
+				_ = o.sessionMgr.AddMessage(waitCtx, task.SessionID, assistantMessage(result, nil))
 				o.recordTaskEpisodeAsync(waitCtx, task.SessionID, task.UserInput, result, toolsUsed)
 			} else {
 				metrics.HITLApprovalTotal.WithLabelValues("rejected").Inc()
@@ -922,9 +913,7 @@ func (o *Orchestrator) ProcessMessageStream(ctx context.Context, sessionID, user
 			if chunk.Done {
 				// Store complete response in session
 				if fullContent.Len() > 0 {
-					_ = o.sessionMgr.AddMessage(ctx, sessionID, models.Message{
-						Role: models.RoleAssistant, Content: fullContent.String(),
-					})
+					_ = o.sessionMgr.AddMessage(ctx, sessionID, assistantMessage(fullContent.String(), nil))
 				}
 			}
 		}
@@ -1188,9 +1177,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 						}
 					}
 				}
-				_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
-					Role: models.RoleAssistant, Content: result.content,
-				})
+				_ = o.sessionMgr.AddMessage(workCtx, sessionID, assistantMessage(result.content, nil))
 				o.boostCitedMemories(workCtx, sessionID, result.content, injectedMemIDs)
 				o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
 				o.recordTaskEpisodeAsync(workCtx, sessionID, task.UserInput, result.content, result.toolsUsed)

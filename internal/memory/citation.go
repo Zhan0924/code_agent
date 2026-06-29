@@ -40,3 +40,15 @@ func TouchRefsFromCitationIDs(userID, projectID string, ids []string) []TouchRef
 	}
 	return refs
 }
+
+// ResolveCitedMemoryIDs prefers persisted cited_memory_ids on the message,
+// falling back to regex parsing of content (REAUDIT-P1-4).
+func ResolveCitedMemoryIDs(stored []string, content string) (ids []string, source string) {
+	if len(stored) > 0 {
+		return stored, "structured"
+	}
+	if ids = ParseCitationIDs(content); len(ids) > 0 {
+		return ids, "regex_fallback"
+	}
+	return nil, "none"
+}

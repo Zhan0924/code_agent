@@ -165,8 +165,9 @@ type Message struct {
 	ToolCallID   string          `json:"tool_call_id,omitempty"`
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	Timestamp    time.Time       `json:"timestamp"`
-	TokenCount   int             `json:"token_count"`
-	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+	TokenCount       int             `json:"token_count"`
+	CitedMemoryIDs   []string        `json:"cited_memory_ids,omitempty"`
+	CacheControl     *CacheControl   `json:"cache_control,omitempty"`
 	Pinned       bool            `json:"pinned,omitempty"`
 }
 

@@ -97,11 +97,24 @@ func (s *Server) handleMessageFeedback(c *gin.Context) {
 		return
 	}
 
-	ids := memory.ParseCitationIDs(msg.Content)
+	ids, source := memory.ResolveCitedMemoryIDs(msg.CitedMemoryIDs, msg.Content)
 	if len(ids) == 0 {
-		c.JSON(http.StatusOK, gin.H{"status": "recorded", "memories_affected": 0})
+		metrics.MemoryFeedbackCitedMissTotal.Inc()
+		s.logger.Warn("feedback with no cited memory ids",
+			zap.String("audit_id", "REAUDIT-P1-4"),
+			zap.String("op", "feedback_cited_miss"),
+			zap.String("session_id", sessionID),
+			zap.String("message_id", messageID),
+			zap.String("cited_source", source),
+			zap.String("result", "miss"))
+		c.JSON(http.StatusOK, gin.H{"status": "recorded", "memories_affected": 0, "cited_source": source})
 		return
 	}
+	s.logger.Info("feedback cited memory ids resolved",
+		zap.String("audit_id", "REAUDIT-P1-4"),
+		zap.String("op", "feedback_cited_resolve"),
+		zap.String("cited_source", source),
+		zap.Int("cited_count", len(ids)))
 
 	sess, err := s.sessionMgr.Get(c.Request.Context(), sessionID)
 	if err != nil {
@@ -128,5 +141,6 @@ func (s *Server) handleMessageFeedback(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":            "recorded",
 		"memories_affected": len(refs),
+		"cited_source":      source,
 	})
 }

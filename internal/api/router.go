@@ -385,6 +385,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/test_embedder_degrade", s.handleTestEmbedderDegrade)
 		v1.POST("/test_tenant_normalize", s.handleTestTenantNormalize)
 		v1.POST("/test_core_memory_dedup", s.handleTestCoreMemoryDedup)
+		v1.POST("/test_feedback_cited_resolve", s.handleTestFeedbackCitedResolve)
 
 		// HMAC-protected webhook endpoints (§3 security hardening)
 		webhooks := v1.Group("/webhooks")
