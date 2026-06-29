@@ -576,6 +576,9 @@ func main() {
 		if cfg.Memory.DedupCandidateLimit > 0 {
 			memoryExtractor.SetDedupCandidateLimit(cfg.Memory.DedupCandidateLimit)
 		}
+		if cfg.Memory.CorePromoteThreshold > 0 {
+			memoryExtractor.SetCorePromoteThreshold(cfg.Memory.CorePromoteThreshold)
+		}
 		orch.SetMemoryExtractor(memoryExtractor)
 		logger.Info("memory extractor wired into orchestrator",
 			zap.Bool("with_embedder_dedup", embedder != nil),
@@ -605,6 +608,7 @@ func main() {
 			zap.Int("promote_queue_size", cfg.Memory.Promote.QueueSize),
 			zap.Bool("demote_enabled", cfg.Memory.Demote.Enabled),
 			zap.Float64("demote_threshold", cfg.Memory.Demote.Threshold),
+			zap.Float64("core_promote_threshold", memoryExtractor.CorePromoteThreshold()),
 		)
 
 		// ─── Active Memory Tools (MemGPT-style core memory) ─────────────────

@@ -170,7 +170,20 @@ func (r *RedisCoreMemory) AppendToSectionScoped(ctx context.Context, userID, pro
 	if sec.Content != "" {
 		sec.Content += "\n"
 	}
-	sec.Content += r.maskForPersist("core_memory_append", section, userID, projectID, scope, content)
+	masked := r.maskForPersist("core_memory_append", section, userID, projectID, scope, content)
+	if sectionContainsLine(sec.Content, masked) {
+		if r.logger != nil {
+			r.logger.Info("core_memory append skipped duplicate content",
+				zap.String("audit_id", "REAUDIT-P1-3"),
+				zap.String("op", "core_memory_dedup_skip"),
+				zap.String("tenant.user_id", userID),
+				zap.String("tenant.project_id", projectID),
+				zap.String("section", section),
+				zap.String("result", "skipped"))
+		}
+		return nil
+	}
+	sec.Content += masked
 
 	return r.saveCoreMemory(ctx, scope, mem)
 }
@@ -194,6 +207,21 @@ func (r *RedisCoreMemory) maskForPersist(op, section, userID, projectID string, 
 			zap.String("result", "ok"))
 	}
 	return masked
+}
+
+// sectionContainsLine reports whether normalized content already exists as a
+// line in the section body (REAUDIT-P1-3 dedup vs tool append / auto-promote).
+func sectionContainsLine(sectionBody, line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	for _, existing := range strings.Split(sectionBody, "\n") {
+		if strings.TrimSpace(existing) == line {
+			return true
+		}
+	}
+	return false
 }
 
 // ReplaceInSection replaces text in a project-scoped section (backward-compatible).

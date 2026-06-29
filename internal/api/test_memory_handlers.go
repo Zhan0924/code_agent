@@ -230,6 +230,76 @@ func (s *Server) handleTestTenantNormalize(c *gin.Context) {
 	})
 }
 
+// handleTestCoreMemoryDedup appends the same persona line twice and returns
+// the persisted section text. Dev-only smoke test for REAUDIT-P1-3 verification.
+func (s *Server) handleTestCoreMemoryDedup(c *gin.Context) {
+	if s.rdb == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "redis not configured"})
+		return
+	}
+
+	userID := c.Query("user_id")
+	if userID == "" {
+		userID = "verify_reaudit_p1_3"
+	}
+	projectID := c.Query("project_id")
+	if projectID == "" {
+		projectID = "default"
+	}
+	section := c.DefaultQuery("section", "persona")
+	line := c.DefaultQuery("line", "prefers concise technical answers")
+
+	ctx := models.WithSessionContext(c.Request.Context(), "", userID, projectID)
+	appendArgs := json.RawMessage(fmt.Sprintf(
+		`{"section":%q,"content":%q,"scope":"project"}`,
+		section, line,
+	))
+
+	if _, err := s.orchestrator.ToolRegistry().Execute(ctx, "core_memory_append", appendArgs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "first append failed: " + err.Error()})
+		return
+	}
+	if _, err := s.orchestrator.ToolRegistry().Execute(ctx, "core_memory_append", appendArgs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "second append failed: " + err.Error()})
+		return
+	}
+
+	redisKey := fmt.Sprintf("core_memory:project:%s:%s", userID, projectID)
+	raw, err := s.rdb.Get(c.Request.Context(), redisKey).Bytes()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "redis get failed: " + err.Error()})
+		return
+	}
+
+	var payload struct {
+		Sections map[string]struct {
+			Content string `json:"content"`
+		} `json:"sections"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unmarshal failed: " + err.Error()})
+		return
+	}
+
+	stored := ""
+	if sec, ok := payload.Sections[section]; ok {
+		stored = sec.Content
+	}
+	lines := strings.Split(strings.TrimSpace(stored), "\n")
+	deduped := strings.Count(stored, line) == 1
+
+	c.JSON(http.StatusOK, gin.H{
+		"audit_id":    "REAUDIT-P1-3",
+		"user_id":     userID,
+		"project_id":  projectID,
+		"section":     section,
+		"line_count":  len(lines),
+		"line_hits":   strings.Count(stored, line),
+		"deduped":     deduped,
+		"stored":      stored,
+	})
+}
+
 // handleTestDecay manually triggers a decay sweep. Useful for ops to confirm
 // the cold-tier path is functional without waiting for the scheduler tick.
 // Decay everything older than 0 (== all) by factor 0.5; aggressive on

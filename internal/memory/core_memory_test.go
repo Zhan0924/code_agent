@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -66,4 +67,25 @@ func TestRedisCoreMemory_PIIMaskOnReplace(t *testing.T) {
 	got := mem.Sections["persona"].Content
 	assert.NotContains(t, got, secret)
 	assert.Contains(t, got, "[REDACTED:API_KEY]")
+}
+
+func TestRedisCoreMemory_AppendDedupSkipsDuplicateLine(t *testing.T) {
+	cm, mr := newTestRedisCoreMemory(t)
+	ctx := context.Background()
+	const (
+		userID    = "u_dedup"
+		projectID = "p_dedup"
+		line      = "prefers concise answers"
+	)
+
+	require.NoError(t, cm.AppendToSectionScoped(ctx, userID, projectID, CoreScopeProject, "persona", line))
+	require.NoError(t, cm.AppendToSectionScoped(ctx, userID, projectID, CoreScopeProject, "persona", line))
+
+	raw, err := mr.Get("core_memory:project:u_dedup:p_dedup")
+	require.NoError(t, err)
+
+	var mem CoreMemory
+	require.NoError(t, json.Unmarshal([]byte(raw), &mem))
+	got := mem.Sections["persona"].Content
+	assert.Equal(t, 1, strings.Count(got, line), "duplicate append must not add a second copy of the line")
 }

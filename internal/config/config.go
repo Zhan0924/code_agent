@@ -154,6 +154,10 @@ type MemoryConfig struct {
 
 	// EpisodicGC 控制周期性清理过期的 episodic memory。
 	EpisodicGC MemoryEpisodicGCConfig `mapstructure:"episodic_gc"`
+
+	// CorePromoteThreshold 是 Extractor 自动晋升 Core Memory 的 importance
+	// 下限（preference/decision）。默认 0.9；见 docs/architecture/25_memory.md §34。
+	CorePromoteThreshold float64 `mapstructure:"core_promote_threshold"`
 }
 
 // MemoryEpisodicGCConfig configures the periodic deletion of old episodic memories

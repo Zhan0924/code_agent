@@ -49,6 +49,10 @@ const defaultDedupCandidateLimit = 30
 // not a typo in dedup_candidate_limit.
 const minDedupCandidateLimit = 5
 
+// DefaultCorePromoteThreshold is the Extractor auto-promote importance floor
+// for preference/decision memories (REAUDIT-P1-3).
+const DefaultCorePromoteThreshold = 0.9
+
 // maxDedupCandidateLimit is the operator-facing ceiling. Matches
 // HybridStore.dedupCandidateLimitCap; duplicated here so misconfiguration
 // is rejected at the Extractor boundary instead of silently clamped
@@ -70,6 +74,7 @@ type Extractor struct {
 	dedupCandidateLimit int      // P1 #9: K for the dedup near-neighbor lookup
 	piiMasker           *PIIMasker
 	corePromoter        CorePromoter
+	corePromoteThreshold float64
 }
 
 // NewExtractor creates a memory extractor.
@@ -79,9 +84,10 @@ func NewExtractor(store MemoryStorer, llmCaller LLMCaller, logger *zap.Logger) *
 		store:               store,
 		llm:                 llmCaller,
 		logger:              logger.With(zap.String("component", "memory.extractor")),
-		maxPerRun:           10, // LLM occasionally over-produces; cap at 10 strong signals
-		dedupCandidateLimit: defaultDedupCandidateLimit,
-		piiMasker:           NewPIIMasker(),
+		maxPerRun:            10, // LLM occasionally over-produces; cap at 10 strong signals
+		dedupCandidateLimit:  defaultDedupCandidateLimit,
+		piiMasker:            NewPIIMasker(),
+		corePromoteThreshold: DefaultCorePromoteThreshold,
 	}
 }
 
@@ -89,6 +95,21 @@ func NewExtractor(store MemoryStorer, llmCaller LLMCaller, logger *zap.Logger) *
 func (e *Extractor) WithCorePromoter(p CorePromoter) *Extractor {
 	e.corePromoter = p
 	return e
+}
+
+// SetCorePromoteThreshold overrides the auto-promote importance floor (default 0.9).
+func (e *Extractor) SetCorePromoteThreshold(threshold float64) {
+	if threshold > 0 && threshold <= 1 {
+		e.corePromoteThreshold = threshold
+	}
+}
+
+// CorePromoteThreshold returns the effective auto-promote floor.
+func (e *Extractor) CorePromoteThreshold() float64 {
+	if e.corePromoteThreshold <= 0 {
+		return DefaultCorePromoteThreshold
+	}
+	return e.corePromoteThreshold
 }
 
 // SetEmbedder enables embedding-based dedup (much more accurate than Jaccard
@@ -304,7 +325,8 @@ func (e *Extractor) ExtractFromInteraction(ctx context.Context, userID, projectI
 			stored++
 			
 			// Auto-promote high-importance preferences to Core Memory (AUDIT-P1-4)
-			if e.corePromoter != nil && c.Importance >= 0.9 && (memType == MemoryPreference || memType == MemoryDecision) {
+			threshold := e.CorePromoteThreshold()
+			if e.corePromoter != nil && c.Importance >= threshold && (memType == MemoryPreference || memType == MemoryDecision) {
 				go func(content string) {
 					// Use background context as the original ctx might cancel when the HTTP request finishes
 					bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -312,7 +334,11 @@ func (e *Extractor) ExtractFromInteraction(ctx context.Context, userID, projectI
 					if err := e.corePromoter.AppendToSectionScoped(bgCtx, userID, projectID, CoreScopeProject, "persona", content); err != nil {
 						e.logger.Debug("failed to auto-promote core memory", zap.Error(err))
 					} else {
-						e.logger.Info("auto-promoted memory to core", zap.String("content", truncate(content, 80)))
+						e.logger.Info("auto-promoted memory to core",
+							zap.String("audit_id", "REAUDIT-P1-3"),
+							zap.String("op", "core_auto_promote"),
+							zap.Float64("threshold", threshold),
+							zap.String("content", truncate(content, 80)))
 					}
 				}(c.Content)
 			}

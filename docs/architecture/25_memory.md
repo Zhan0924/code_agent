@@ -1802,6 +1802,7 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 | `conflict.max_conflicts` | 32 | `memory_dedup_batch_size` | P95 = 32 → 截断风险 | 提高至 64 |
 | `decay.factor` | 0.95 | `memory_decay_affected_count` | 每轮 0 → factor 太保守 | 降至 0.90 |
 | `demote.threshold` | 0.3 | `memory_demote_total{tier=hot}` | 持续为 0 → 阈值过低 | 提高至 0.35 观察热缓存占用 |
+| `core_promote_threshold` | 0.9 | 启动日志 `core_promote_threshold` + `core_auto_promote` / `core_memory_dedup_skip` | persona 冗余行堆积 → 阈值过低或 dedup 未生效 | 提高至 0.92 减少 auto-promote；检查 dedup skip 日志 |
 
 ## §35. AUDIT-P0-1: Citation Feedback Loop（召回 vs 使用）
 
