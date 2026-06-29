@@ -552,6 +552,7 @@ func main() {
 	var (
 		memoryDecayStop   func()
 		memoryDistillStop func()
+		memoryEpisodicGCStop func()
 		memoryAccessStop  func()
 		memoryPromoteStop func()
 	)
@@ -643,6 +644,21 @@ func main() {
 				zap.Duration("interval", cfg.Memory.Distill.Interval),
 				zap.Int("targets", len(cfg.Memory.Distill.Targets)))
 		}
+
+		if cfg.Memory.EpisodicGC.Enabled {
+			gcCtx, cancelGC := context.WithCancel(context.Background())
+			memoryEpisodicGCStop = cancelGC
+			go runEpisodicGCLoop(
+				gcCtx,
+				memAdapter.HybridStore(),
+				cfg.Memory.EpisodicGC,
+				logger,
+			)
+			logger.Info("episodic gc scheduler started",
+				zap.Duration("interval", cfg.Memory.EpisodicGC.Interval),
+				zap.Duration("older_than", cfg.Memory.EpisodicGC.OlderThan))
+		}
+
 
 		// ─── Async Access Batcher (read-path Touch) ─────────────────────
 		// Without this, every Retrieve returned memories WITHOUT advancing
@@ -980,6 +996,9 @@ func main() {
 	// will complete its current iteration before the goroutine exits.
 	if memoryDistillStop != nil {
 		memoryDistillStop()
+	}
+	if memoryEpisodicGCStop != nil {
+		memoryEpisodicGCStop()
 	}
 	if memoryDecayStop != nil {
 		memoryDecayStop()

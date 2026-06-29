@@ -809,6 +809,14 @@ func (h *HybridStore) MarkDistilled(ctx context.Context, ids []string) error {
 	return h.cold.MarkDistilled(ctx, ids)
 }
 
+func (h *HybridStore) DeleteOldEpisodic(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if h.cold == nil {
+		return 0, nil
+	}
+	return h.cold.DeleteOldEpisodic(ctx, olderThan)
+}
+
+
 // ListActiveDistillTenants delegates to cold (PG owns the GROUP BY index).
 // Hot tier doesn't store cross-tenant aggregates, so there's nothing to
 // fall back to: with cold==nil we return nil/nil rather than ranging over

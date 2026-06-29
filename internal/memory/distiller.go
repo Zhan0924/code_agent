@@ -38,6 +38,7 @@ type DistillerStore interface {
 	Store(ctx context.Context, m *Memory) error
 	MarkDistilled(ctx context.Context, ids []string) error
 	ListActiveDistillTenants(ctx context.Context, minEpisodic, limit int) ([]TenantRef, error)
+	DeleteOldEpisodic(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
 // DistillerOptions tunes the consolidation pass without forcing callers to

@@ -290,6 +290,44 @@ func runMemoryDistillLoop(
 	}
 }
 
+func runEpisodicGCLoop(ctx context.Context, store memory.DistillerStore, cfg config.MemoryEpisodicGCConfig, logger *zap.Logger) {
+	logger = logger.With(zap.String("component", "memory.episodic.gc"))
+
+	if !cfg.Enabled {
+		logger.Debug("episodic gc disabled; scheduler exiting")
+		return
+	}
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = 24 * time.Hour
+	}
+	olderThan := cfg.OlderThan
+	if olderThan <= 0 {
+		olderThan = 30 * 24 * time.Hour
+	}
+
+	timer := time.NewTimer(10 * time.Second) // offset start
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("episodic gc scheduler stopping")
+			return
+		case <-timer.C:
+		}
+
+		deleted, err := store.DeleteOldEpisodic(ctx, olderThan)
+		if err != nil {
+			logger.Error("episodic gc failed", zap.Error(err))
+		} else if deleted > 0 {
+			logger.Info("episodic gc cycle complete", zap.Int64("deleted", deleted), zap.Duration("older_than", olderThan))
+		}
+
+		timer.Reset(interval)
+	}
+}
+
 // buildDistillTenants assembles the per-tick distill list: static Targets
 // (forced inclusion) merged with PG-discovered active tenants, de-duped
 // and capped. Pulled out so runMemoryDistillLoop stays linear.
