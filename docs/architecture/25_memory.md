@@ -1723,6 +1723,18 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 - 通过 `go test -v ./internal/memory -run TestPGCold_Integration` (兼容 Podman `TESTCONTAINERS_RYUK_DISABLED=true`)。
 - 覆盖率包含了 `DedupTx` 事务删除逻辑、`RetrieveByVectorAndType` 的过滤与 HNSW 近似搜索、`Decay` 的数学衰减。
 
+## §28. AUDIT-P0-4: Session-Memory RLHF-lite Bridge
+
+### 病征
+以往的架构中 Session 与 Memory 完全解耦。用户在会话中对 Agent 回复给出的反馈（如“不要这样回答”），无法反馈至内存系统，导致带来错误回答的记忆无法自动降权。
+
+### 修复策略
+增加了一条反馈桥梁：解析助手回复中的 `[mem:<id>]` 引用，当收到负反馈时，对被引用的 Memory 执行降权（BoostScoreBatch -0.2）。
+
+### 关键接口变更
+- `internal/api/session_handlers.go`: 新增 `POST /sessions/:id/messages/:message_id/feedback` API，用于接收针对特定消息的反馈（score < 0 代表踩）。
+- `internal/session/manager.go`: 新增 `GetMessage` 用于获取特定消息的原文，以供正则表达式匹配出引用的记忆 ID。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。
