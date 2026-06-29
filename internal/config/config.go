@@ -151,6 +151,17 @@ type MemoryConfig struct {
 	// Demote 控制 Decay 路径的 hot 主动驱逐（P1 #8）。关闭后 hot 副本
 	// 即使衰减到 0.05 分仍占用 hot 24h 直到 TTL，污染 tier-1 召回。
 	Demote MemoryDemoteConfig `mapstructure:"demote"`
+
+	// EpisodicGC 控制周期性清理过期的 episodic memory。
+	EpisodicGC MemoryEpisodicGCConfig `mapstructure:"episodic_gc"`
+}
+
+// MemoryEpisodicGCConfig configures the periodic deletion of old episodic memories
+// to prevent infinite bloat when Distiller is disabled or tenant lacks enough episodes.
+type MemoryEpisodicGCConfig struct {
+	Enabled   bool          `mapstructure:"enabled"`
+	Interval  time.Duration `mapstructure:"interval"`
+	OlderThan time.Duration `mapstructure:"older_than"`
 }
 
 // MemoryPromoteConfig 配置 cold→hot 异步回填批处理器。
@@ -551,6 +562,21 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.shutdown_timeout", "15s")
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")
+
+	// AUDIT-P0-2: distillation + episodic GC default ON. Operators who
+	// truly want the half-dead state (smoke tests, cost-sensitive CI)
+	// must explicitly set memory.distill.enabled=false in YAML. Without
+	// these defaults a config.yaml missing the section entirely (the
+	// common case for new clusters) silently disables both schedulers.
+	v.SetDefault("memory.distill.enabled", true)
+	v.SetDefault("memory.distill.interval", "6h")
+	v.SetDefault("memory.distill.max_episodic_per_run", 50)
+	v.SetDefault("memory.distill.min_episodic_to_trigger", 3)
+	v.SetDefault("memory.distill.auto_discover", true)
+	v.SetDefault("memory.distill.max_tenants_per_tick", 32)
+	v.SetDefault("memory.episodic_gc.enabled", true)
+	v.SetDefault("memory.episodic_gc.interval", "24h")
+	v.SetDefault("memory.episodic_gc.older_than", "720h")
 
 	// Read config file
 	if configPath != "" {

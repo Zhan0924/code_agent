@@ -238,7 +238,11 @@ memory:
     older_than: 720h # 30 days
     factor: 0.95
   distill:
-    enabled: false
+    # AUDIT-P0-2: default ON so episodic memories don't pile up as the
+    # "half-dead" state described in 25_memory.md §36. Disable only for
+    # smoke tests or single-shot CI where the LLM cost matters more than
+    # cross-session learning.
+    enabled: true
     interval: 6h
     max_episodic_per_run: 50
     min_episodic_to_trigger: 3
@@ -246,3 +250,7 @@ memory:
     max_tenants_per_tick: 32
     min_episodic_for_discovery: 0
     targets: []
+  episodic_gc:
+    enabled: true
+    interval: 24h
+    older_than: 720h # 30 days

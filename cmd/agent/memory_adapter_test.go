@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/agent/code_agent/internal/config"
 	"github.com/agent/code_agent/internal/memory"
@@ -28,6 +29,9 @@ func (f *fakeDiscoverStore) ListByType(_ context.Context, _, _ string, _ memory.
 func (f *fakeDiscoverStore) Store(_ context.Context, _ *memory.Memory) error { return nil }
 func (f *fakeDiscoverStore) MarkDistilled(_ context.Context, _ []string) error {
 	return nil
+}
+func (f *fakeDiscoverStore) DeleteOldEpisodic(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
 }
 func (f *fakeDiscoverStore) ListActiveDistillTenants(_ context.Context, minEpisodic, limit int) ([]memory.TenantRef, error) {
 	f.gotMin = minEpisodic

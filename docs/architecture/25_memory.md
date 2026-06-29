@@ -1828,6 +1828,38 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 - **+0.05 轻量 boost**：避免单次引用过度放大；用户显式 feedback（P0-4）幅度更大（±0.1/0.2）。
 - **LLM 引用非强制**：机制就绪，是否 cite 取决于模型；无 citation 时不 boost。
 
+## §36. AUDIT-P0-2: Distiller Half-Dead State
+
+### 病征
+- `configs/config.example.yaml::memory.distill.enabled` 默认 `false`，运营直接复制 example → 蒸馏永远不跑，episodic 永远不会被合并成 semantic memory。
+- `PGCold.DeleteOldEpisodic` 原实现仅按 `created_at < cutoff` 删除，无视 `distilled_at`。当 Distiller 处于半死状态时，episodic 在过 30d 后会被直接销毁，等于「Distiller 还没跑就把原始数据丢了」。
+- `fakeDistillerStore` / `fakeDiscoverStore` 缺 `DeleteOldEpisodic` 方法，导致 `go vet ./...` 全包失败。
+
+### 修复策略
+1. **Distill 默认开启**：`config.example.yaml` 将 `distill.enabled` 改为 `true`，并加注释解释为何不应默认关闭（参见本节）。
+2. **GC 安全契约**：`PGCold.DeleteOldEpisodic` SQL 改为 `WHERE type='episodic' AND distilled_at IS NOT NULL AND distilled_at < $1`。未蒸馏的 episodic 永久保留，等待 Distiller 处理后再走 GC 路径，彻底杜绝「Distiller 关闭 + GC 激活」时的数据丢失。
+3. **测试桩补全**：`fakeDistillerStore.DeleteOldEpisodic` 实现 distilled-only 语义；`fakeDiscoverStore.DeleteOldEpisodic` 给出 noop 桩，恢复 `go vet ./...`。
+4. **新增覆盖**：`tests/internal/memory/episodic_gc_test.go::TestDeleteOldEpisodic_OnlyTouchesDistilled` 同时验证 4 个分支（旧+distilled→删 / 旧+未蒸馏→保留 / 新+distilled→保留 / 非 episodic→保留）。
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `internal/memory/pg_cold.go` | `DeleteOldEpisodic` SQL 限定 `distilled_at IS NOT NULL AND distilled_at < $1` |
+| `configs/config.example.yaml` | `memory.distill.enabled: true` + 解释注释 |
+| `tests/internal/memory/distiller_test.go` | 加 `fakeDistillerStore.DeleteOldEpisodic` 实现 |
+| `cmd/agent/memory_adapter_test.go` | 加 `fakeDiscoverStore.DeleteOldEpisodic` noop 桩 |
+| `tests/internal/memory/episodic_gc_test.go` | 新增 safety 单测 |
+
+### 验证
+- `go vet ./...`（全包通过，包括 cmd/agent 与 tests/internal/memory）。
+- `go test ./tests/internal/memory/... -run 'DeleteOldEpisodic|Distiller'`。
+- Docker：`scripts/verify-audit-p0-2.sh` 通过 `agent-postgres` 种子两条 episodic（一条 distilled、一条未蒸馏），直接调用 SQL 触发 GC 行为等价（运行时通过容器内 PG）；脚本断言只有 distilled 的一行被删，未蒸馏的保留。
+
+### 设计取舍
+- **不引入 force-purge**：当真正需要清理未蒸馏 episodic（PG 磁盘压力）时，应通过运维工单 + 一次性 SQL 完成，而不是把"误删"做成默认行为。
+- **默认开启 distill 的代价**：每个有 ≥ MinEpisodicToTrigger 的 (user, project) 都会产生一次 LLM 调用，单 tick 上限由 `max_tenants_per_tick` 约束（默认 32），可控。
+- **不与 P0-4 反馈闭环交叉**：feedback 调 `BoostScoreBatch`，蒸馏调 `Store(memType=semantic)`，路径互不重叠。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

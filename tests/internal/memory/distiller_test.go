@@ -5,6 +5,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent/code_agent/internal/memory"
 	"github.com/stretchr/testify/assert"
@@ -65,6 +66,27 @@ func (f *fakeDistillerStore) MarkDistilled(_ context.Context, ids []string) erro
 	}
 	f.mems = newMems
 	return nil
+}
+
+// DeleteOldEpisodic mirrors PGCold's safe-GC contract for AUDIT-P0-2:
+// only delete episodic entries whose DistilledAt is non-nil and older
+// than the supplied retention window. Undistilled episodic rows must
+// never be removed by this path.
+func (f *fakeDistillerStore) DeleteOldEpisodic(_ context.Context, olderThan time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cutoff := time.Now().Add(-olderThan)
+	kept := f.mems[:0]
+	var deleted int64
+	for _, m := range f.mems {
+		if m.Type == memory.MemoryTypeEpisodic && m.DistilledAt != nil && m.DistilledAt.Before(cutoff) {
+			deleted++
+			continue
+		}
+		kept = append(kept, m)
+	}
+	f.mems = append([]memory.Memory(nil), kept...)
+	return deleted, nil
 }
 
 // ListActiveDistillTenants mirrors PGCold's GROUP BY semantics: count

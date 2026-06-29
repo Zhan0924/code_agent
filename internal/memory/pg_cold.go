@@ -515,12 +515,23 @@ func (p *PGCold) MarkDistilled(ctx context.Context, ids []string) error {
 	return err
 }
 
-// DeleteOldEpisodic removes episodic memories older than the specified duration.
+// DeleteOldEpisodic removes episodic memories that have already been
+// consumed by the Distiller (distilled_at IS NOT NULL) and whose
+// distilled_at timestamp is older than the supplied retention window.
+//
+// Safety rule: undistilled episodic rows are *never* deleted by this
+// path. If Distiller is disabled or the tenant lacks enough episodes
+// to trigger a run, those rows accumulate but are not destroyed —
+// preventing data loss in the "Distiller half-dead" state called out
+// by AUDIT-P0-2. Operators who need an aggressive purge (e.g. PG disk
+// pressure) should call a separate force-delete path (not yet wired).
 func (p *PGCold) DeleteOldEpisodic(ctx context.Context, olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-olderThan)
 	res, err := p.db.ExecContext(ctx, `
 		DELETE FROM memories
-		WHERE type = 'episodic' AND created_at < $1
+		WHERE type = 'episodic'
+		  AND distilled_at IS NOT NULL
+		  AND distilled_at < $1
 	`, cutoff)
 	if err != nil {
 		return 0, err
