@@ -48,6 +48,20 @@ func (p *PGCold) Migrate() error {
 	if dim <= 0 {
 		dim = 1536
 	}
+	colName := "embedding"
+	if dim != 1536 {
+		colName = fmt.Sprintf("embedding_%d", dim)
+	}
+
+	indexStmt := ""
+	if dim <= 2000 {
+		indexStmt = fmt.Sprintf(`
+		-- Use HNSW for robust exact-like recall on small tables and fast ANN on large tables
+		CREATE INDEX IF NOT EXISTS idx_memories_%s_hnsw
+			ON memories USING hnsw (%s vector_cosine_ops);
+		`, colName, colName)
+	}
+
 	createStmt := fmt.Sprintf(`
 		CREATE EXTENSION IF NOT EXISTS vector;
 		CREATE TABLE IF NOT EXISTS memories (
@@ -56,7 +70,7 @@ func (p *PGCold) Migrate() error {
 			project_id TEXT NOT NULL,
 			type TEXT NOT NULL,
 			content TEXT NOT NULL,
-			embedding vector(%d),
+			%s vector(%d),
 			score FLOAT DEFAULT 1.0,
 			access_count INT DEFAULT 0,
 			created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -66,21 +80,20 @@ func (p *PGCold) Migrate() error {
 		);
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS distilled_at TIMESTAMPTZ;
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS %s vector(%d);
 		CREATE INDEX IF NOT EXISTS idx_memories_user_project ON memories(user_id, project_id);
 		CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 		CREATE INDEX IF NOT EXISTS idx_memories_score ON memories(score DESC);
 		-- Drop legacy IVFFlat index which severely underfits small agent memory tables
 		DROP INDEX IF EXISTS idx_memories_embedding;
-		-- Use HNSW for robust exact-like recall on small tables and fast ANN on large tables
-		CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
-			ON memories USING hnsw (embedding vector_cosine_ops);
+		%s
 		-- Partial index lets the Distiller's "next batch" query (WHERE
 		-- type = 'episodic' AND distilled_at IS NULL ORDER BY created_at)
 		-- run without a full type-scan.
 		CREATE INDEX IF NOT EXISTS idx_memories_episodic_undistilled
 			ON memories(user_id, project_id, created_at)
 			WHERE type = 'episodic' AND distilled_at IS NULL;
-	`, dim)
+	`, colName, dim, colName, dim, indexStmt)
 	if _, err := p.db.Exec(createStmt); err != nil {
 		return err
 	}
@@ -109,16 +122,24 @@ func (p *PGCold) Store(m *Memory) error {
 	// distilled_at is intentionally NOT touched on conflict: a re-Store
 	// of an existing episodic must not silently un-mark its distilled
 	// status (would re-trigger consolidation and produce duplicates).
-	_, err := p.db.Exec(`
-		INSERT INTO memories (id, user_id, project_id, type, content, embedding, score, access_count, created_at, updated_at, last_accessed_at, distilled_at)
+	
+	colName := "embedding"
+	if p.embedDim > 0 && p.embedDim != 1536 {
+		colName = fmt.Sprintf("embedding_%d", p.embedDim)
+	}
+	
+	query := fmt.Sprintf(`
+		INSERT INTO memories (id, user_id, project_id, type, content, %s, score, access_count, created_at, updated_at, last_accessed_at, distilled_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (id) DO UPDATE SET
 			content = EXCLUDED.content,
-			embedding = EXCLUDED.embedding,
+			%s = EXCLUDED.%s,
 			score = EXCLUDED.score,
 			updated_at = NOW(),
 			last_accessed_at = NOW()
-	`, m.ID, m.UserID, m.ProjectID, m.Type, m.Content, embeddingStr, m.Score, m.AccessCount, m.CreatedAt, updatedAt, m.LastAccessedAt, nullableTime(m.DistilledAt))
+	`, colName, colName, colName)
+	
+	_, err := p.db.Exec(query, m.ID, m.UserID, m.ProjectID, m.Type, m.Content, embeddingStr, m.Score, m.AccessCount, m.CreatedAt, updatedAt, m.LastAccessedAt, nullableTime(m.DistilledAt))
 	return err
 }
 
@@ -269,6 +290,12 @@ func (p *PGCold) retrieveByVectorTyped(embedding []float32, userID, projectID, m
 		return nil, err
 	}
 	vecStr := formatVector(embedding)
+	
+	colName := "embedding"
+	if p.embedDim > 0 && p.embedDim != 1536 {
+		colName = fmt.Sprintf("embedding_%d", p.embedDim)
+	}
+	
 	// Two-arm query so we can keep prepared-statement reuse for the common
 	// (no type filter) path. memType is a *fixed* enum value (preference /
 	// decision / knowledge / pattern / episodic / semantic) so direct $5
@@ -281,22 +308,24 @@ func (p *PGCold) retrieveByVectorTyped(embedding []float32, userID, projectID, m
 	var rows *sql.Rows
 	var err error
 	if memType == "" {
-		rows, err = p.db.Query(`
-			SELECT id, user_id, project_id, type, content, embedding, score, access_count, created_at, updated_at, last_accessed_at, distilled_at
+		query := fmt.Sprintf(`
+			SELECT id, user_id, project_id, type, content, %s, score, access_count, created_at, updated_at, last_accessed_at, distilled_at
 			FROM memories
-			WHERE user_id = $1 AND project_id = $2 AND embedding IS NOT NULL
+			WHERE user_id = $1 AND project_id = $2 AND %s IS NOT NULL
 			  AND type <> 'episodic'
-			ORDER BY embedding <=> $3
+			ORDER BY %s <=> $3
 			LIMIT $4
-		`, userID, projectID, vecStr, limit)
+		`, colName, colName, colName)
+		rows, err = p.db.Query(query, userID, projectID, vecStr, limit)
 	} else {
-		rows, err = p.db.Query(`
-			SELECT id, user_id, project_id, type, content, embedding, score, access_count, created_at, updated_at, last_accessed_at, distilled_at
+		query := fmt.Sprintf(`
+			SELECT id, user_id, project_id, type, content, %s, score, access_count, created_at, updated_at, last_accessed_at, distilled_at
 			FROM memories
-			WHERE user_id = $1 AND project_id = $2 AND embedding IS NOT NULL AND type = $5
-			ORDER BY embedding <=> $3
+			WHERE user_id = $1 AND project_id = $2 AND %s IS NOT NULL AND type = $5
+			ORDER BY %s <=> $3
 			LIMIT $4
-		`, userID, projectID, vecStr, limit, memType)
+		`, colName, colName, colName)
+		rows, err = p.db.Query(query, userID, projectID, vecStr, limit, memType)
 	}
 	if err != nil {
 		return nil, err

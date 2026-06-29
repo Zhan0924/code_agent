@@ -1759,6 +1759,14 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 ### 修复策略
 在 `Extractor` 中引入 `CorePromoter` 接口（由 `CoreMemoryManager` 实现）。当后台 `Extractor` 抽取出 `Importance >= 0.9` 且类型为 `preference` 或 `decision` 的记忆时，触发自动晋升（Auto-Promotion），将其异步直接写入 Core Memory 的 `persona` section，确保关键用户偏好强制驻留。
 
+## §32. AUDIT-P1-5: 维度迁移与动态列 (Embedding Dimension Migration)
+
+### 病征
+以前 schema 硬编码了 `embedding vector(1536)`。如果用户在配置中更改了 Embedding 模型（例如切换到 3072 维度的模型），由于 pgvector 的限制，无法直接 ALTER COLUMN 修改维度。这导致系统在启动时如果维度不同会导致崩溃或无法正常检索。
+
+### 修复策略
+引入了动态 Embedding 列。在 `pg_cold.go` 中，默认 1536 维度继续使用 `embedding` 列，其他维度则使用命名约定 `embedding_{dim}` (例如 `embedding_3072`)。`Migrate()` 过程中如果发现维度不是 1536，会自动添加对应的特定维度列并只对该列建立 HNSW 索引（限制 `dim <= 2000` 时才建立 HNSW，避免 pgvector 限制）。查询和插入都根据配置的维度动态读写对应的列，从而支持"双 column 渐进迁移"，避免了直接丢失原有数据和引发崩溃的问题。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。
