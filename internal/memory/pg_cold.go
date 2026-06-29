@@ -485,6 +485,19 @@ func (p *PGCold) MarkDistilled(ctx context.Context, ids []string) error {
 	return err
 }
 
+// DeleteOldEpisodic removes episodic memories older than the specified duration.
+func (p *PGCold) DeleteOldEpisodic(ctx context.Context, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-olderThan)
+	res, err := p.db.ExecContext(ctx, `
+		DELETE FROM memories
+		WHERE type = 'episodic' AND created_at < $1
+	`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // Update modifies an existing memory's content, embedding, score, and metadata.
 // AccessCount is also persisted so reinforcement signals from ConflictResolver
 // (Hebbian "repeated expression = stronger") are not silently dropped.
@@ -526,6 +539,20 @@ func (p *PGCold) DeleteByIDs(ctx context.Context, ids []string) error {
 		DELETE FROM memories WHERE id = ANY($1)
 	`, pq.Array(ids))
 	return err
+}
+
+// DeleteByUser hard-deletes all memories belonging to a specific user (GDPR compliance).
+func (p *PGCold) DeleteByUser(ctx context.Context, userID string) (int64, error) {
+	if userID == "" {
+		return 0, nil
+	}
+	res, err := p.db.ExecContext(ctx, `
+		DELETE FROM memories WHERE user_id = $1
+	`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // DedupTx is the atomic write path used by HybridStore's dedup branch:

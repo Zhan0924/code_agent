@@ -117,3 +117,29 @@ func (s *Server) handleMemoryStats(c *gin.Context) {
 		"total":      len(mems),
 	})
 }
+
+// handleDeleteMemoryByUser handles GDPR deletion requests.
+// It deletes all memories belonging to the specified user_id.
+func (s *Server) handleDeleteMemoryByUser(c *gin.Context) {
+	if s.memoryStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not configured"})
+		return
+	}
+
+	userID := c.Param("user_id")
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
+		return
+	}
+
+	deletedCount, err := s.memoryStore.DeleteByUser(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user_id":       userID,
+		"deleted_count": deletedCount,
+	})
+}

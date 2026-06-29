@@ -816,6 +816,42 @@ func (h *HybridStore) DeleteOldEpisodic(ctx context.Context, olderThan time.Dura
 	return h.cold.DeleteOldEpisodic(ctx, olderThan)
 }
 
+// DeleteByUser removes all memories belonging to a specific user across both tiers.
+// It also publishes a "deleted_user" event to the blackboard.
+func (h *HybridStore) DeleteByUser(ctx context.Context, userID string) (int64, error) {
+	if userID == "" {
+		return 0, nil
+	}
+	
+	var totalDeleted int64
+	
+	if h.cold != nil {
+		if deleted, err := h.cold.DeleteByUser(ctx, userID); err != nil {
+			return 0, fmt.Errorf("cold tier delete failed: %w", err)
+		} else {
+			totalDeleted += deleted
+		}
+	}
+	
+	if h.hot != nil {
+		if deleted, err := h.hot.DeleteByUser(ctx, userID); err != nil {
+			return totalDeleted, fmt.Errorf("hot tier delete failed: %w", err)
+		} else {
+			totalDeleted += deleted
+		}
+	}
+	
+	if h.blackboard != nil {
+		// Broadcast deletion so any active listeners can drop caches
+		dummyMem := &Memory{
+			UserID: userID,
+		}
+		_ = h.blackboard.Publish(ctx, "deleted_user", dummyMem)
+	}
+	
+	return totalDeleted, nil
+}
+
 
 // ListActiveDistillTenants delegates to cold (PG owns the GROUP BY index).
 // Hot tier doesn't store cross-tenant aggregates, so there's nothing to

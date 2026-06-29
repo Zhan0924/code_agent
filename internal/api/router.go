@@ -294,6 +294,8 @@ func (s *Server) setupRoutes() {
 		// Long-term memory inspection (read-only)
 		v1.GET("/memory", s.handleListMemory)
 		v1.GET("/memory/stats", s.handleMemoryStats)
+		v1.DELETE("/memory/user/:user_id", s.handleDeleteMemoryByUser)
+
 
 		// HITL approval (requires admin or dev role)
 		approvalGroup := v1.Group("")

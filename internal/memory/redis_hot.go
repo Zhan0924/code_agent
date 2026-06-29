@@ -404,6 +404,40 @@ func (r *RedisHot) DeleteBatch(ctx context.Context, refs []TouchRef) error {
 	return r.client.Del(ctx, keys...).Err()
 }
 
+// DeleteByUser deletes all hot memories belonging to a specific user (GDPR compliance).
+func (r *RedisHot) DeleteByUser(ctx context.Context, userID string) (int64, error) {
+	if userID == "" {
+		return 0, nil
+	}
+	pattern := fmt.Sprintf("%s:*", r.keyPrefix(userID, "*"))
+	
+	var cursor uint64
+	var totalDeleted int64
+	
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = r.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return totalDeleted, err
+		}
+		
+		if len(keys) > 0 {
+			res, err := r.client.Del(ctx, keys...).Result()
+			if err != nil {
+				return totalDeleted, err
+			}
+			totalDeleted += res
+		}
+		
+		if cursor == 0 {
+			break
+		}
+	}
+	
+	return totalDeleted, nil
+}
+
 // RetrieveByQuery returns memories ranked by cosine similarity to the query embedding.
 // Since hot layer is small (< 50 items with 24h TTL), in-memory ranking is acceptable.
 //
