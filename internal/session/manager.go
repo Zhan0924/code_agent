@@ -564,6 +564,20 @@ func (m *Manager) performHotColdSeparation(ctx context.Context, sessionID string
 
 	_ = m.saveHot(ctx, session)
 }
+// GetMessage retrieves a specific message from a session.
+func (m *Manager) GetMessage(ctx context.Context, sessionID, messageID string) (*models.Message, error) {
+	s, err := m.Get(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range s.Messages {
+		if s.Messages[i].ID == messageID {
+			return &s.Messages[i], nil
+		}
+	}
+	return nil, fmt.Errorf("message %s not found in session %s", messageID, sessionID)
+}
+
 
 // GetContextWindow returns the current messages suitable for LLM context.
 func (m *Manager) GetContextWindow(ctx context.Context, sessionID string) ([]models.Message, error) {

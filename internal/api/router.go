@@ -290,6 +290,7 @@ func (s *Server) setupRoutes() {
 		v1.DELETE("/sessions/:id", s.handleDeleteSession)
 		v1.POST("/sessions/:id/messages/:message_id/pin", s.handlePinMessage)
 		v1.POST("/sessions/:id/messages/:message_id/unpin", s.handleUnpinMessage)
+		v1.POST("/sessions/:id/messages/:message_id/feedback", s.handleMessageFeedback)
 
 		// Long-term memory inspection (read-only)
 		v1.GET("/memory", s.handleListMemory)
