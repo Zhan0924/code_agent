@@ -129,14 +129,6 @@ session:
   ttl: 24h
   compaction_mode: "truncate"     # "truncate" or "summarize"
 
-memory:
-  distill:
-    enabled: true
-    interval: 1h
-    max_episodic_per_run: 50
-    min_episodic_to_trigger: 3
-    auto_discover: true
-    max_tenants_per_tick: 32
 
 security:
   sensitive_patterns:
