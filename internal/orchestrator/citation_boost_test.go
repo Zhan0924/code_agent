@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type recordingMemoryRetriever struct {
@@ -97,7 +98,7 @@ func TestBoostCitedMemories_BoostsUniqueIDs(t *testing.T) {
 	sess, err := sessMgr.Create(ctx, "alice", "p1")
 	require.NoError(t, err)
 
-	o.boostCitedMemories(ctx, sess.ID, "Answer uses [mem:abc-123] and again [mem:abc-123] plus [mem:xyz]")
+	o.boostCitedMemories(ctx, sess.ID, "Answer uses [mem:abc-123] and again [mem:abc-123] plus [mem:xyz]", []string{"abc-123", "other"})
 
 	require.Len(t, rec.boostCalls, 1)
 	assert.InDelta(t, 0.05, rec.boostCalls[0].boost, 1e-9)
@@ -120,7 +121,7 @@ func TestBoostCitedMemories_NoCitationSkipsBoost(t *testing.T) {
 	sess, err := sessMgr.Create(ctx, "alice", "p1")
 	require.NoError(t, err)
 
-	o.boostCitedMemories(ctx, sess.ID, "plain answer without memory tags")
+	o.boostCitedMemories(ctx, sess.ID, "plain answer without memory tags", []string{"abc-123"})
 	assert.Empty(t, rec.boostCalls)
 }
 
@@ -132,7 +133,7 @@ func TestBoostCitedMemories_NilStoreIsNoOp(t *testing.T) {
 	sess, err := sessMgr.Create(ctx, "alice", "p1")
 	require.NoError(t, err)
 
-	o.boostCitedMemories(ctx, sess.ID, "uses [mem:abc]")
+	o.boostCitedMemories(ctx, sess.ID, "uses [mem:abc]", nil)
 }
 
 func TestBoostCitedMemories_UpdatesHybridStoreScore(t *testing.T) {
@@ -162,10 +163,28 @@ func TestBoostCitedMemories_UpdatesHybridStoreScore(t *testing.T) {
 	sess, err := sessMgr.Create(ctx, "alice", "p1")
 	require.NoError(t, err)
 
-	o.boostCitedMemories(ctx, sess.ID, "Based on [mem:m1] you prefer tabs.")
+	o.boostCitedMemories(ctx, sess.ID, "Based on [mem:m1] you prefer tabs.", []string{"m1", "m2"})
 
 	got, err := hot.Retrieve(ctx, "alice", "p1", 10)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.InDelta(t, 0.55, got[0].Score, 1e-9)
+}
+
+func TestRecordCitationFeedback_MissWhenInjectedWithoutCite(t *testing.T) {
+	core, recorded := observer.New(zap.WarnLevel)
+	o, sessMgr, _ := newCitationBoostHarness(t)
+	o.logger = zap.New(core)
+	ctx := context.Background()
+
+	sess, err := sessMgr.Create(ctx, "alice", "p1")
+	require.NoError(t, err)
+
+	o.boostCitedMemories(ctx, sess.ID, "plain answer without memory tags", []string{"mem-a", "mem-b"})
+
+	logs := recorded.FilterMessage("memory injected but assistant cited none").All()
+	require.Len(t, logs, 1)
+	fields := logs[0].ContextMap()
+	assert.Equal(t, "REAUDIT-P0-3", fields["audit_id"])
+	assert.EqualValues(t, 2, fields["injected_count"])
 }

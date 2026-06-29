@@ -427,7 +427,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	// Execute with ReAct loop
 	task.State = models.TaskStateExecuting
 	o.persistTaskState(ctx, task.ID, models.TaskStateExecuting)
-	response, toolsUsed, err := o.reactLoop(ctx, task)
+	response, toolsUsed, injectedMemIDs, err := o.reactLoop(ctx, task)
 	if err != nil {
 		task.State = models.TaskStateFailed
 		o.persistFailureAssistant(ctx, sessionID, task.ID, "⚠️ Task failed: "+err.Error())
@@ -435,7 +435,7 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, sessionID, userMessag
 	}
 
 	// AUDIT-P0-1: Feedback loop for cited memories
-	o.boostCitedMemories(ctx, sessionID, response)
+	o.boostCitedMemories(ctx, sessionID, response, injectedMemIDs)
 
 	// Store assistant response
 	task.State = models.TaskStateCompleted
@@ -539,7 +539,7 @@ func (o *Orchestrator) persistAudit(ctx context.Context, taskID, userID, action,
 // in-order sequence of tool names invoked during the loop, used by
 // recordTaskEpisodeAsync to capture the trajectory in per-task episodic
 // memory. Best-effort: some early-exit paths may return nil tools.
-func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string, []string, error) {
+func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string, []string, []string, error) {
 	// [P2-E1] Register interrupt channel for this session
 	interruptCh := o.registerInterrupt(task.SessionID)
 	defer o.unregisterInterrupt(task.SessionID)
@@ -580,7 +580,7 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 		return o.buildStableMemory(ctx, summary, userID, projectID)
 	}())
 
-	dynamicMemory := o.buildDynamicMemory(ctx, sess.UserID, sess.ProjectID, task.UserInput)
+	dynamicMemory, injectedMemIDs := o.buildDynamicMemory(ctx, sess.UserID, sess.ProjectID, task.UserInput)
 
 	messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, dynamicMemory, task.UserInput)
 	if len(messages) > 0 && messages[0].Role == models.RoleSystem {
@@ -618,14 +618,14 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 				)
 			}
 		}
-		return result.content, result.toolsUsed, nil
+		return result.content, result.toolsUsed, injectedMemIDs, nil
 	}
 
 	// Step limit exhausted — save progress
 	o.saveProgressForContinuation(ctx, task)
 	return "⚠️ I reached the maximum reasoning steps. Your workspace files and .plan.md are intact.\n\n" +
 		"**To continue from where I left off**, send a follow-up message saying `continue` in the same session. " +
-		"I will read .plan.md and .progress.json to resume the remaining steps.", result.toolsUsed, nil
+		"I will read .plan.md and .progress.json to resume the remaining steps.", result.toolsUsed, injectedMemIDs, nil
 }
 
 // saveProgressForContinuation writes a .progress.json to the workspace
@@ -798,7 +798,7 @@ func (o *Orchestrator) suspendForApprovalInProcess(ctx context.Context, task *mo
 			if resp.Approved {
 				metrics.HITLApprovalTotal.WithLabelValues("approved").Inc()
 				o.logger.Info("task approved, executing", zap.String("task_id", task.ID))
-				result, toolsUsed, err := o.reactLoop(waitCtx, task)
+				result, toolsUsed, _, err := o.reactLoop(waitCtx, task)
 				if err != nil {
 					o.logger.Error("post-approval execution failed", zap.Error(err))
 					return
@@ -1098,7 +1098,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 			return o.buildStableMemory(workCtx, summary, userID, projectID)
 		}())
 
-		dynamicMemory := o.buildDynamicMemory(workCtx, userID, projectID, task.UserInput)
+		dynamicMemory, injectedMemIDs := o.buildDynamicMemory(workCtx, userID, projectID, task.UserInput)
 		messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, dynamicMemory, task.UserInput)
 		if len(messages) > 0 && messages[0].Role == models.RoleSystem {
 			messages[0] = o.buildSystemMessage(task.Intent)
@@ -1191,7 +1191,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 				_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
 					Role: models.RoleAssistant, Content: result.content,
 				})
-				o.boostCitedMemories(workCtx, sessionID, result.content)
+				o.boostCitedMemories(workCtx, sessionID, result.content, injectedMemIDs)
 				o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
 				o.recordTaskEpisodeAsync(workCtx, sessionID, task.UserInput, result.content, result.toolsUsed)
 				sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
@@ -1978,12 +1978,13 @@ func (o *Orchestrator) GetTool(name string) (tools.Tool, bool) {
 }
 
 // boostCitedMemories parses the LLM's response for [mem:<id>] citations and boosts their scores.
-func (o *Orchestrator) boostCitedMemories(ctx context.Context, sessionID, response string) {
+func (o *Orchestrator) boostCitedMemories(ctx context.Context, sessionID, response string, injectedIDs []string) {
 	if o.memoryStore == nil {
 		return
 	}
-	ids := memory.ParseCitationIDs(response)
-	if len(ids) == 0 {
+	cited := memory.ParseCitationIDs(response)
+	o.recordCitationFeedback(ctx, sessionID, injectedIDs, cited)
+	if len(cited) == 0 {
 		return
 	}
 	sess, err := o.sessionMgr.Get(ctx, sessionID)
@@ -1991,12 +1992,77 @@ func (o *Orchestrator) boostCitedMemories(ctx context.Context, sessionID, respon
 		return
 	}
 
-	refs := memory.TouchRefsFromCitationIDs(sess.UserID, sess.ProjectID, ids)
+	refs := memory.TouchRefsFromCitationIDs(sess.UserID, sess.ProjectID, cited)
 	if err := o.memoryStore.BoostScoreBatch(ctx, refs, 0.05); err != nil {
 		metrics.MemoryCitationBoostTotal.WithLabelValues("auto", "err").Inc()
 		o.logger.Warn("failed to boost cited memories", zap.Error(err))
 	} else {
 		metrics.MemoryCitationBoostTotal.WithLabelValues("auto", "ok").Add(float64(len(refs)))
-		o.logger.Info("boosted cited memories", zap.Int("count", len(refs)))
+		o.logger.Info("boosted cited memories",
+			zap.String("audit_id", "REAUDIT-P0-3"),
+			zap.String("op", "citation_boost"),
+			zap.Int("cited_count", len(refs)),
+			zap.Strings("cited_mem_ids", cited),
+			zap.String("result", "ok"))
 	}
+}
+
+// recordCitationFeedback emits REAUDIT-P0-3 observability when memories were
+// injected but the assistant may have ignored the [mem:id] citation instruct.
+func (o *Orchestrator) recordCitationFeedback(ctx context.Context, sessionID string, injectedIDs, citedIDs []string) {
+	if len(injectedIDs) == 0 {
+		return
+	}
+	metrics.MemoryCitationFeedbackTotal.WithLabelValues("injected").Inc()
+
+	userID, projectID := "", ""
+	if sess, err := o.sessionMgr.Get(ctx, sessionID); err == nil && sess != nil {
+		userID = sess.UserID
+		projectID = sess.ProjectID
+	}
+
+	if len(citedIDs) == 0 {
+		metrics.MemoryCitationFeedbackTotal.WithLabelValues("missed").Inc()
+		o.logger.Warn("memory injected but assistant cited none",
+			zap.String("audit_id", "REAUDIT-P0-3"),
+			zap.String("op", "citation_feedback_miss"),
+			zap.String("tenant.user_id", userID),
+			zap.String("tenant.project_id", projectID),
+			zap.Strings("injected_mem_ids", injectedIDs),
+			zap.Int("injected_count", len(injectedIDs)),
+			zap.Int("cited_count", 0),
+			zap.String("severity", "warn"),
+			zap.String("result", "miss"))
+		return
+	}
+
+	metrics.MemoryCitationFeedbackTotal.WithLabelValues("cited").Inc()
+	citedSet := make(map[string]struct{}, len(citedIDs))
+	for _, id := range citedIDs {
+		citedSet[id] = struct{}{}
+	}
+	var uncited []string
+	for _, id := range injectedIDs {
+		if _, ok := citedSet[id]; !ok {
+			uncited = append(uncited, id)
+		}
+	}
+	if len(uncited) > 0 {
+		metrics.MemoryCitationFeedbackTotal.WithLabelValues("partial").Inc()
+		o.logger.Info("memory citation partial — some injected ids not cited",
+			zap.String("audit_id", "REAUDIT-P0-3"),
+			zap.String("op", "citation_feedback_partial"),
+			zap.String("tenant.user_id", userID),
+			zap.String("tenant.project_id", projectID),
+			zap.Strings("injected_mem_ids", injectedIDs),
+			zap.Strings("cited_mem_ids", citedIDs),
+			zap.Strings("uncited_mem_ids", uncited),
+			zap.String("result", "partial"))
+	}
+}
+
+// ObserveCitationFeedbackForTest exposes recordCitationFeedback for dev-only
+// HTTP smoke tests (verify-reaudit-p0-3.sh). Not part of the public API.
+func (o *Orchestrator) ObserveCitationFeedbackForTest(ctx context.Context, sessionID, response string, injectedIDs []string) {
+	o.recordCitationFeedback(ctx, sessionID, injectedIDs, memory.ParseCitationIDs(response))
 }

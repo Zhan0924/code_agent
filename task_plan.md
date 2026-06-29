@@ -17,7 +17,7 @@ Phase 2
 - [x] Step 2: 方案文档 `docs/superpowers/plans/2026-06-29-REAUDIT-P0-1-mark-distilled-semantics.md`
 - [x] Step 3: 实现（UPDATE distilled_at + 结构化日志 + 单测/集成测）
 - [x] Step 4: Docker + verify-reaudit-p0-1.sh PASS
-- [ ] Step 5: safe-push（待用户确认）
+- [x] Step 5: safe-push → `b332948`
 - **Status:** complete
 
 ### Phase 2: REAUDIT-P0-2 — CoreMemory PII 缺口
@@ -25,15 +25,19 @@ Phase 2
 - [x] Step 2: `docs/superpowers/plans/2026-06-29-REAUDIT-P0-2-core-memory-pii.md`
 - [x] Step 3: `RedisCoreMemory.maskForPersist` + 单测 + dev endpoint
 - [x] Step 4: `verify-reaudit-p0-2.sh` PASS
-- [ ] Step 5: safe-push（待用户确认）
+- [x] Step 5: safe-push → `b332948`
 - **Status:** complete
 
 ## Current Phase
-Phase 3
+Phase 4
 
 ### Phase 3: REAUDIT-P0-3 — Citation 反馈闭环对低成本模型形同虚设（观测增强）
-- [ ] 五步循环（重点：补 `memory_citation_boost_total` 在低 cite_rate 模型下的告警条件 + 文档明示）
-- **Status:** pending
+- [x] Step 1: 代码复核 — 注入与 cite 对比无 miss 信号
+- [x] Step 2: `docs/superpowers/plans/2026-06-29-REAUDIT-P0-3-citation-feedback-observability.md`
+- [x] Step 3: `recordCitationFeedback` + `MemoryCitationFeedbackTotal` + dev endpoint
+- [x] Step 4: `verify-reaudit-p0-3.sh` PASS
+- [x] Step 5: safe-push
+- **Status:** complete
 
 ### Phase 4: REAUDIT-P0-4 — Embedder 失效监控盲区
 - [ ] 五步循环（重点：`HybridStore.embedText` 失败上 `memory_failures_total{tier="embedder",...}` + 独立 `memory_retrieve_degraded_total`）

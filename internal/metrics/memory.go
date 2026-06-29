@@ -411,6 +411,20 @@ var (
 		Help:      "Automatic score adjustments from [mem:id] citations in assistant replies",
 	}, []string{"source", "status"})
 
+	// MemoryCitationFeedbackTotal tracks turns where memories were injected into
+	// the prompt vs whether the assistant cited any [mem:id] tags (REAUDIT-P0-3).
+	// outcome:
+	//   - injected: at least one memory was injected this turn
+	//   - missed:   injected > 0 but response contained zero citations
+	//   - cited:    injected > 0 and response cited at least one id
+	//   - partial:  injected > 0, some cited but not all injected ids cited
+	MemoryCitationFeedbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "code_agent",
+		Subsystem: "memory",
+		Name:      "citation_feedback_total",
+		Help:      "Citation feedback loop outcomes when memories were injected (REAUDIT-P0-3 observability)",
+	}, []string{"outcome"})
+
 	// MemoryFailuresTotal is the AUDIT-P2-4 alertable error-classification
 	// counter. Previously a hot-store error and a cold-store error were
 	// both logged at Warn / Error with no machine-readable severity, so

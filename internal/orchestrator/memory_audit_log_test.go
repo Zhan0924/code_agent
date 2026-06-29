@@ -64,9 +64,10 @@ func TestBuildDynamicMemory_AuditLogAndCitations(t *testing.T) {
 		logger:      logger,
 	}
 
-	out := o.buildDynamicMemory(context.Background(), "user-7", "proj-1", "what coding style?")
+	out, injected := o.buildDynamicMemory(context.Background(), "user-7", "proj-1", "what coding style?")
 
 	require.NotEmpty(t, out, "buildDynamicMemory must emit a block when retriever returns data")
+	assert.Len(t, injected, 3)
 	for _, want := range []string{"[mem:mem-pref-1]", "[mem:mem-dec-1]", "[mem:mem-gen-1]"} {
 		assert.True(t, strings.Contains(out, want), "expected prompt to embed citation marker %s\n%s", want, out)
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/gin-gonic/gin"
 )
@@ -108,6 +109,67 @@ func (s *Server) handleTestCoreMemoryPII(c *gin.Context) {
 		"stored":     stored,
 		"masked":     !strings.Contains(stored, secret),
 	})
+}
+
+// handleTestCitationFeedback exercises REAUDIT-P0-3 citation miss observability
+// by simulating injected memories with a response that omits [mem:id] tags.
+func (s *Server) handleTestCitationFeedback(c *gin.Context) {
+	if s.orchestrator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "orchestrator not configured"})
+		return
+	}
+	if s.sessionMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session manager not configured"})
+		return
+	}
+
+	userID := c.DefaultQuery("user_id", "verify_reaudit_p0_3")
+	projectID := c.DefaultQuery("project_id", "default")
+	response := c.DefaultQuery("response", "plain answer without memory citations")
+
+	ctx := c.Request.Context()
+	sess, err := s.sessionMgr.Create(ctx, userID, projectID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "session create failed: " + err.Error()})
+		return
+	}
+
+	injected := []string{"mem-test-a", "mem-test-b"}
+	s.orchestrator.ObserveCitationFeedbackForTest(ctx, sess.ID, response, injected)
+
+	cited := memory.ParseCitationIDs(response)
+	outcome := citationFeedbackOutcome(injected, cited)
+
+	c.JSON(http.StatusOK, gin.H{
+		"audit_id":        "REAUDIT-P0-3",
+		"session_id":      sess.ID,
+		"user_id":         userID,
+		"project_id":      projectID,
+		"injected_ids":    injected,
+		"cited_ids":       cited,
+		"injected_count":  len(injected),
+		"cited_count":     len(cited),
+		"outcome":         outcome,
+	})
+}
+
+func citationFeedbackOutcome(injected, cited []string) string {
+	if len(injected) == 0 {
+		return "none"
+	}
+	if len(cited) == 0 {
+		return "missed"
+	}
+	citedSet := make(map[string]struct{}, len(cited))
+	for _, id := range cited {
+		citedSet[id] = struct{}{}
+	}
+	for _, id := range injected {
+		if _, ok := citedSet[id]; !ok {
+			return "partial"
+		}
+	}
+	return "cited"
 }
 
 // handleTestDecay manually triggers a decay sweep. Useful for ops to confirm

@@ -183,8 +183,9 @@ func (o *Orchestrator) buildStableMemory(ctx context.Context, sessionSummary, us
 	return strings.Join(parts, "\n\n")
 }
 
-func (o *Orchestrator) buildDynamicMemory(ctx context.Context, userID, projectID, query string) string {
+func (o *Orchestrator) buildDynamicMemory(ctx context.Context, userID, projectID, query string) (string, []string) {
 	var parts []string
+	var injectedIDs []string
 
 	// 3. Query-specific long-term memories (lowest stability, changes per turn).
 	if o.memoryStore != nil && query != "" {
@@ -203,6 +204,7 @@ func (o *Orchestrator) buildDynamicMemory(ctx context.Context, userID, projectID
 			for _, m := range memories {
 				ids = append(ids, m.ID)
 			}
+			injectedIDs = ids
 			o.logger.Info("memories injected into prompt",
 				zap.String("user_id", userID),
 				zap.String("project_id", projectID),
@@ -222,7 +224,7 @@ func (o *Orchestrator) buildDynamicMemory(ctx context.Context, userID, projectID
 		}
 	}
 
-	return strings.Join(parts, "\n\n")
+	return strings.Join(parts, "\n\n"), injectedIDs
 }
 
 // retrieveBucketedMemories returns up to `limit` memories with importance

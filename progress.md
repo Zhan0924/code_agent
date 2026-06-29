@@ -27,3 +27,10 @@
 - Step 3：`RedisCoreMemory` 注入 masker，`maskForPersist` 覆盖 append/replace（含 extractor auto-promote）
 - Step 4：`./scripts/verify-reaudit-p0-2.sh` PASS（API masked=true + Redis 无裸 AWS key）
 - 文档：02-audit REAUDIT-P0-2 ✅
+
+### Phase 3 完成（REAUDIT-P0-3）
+
+- Step 1 判定：**真实存在** — 注入 memory 后零 cite 时无 miss 指标/日志
+- Step 3：`buildDynamicMemory` 返回 injectedIDs；`recordCitationFeedback` 发 `injected|missed|cited|partial` 指标 + 结构化日志
+- Step 4：`./scripts/verify-reaudit-p0-3.sh` PASS（API outcome=missed + 日志 citation_feedback_miss）
+- 文档：02-audit REAUDIT-P0-3 ✅
