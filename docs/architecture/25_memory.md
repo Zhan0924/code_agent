@@ -1735,6 +1735,14 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 - `internal/api/session_handlers.go`: 新增 `POST /sessions/:id/messages/:message_id/feedback` API，用于接收针对特定消息的反馈（score < 0 代表踩）。
 - `internal/session/manager.go`: 新增 `GetMessage` 用于获取特定消息的原文，以供正则表达式匹配出引用的记忆 ID。
 
+## §29. AUDIT-P1-1: Cross-Type Semantic Deduplication
+
+### 病征
+以前 ConflictResolver 强制只有 `Type` 相同的 Memory 才可能发生冲突（`c.Type != newMem.Type -> skip`）。如果 LLM 对于相似的事实一次标记为 `preference` 一次标记为 `knowledge`，两条相似的记忆就会独立存活，浪费 Token 且分散检索得分。
+
+### 修复策略
+在 `conflict.go` 中移除了 `c.Type != newMem.Type` 的判断限制，使得纯粹依靠 Vector Similarity 来触发 Deduplication。同时引入了 `typePriority` （如 Preference > Knowledge > Semantic），确保合并后保留优先级更高的类型。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

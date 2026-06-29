@@ -103,7 +103,9 @@ func (r *ConflictResolver) FindConflicts(newMemory *Memory, candidates []Memory)
 
 	var conflicts []Memory
 	for _, c := range candidates {
-		if len(c.Embedding) == 0 || c.Type != newMemory.Type {
+		// Ensure both have valid embeddings to compare.
+		// Note: We intentionally allow cross-type deduplication (e.g. preference vs knowledge).
+		if len(c.Embedding) == 0 {
 			continue
 		}
 		sim := CosineSimilarity(newMemory.Embedding, c.Embedding)
@@ -156,6 +158,11 @@ func (r *ConflictResolver) ResolveWithOutcome(old, new *Memory) (*Memory, Resolv
 	blendedScore := (1-w)*old.Score + w*new.Score
 	if blendedScore > 1.0 {
 		blendedScore = 1.0
+	}
+
+	// Promote type if the new memory has a higher-priority type.
+	if typePriority(new.Type) > typePriority(old.Type) {
+		old.Type = new.Type
 	}
 
 	scoreGap := new.Score - old.Score
@@ -248,6 +255,28 @@ func (r *ConflictResolver) ReinforceFromDup(anchor *Memory, dup Memory) {
 	anchor.AccessCount += 1 + dup.AccessCount
 	if dup.LastAccessedAt.After(anchor.LastAccessedAt) {
 		anchor.LastAccessedAt = dup.LastAccessedAt
+	}
+	if typePriority(dup.Type) > typePriority(anchor.Type) {
+		anchor.Type = dup.Type
+	}
+}
+
+// typePriority assigns a numerical priority to memory types to ensure
+// higher-value semantic abstractions survive cross-type deduplication.
+func typePriority(t MemoryType) int {
+	switch t {
+	case MemoryPreference:
+		return 5
+	case MemoryKnowledge:
+		return 4
+	case MemoryPattern:
+		return 3
+	case MemoryTypeEpisodic:
+		return 2
+	case MemoryTypeSemantic:
+		return 1
+	default:
+		return 0
 	}
 }
 

@@ -40,11 +40,23 @@ func TestConflictResolver_FindConflicts(t *testing.T) {
 
 	conflicts := resolver.FindConflicts(newMem, candidates)
 
-	if len(conflicts) != 1 {
-		t.Errorf("expected 1 conflict, got %d", len(conflicts))
+	if len(conflicts) != 2 {
+		t.Errorf("expected 2 conflicts, got %d", len(conflicts))
 	}
-	if len(conflicts) > 0 && conflicts[0].Content != "User prefers spaces" {
-		t.Errorf("wrong conflict detected: %s", conflicts[0].Content)
+	
+	// Should detect both the same-type and cross-type conflicts
+	hasSpaces := false
+	hasReact := false
+	for _, c := range conflicts {
+		if c.Content == "User prefers spaces" {
+			hasSpaces = true
+		} else if c.Content == "Use React for frontend" {
+			hasReact = true
+		}
+	}
+	
+	if !hasSpaces || !hasReact {
+		t.Errorf("wrong conflicts detected: %+v", conflicts)
 	}
 }
 
