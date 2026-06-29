@@ -1751,6 +1751,14 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 ### 修复策略
 将 `piiMasker` 抽出为公共 `memory.PIIMasker`，并支持通过 `AGENT_CUSTOM_PII_REGEX` 环境变量动态传入业务侧正则（格式 `LABEL=Regex,LABEL2=Regex2`）。在 `HybridStore.Store` 写入库与 `Blackboard.Publish` 广播前，强制对 `Memory.Content` 进行二次 `Mask()`，作为 Defense in Depth。
 
+## §31. AUDIT-P1-4: Core Memory Auto-Promotion
+
+### 病征
+以前 CoreMemory 完全依赖 LLM 调用 `core_memory_append` tool 才能写入。而 `Extractor` 在背后通过总结对话抽取出极高权重的 Preference (例如 Importance >= 0.9)，却只会进入 Long-Term Memory，并且随着衰减甚至可能丢失，导致「最稳定的 User Persona」无法被记录。
+
+### 修复策略
+在 `Extractor` 中引入 `CorePromoter` 接口（由 `CoreMemoryManager` 实现）。当后台 `Extractor` 抽取出 `Importance >= 0.9` 且类型为 `preference` 或 `decision` 的记忆时，触发自动晋升（Auto-Promotion），将其异步直接写入 Core Memory 的 `persona` section，确保关键用户偏好强制驻留。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

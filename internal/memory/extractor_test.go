@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/agent/code_agent/internal/llm"
 	"go.uber.org/zap"
@@ -479,3 +480,35 @@ var errEmbedderDown = errFake{"embedder unavailable"}
 type errFake struct{ msg string }
 
 func (e errFake) Error() string { return e.msg }
+
+type mockCorePromoter struct {
+	called bool
+	content string
+}
+
+func (m *mockCorePromoter) AppendToSectionScoped(ctx context.Context, userID, projectID string, scope CoreMemoryScope, section, content string) error {
+	m.called = true
+	m.content = content
+	return nil
+}
+
+func TestExtractor_AutoPromotesCoreMemory(t *testing.T) {
+	llmResp := `[{"type":"preference","content":"I prefer tabs","importance":0.9}]`
+	ms := &mockStore{}
+	ml := &mockLLM{response: llmResp}
+	promoter := &mockCorePromoter{}
+
+	ext := NewExtractor(ms, ml, zap.NewNop()).WithCorePromoter(promoter)
+
+	ext.ExtractFromInteraction(context.Background(), "u1", "p1", "I prefer tabs", "OK, tabs it is")
+
+	// Wait for the async goroutine in the extractor to finish
+	time.Sleep(50 * time.Millisecond)
+
+	if !promoter.called {
+		t.Error("expected core memory promoter to be called for importance 9 preference")
+	}
+	if promoter.content != "I prefer tabs" {
+		t.Errorf("expected promoted content 'I prefer tabs', got %q", promoter.content)
+	}
+}

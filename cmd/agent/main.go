@@ -589,7 +589,11 @@ func main() {
 		//      inject those sections into every prompt's [Core Memory] block.
 		// Without (2), the tools wrote to Redis but the LLM never saw it
 		// back (the original "write-only blackhole" bug).
+		// Setup Core Memory
 		coreManager := memory.NewRedisCoreMemory(rdb, logger)
+		if memAdapter != nil {
+			memoryExtractor.WithCorePromoter(coreManager)
+		}
 		orch.SetCoreMemory(coreManager)
 		memoryTools := tools.NewMemoryToolsProvider(coreManager)
 		for _, tool := range memoryTools.Tools() {

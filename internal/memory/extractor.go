@@ -55,15 +55,21 @@ const minDedupCandidateLimit = 5
 // inside the store.
 const maxDedupCandidateLimit = 200
 
+// CorePromoter allows the extractor to auto-promote high-importance memories to Core Memory.
+type CorePromoter interface {
+	AppendToSectionScoped(ctx context.Context, userID, projectID string, scope CoreMemoryScope, section, content string) error
+}
+
 // Extractor analyzes interactions and extracts structured memories using LLM.
 type Extractor struct {
-	store               MemoryStorer
 	llm                 LLMCaller
+	store               MemoryStorer
 	logger              *zap.Logger
 	embedder            Embedder // optional: enables embedding-based dedup
 	maxPerRun           int      // cap on candidates accepted per ExtractFromInteraction
 	dedupCandidateLimit int      // P1 #9: K for the dedup near-neighbor lookup
 	piiMasker           *PIIMasker
+	corePromoter        CorePromoter
 }
 
 // NewExtractor creates a memory extractor.
@@ -77,6 +83,12 @@ func NewExtractor(store MemoryStorer, llmCaller LLMCaller, logger *zap.Logger) *
 		dedupCandidateLimit: defaultDedupCandidateLimit,
 		piiMasker:           NewPIIMasker(),
 	}
+}
+
+// WithCorePromoter attaches a CorePromoter to the extractor for auto-promotion.
+func (e *Extractor) WithCorePromoter(p CorePromoter) *Extractor {
+	e.corePromoter = p
+	return e
 }
 
 // SetEmbedder enables embedding-based dedup (much more accurate than Jaccard
@@ -290,6 +302,20 @@ func (e *Extractor) ExtractFromInteraction(ctx context.Context, userID, projectI
 			e.logger.Debug("failed to store memory", zap.Error(err))
 		} else {
 			stored++
+			
+			// Auto-promote high-importance preferences to Core Memory (AUDIT-P1-4)
+			if e.corePromoter != nil && c.Importance >= 0.9 && (memType == MemoryPreference || memType == MemoryDecision) {
+				go func(content string) {
+					// Use background context as the original ctx might cancel when the HTTP request finishes
+					bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := e.corePromoter.AppendToSectionScoped(bgCtx, userID, projectID, CoreScopeProject, "persona", content); err != nil {
+						e.logger.Debug("failed to auto-promote core memory", zap.Error(err))
+					} else {
+						e.logger.Info("auto-promoted memory to core", zap.String("content", truncate(content, 80)))
+					}
+				}(c.Content)
+			}
 		}
 	}
 
