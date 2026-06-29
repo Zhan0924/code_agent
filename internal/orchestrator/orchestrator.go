@@ -34,8 +34,6 @@ import (
 	"go.uber.org/zap"
 )
 
-var citedMemoryRegex = regexp.MustCompile(`\[mem:([a-zA-Z0-9-]+)\]`)
-
 // Context keys for orchestrator-local request metadata.
 //
 // Note: the (sessionID, userID, projectID) triple has moved to
@@ -1193,6 +1191,7 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 				_ = o.sessionMgr.AddMessage(workCtx, sessionID, models.Message{
 					Role: models.RoleAssistant, Content: result.content,
 				})
+				o.boostCitedMemories(workCtx, sessionID, result.content)
 				o.extractMemoriesAsync(workCtx, sessionID, task.UserInput, result.content)
 				o.recordTaskEpisodeAsync(workCtx, sessionID, task.UserInput, result.content, result.toolsUsed)
 				sink.Emit(models.ReactStreamEvent{Type: "done", TaskID: task.ID})
@@ -1983,8 +1982,8 @@ func (o *Orchestrator) boostCitedMemories(ctx context.Context, sessionID, respon
 	if o.memoryStore == nil {
 		return
 	}
-	matches := citedMemoryRegex.FindAllStringSubmatch(response, -1)
-	if len(matches) == 0 {
+	ids := memory.ParseCitationIDs(response)
+	if len(ids) == 0 {
 		return
 	}
 	sess, err := o.sessionMgr.Get(ctx, sessionID)
@@ -1992,24 +1991,12 @@ func (o *Orchestrator) boostCitedMemories(ctx context.Context, sessionID, respon
 		return
 	}
 
-	idMap := make(map[string]bool)
-	var refs []memory.TouchRef
-	for _, match := range matches {
-		if len(match) > 1 && !idMap[match[1]] {
-			idMap[match[1]] = true
-			refs = append(refs, memory.TouchRef{
-				UserID:    sess.UserID,
-				ProjectID: sess.ProjectID,
-				ID:        match[1],
-			})
-		}
-	}
-
-	if len(refs) > 0 {
-		if err := o.memoryStore.BoostScoreBatch(ctx, refs, 0.05); err != nil {
-			o.logger.Warn("failed to boost cited memories", zap.Error(err))
-		} else {
-			o.logger.Info("boosted cited memories", zap.Int("count", len(refs)))
-		}
+	refs := memory.TouchRefsFromCitationIDs(sess.UserID, sess.ProjectID, ids)
+	if err := o.memoryStore.BoostScoreBatch(ctx, refs, 0.05); err != nil {
+		metrics.MemoryCitationBoostTotal.WithLabelValues("auto", "err").Inc()
+		o.logger.Warn("failed to boost cited memories", zap.Error(err))
+	} else {
+		metrics.MemoryCitationBoostTotal.WithLabelValues("auto", "ok").Add(float64(len(refs)))
+		o.logger.Info("boosted cited memories", zap.Int("count", len(refs)))
 	}
 }

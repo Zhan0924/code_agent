@@ -1797,6 +1797,37 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 | `decay.factor` | 0.95 | `memory_decay_affected_count` | 每轮 0 → factor 太保守 | 降至 0.90 |
 | `demote.threshold` | 0.3 | `memory_demote_total{tier=hot}` | 持续为 0 → 阈值过低 | 提高至 0.35 观察热缓存占用 |
 
+## §35. AUDIT-P0-1: Citation Feedback Loop（召回 vs 使用）
+
+### 病征
+`enqueueTouches` / `access_count` 只能证明 memory「被 Retrieve 命中」，无法证明 LLM 在最终回答中实际采纳。Decay 对「召回但忽略」与「召回且使用」一视同仁，score 信号长期失真。
+
+### 修复策略
+1. **Prompt 注入可引用 ID**：`buildDynamicMemory` 为每条召回 memory 注入 `[mem:<id>]` 前缀，并 instruct LLM 在回答中显式引用。
+2. **ReAct 结束 auto-boost**：`ProcessMessage`（同步）与 `ProcessMessageStreamFull`（流式）在 assistant 终态写入后调用 `boostCitedMemories`，对被引用的 ID 执行 `BoostScoreBatch(+0.05)`。
+3. **统一解析**：`memory.ParseCitationIDs` 提取并去重 citation；`BoostScoreBatch` 在 hot/cold 双写并 clamp 到 `[0.01, 1.0]`。
+4. **指标**：`memory_citation_boost_total{source=auto,status=ok|err}`。
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `internal/orchestrator/memory_bridge.go` | `buildDynamicMemory` 注入 `[mem:id]` + 引用指令 |
+| `internal/orchestrator/orchestrator.go` | `boostCitedMemories`；sync/stream 双路径调用 |
+| `internal/memory/citation.go` | `ParseCitationIDs` / `TouchRefsFromCitationIDs` |
+| `internal/memory/pg_cold.go` / `redis_hot.go` | `BoostScoreBatch` score clamp |
+| `internal/metrics/memory.go` | `memory_citation_boost_total` |
+
+### 验证
+- `go test ./internal/orchestrator/... -run TestBoostCitedMemories`
+- `go test ./internal/memory/... -run 'Citation|Boost'`
+- `bash scripts/verify-audit-p0-1.sh`（Podman 栈：healthz → PG/Redis 种子 → feedback API → score 0.50→0.60）
+- 日志关键字：`boosted cited memories`（LLM 对话且含 citation 时出现）
+
+### 设计取舍
+- **保留 enqueueTouches**：召回信号（access）与使用信号（citation boost）并存，不互相替代。
+- **+0.05 轻量 boost**：避免单次引用过度放大；用户显式 feedback（P0-4）幅度更大（±0.1/0.2）。
+- **LLM 引用非强制**：机制就绪，是否 cite 取决于模型；无 citation 时不 boost。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

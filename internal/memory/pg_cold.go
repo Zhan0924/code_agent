@@ -247,16 +247,17 @@ func (p *PGCold) TouchBatch(ctx context.Context, ids []string) error {
 	return err
 }
 
-// BoostScoreBatch increases the score of specified memories by the given amount, capped at 1.0.
+// BoostScoreBatch increases the score of specified memories by the given amount,
+// clamped to [MinMemoryScore, MaxMemoryScore].
 func (p *PGCold) BoostScoreBatch(ctx context.Context, ids []string, boost float64) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	_, err := p.db.ExecContext(ctx, `
 		UPDATE memories
-		SET score = LEAST(score + $1, 1.0)
+		SET score = GREATEST(LEAST(score + $1, $3), $4)
 		WHERE id = ANY($2)
-	`, boost, pq.Array(ids))
+	`, boost, pq.Array(ids), MaxMemoryScore, MinMemoryScore)
 	return err
 }
 

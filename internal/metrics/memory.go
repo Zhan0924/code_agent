@@ -393,4 +393,21 @@ var (
 		Name:      "hot_scan_truncated_total",
 		Help:      "Times RedisHot.scanAll hit its cap (some keys not examined)",
 	}, []string{"endpoint"})
+
+	// MemoryFeedbackTotal counts user thumbs-up/down on assistant messages
+	// that cited at least one memory. direction: positive | negative.
+	MemoryFeedbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "code_agent",
+		Subsystem: "memory",
+		Name:      "feedback_total",
+		Help:      "User feedback events that adjusted cited memory scores",
+	}, []string{"direction"})
+
+	// MemoryCitationBoostTotal counts automatic score bumps from LLM citations.
+	MemoryCitationBoostTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "code_agent",
+		Subsystem: "memory",
+		Name:      "citation_boost_total",
+		Help:      "Automatic score adjustments from [mem:id] citations in assistant replies",
+	}, []string{"source", "status"})
 )

@@ -100,7 +100,10 @@ func (r *RedisHot) BoostScoreBatch(ctx context.Context, refs []TouchRef, boost f
 			if data then
 				local mem = cjson.decode(data)
 				if mem.score then
-					mem.score = math.min(mem.score + tonumber(ARGV[1]), 1.0)
+					local boosted = mem.score + tonumber(ARGV[1])
+					if boosted > tonumber(ARGV[2]) then boosted = tonumber(ARGV[2]) end
+					if boosted < tonumber(ARGV[3]) then boosted = tonumber(ARGV[3]) end
+					mem.score = boosted
 					redis.call("SET", key, cjson.encode(mem))
 				end
 			end
@@ -113,7 +116,7 @@ func (r *RedisHot) BoostScoreBatch(ctx context.Context, refs []TouchRef, boost f
 		keys[i] = r.keyPrefix(ref.UserID, ref.ProjectID) + ":" + ref.ID
 	}
 	
-	return script.Run(ctx, r.client, keys, boost).Err()
+	return script.Run(ctx, r.client, keys, boost, MaxMemoryScore, MinMemoryScore).Err()
 }
 
 // TouchBatch refreshes hot copies of each ref: bumps AccessCount and

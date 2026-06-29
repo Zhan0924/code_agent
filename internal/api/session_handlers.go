@@ -4,9 +4,10 @@ package api
 
 import (
 	"net/http"
-	"regexp"
 
 	"github.com/agent/code_agent/internal/memory"
+	"github.com/agent/code_agent/internal/metrics"
+	"github.com/agent/code_agent/internal/models"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -63,8 +64,6 @@ func (s *Server) handleUnpinMessage(c *gin.Context) {
 	})
 }
 
-var memoryCitationRe = regexp.MustCompile(`\[mem:([^\]]+)\]`)
-
 type FeedbackRequest struct {
 	Score float64 `json:"score" binding:"required"`
 }
@@ -83,8 +82,7 @@ func (s *Server) handleMessageFeedback(c *gin.Context) {
 	}
 
 	if s.memoryStore == nil {
-		s.logger.Warn("memoryStore is not initialized, skipping feedback boost")
-		c.JSON(http.StatusOK, gin.H{"status": "recorded_locally_only"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
 		return
 	}
 
@@ -94,14 +92,13 @@ func (s *Server) handleMessageFeedback(c *gin.Context) {
 		return
 	}
 
-	if msg.Role != "assistant" {
+	if msg.Role != models.RoleAssistant {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "feedback is only supported on assistant messages"})
 		return
 	}
 
-	// Parse cited memories
-	matches := memoryCitationRe.FindAllStringSubmatch(msg.Content, -1)
-	if len(matches) == 0 {
+	ids := memory.ParseCitationIDs(msg.Content)
+	if len(ids) == 0 {
 		c.JSON(http.StatusOK, gin.H{"status": "recorded", "memories_affected": 0})
 		return
 	}
@@ -112,28 +109,21 @@ func (s *Server) handleMessageFeedback(c *gin.Context) {
 		return
 	}
 
-	// Calculate boost (e.g., if score is -1, boost is -0.2; if +1, boost is +0.1)
 	boost := 0.1
+	direction := "positive"
 	if req.Score < 0 {
 		boost = -0.2
+		direction = "negative"
 	}
 
-	var refs []memory.TouchRef
-	for _, match := range matches {
-		if len(match) == 2 {
-			refs = append(refs, memory.TouchRef{
-				ID:        match[1],
-				UserID:    sess.UserID,
-				ProjectID: sess.ProjectID,
-			})
-		}
+	refs := memory.TouchRefsFromCitationIDs(sess.UserID, sess.ProjectID, ids)
+	if err := s.memoryStore.BoostScoreBatch(c.Request.Context(), refs, boost); err != nil {
+		s.logger.Error("failed to boost memories on feedback", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to apply feedback to memories"})
+		return
 	}
 
-	if len(refs) > 0 {
-		if err := s.memoryStore.BoostScoreBatch(c.Request.Context(), refs, boost); err != nil {
-			s.logger.Error("failed to boost memories on feedback", zap.Error(err))
-		}
-	}
+	metrics.MemoryFeedbackTotal.WithLabelValues(direction).Add(float64(len(refs)))
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":            "recorded",
