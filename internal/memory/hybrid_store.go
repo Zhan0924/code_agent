@@ -53,7 +53,7 @@ func (h *HybridStore) Store(ctx context.Context, m *Memory) (retErr error) {
 	// the same hit. limit=3 was the pre-P1 #7 value and was too small
 	// to see redundancy beyond the topmost matches.
 	if h.cold != nil && len(m.Embedding) > 0 && h.resolver != nil {
-		candidates, err := h.cold.RetrieveByVector(m.Embedding, m.UserID, m.ProjectID, dedupOversample)
+		candidates, err := h.cold.RetrieveByVector(m.Embedding, m.UserID, m.ProjectID, h.DedupOversample())
 		if err == nil && len(candidates) > 0 {
 			conflicts := h.resolver.FindConflicts(m, candidates)
 			if len(conflicts) > 0 {

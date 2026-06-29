@@ -6,16 +6,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// dedupOversample is the candidate budget HybridStore.Store gives the
-// vector search when looking for conflicts. The pre-P1 #7 value was 3,
-// which was insufficient to catch duplicate backlog (the duplicates
-// past rank-3 stayed alive forever). 10 is conservative — small enough
-// that pgvector still hits the IVFFlat index efficiently, large enough
-// that mid-size duplicate clusters get cleaned up in one Store call.
-//
-// Capped further by ConflictResolver.MaxConflicts() before we touch
-// cold transactions — see HybridStore.dedupMerge.
-const dedupOversample = 10
+// defaultDedupOversample is the candidate budget HybridStore.Store gives the
+// vector search when looking for conflicts (REAUDIT-P2-1 configurable).
+const defaultDedupOversample = 10
 
 // Embedder generates vector embeddings from text.
 type Embedder interface {
@@ -61,18 +54,36 @@ type HybridStore struct {
 	// SetDemoteThreshold from main.go.
 	demoteThreshold float64
 
+	dedupOversample int
+
 	masker *PIIMasker
 }
 
 // NewHybridStore creates a hybrid memory store.
 func NewHybridStore(hot *RedisHot, cold *PGCold, logger *zap.Logger) *HybridStore {
 	return &HybridStore{
-		hot:      hot,
-		cold:     cold,
-		logger:   logger.With(zap.String("component", "memory.hybrid")),
-		resolver: NewConflictResolver(cold),
-		masker:   NewPIIMasker(),
+		hot:             hot,
+		cold:            cold,
+		logger:          logger.With(zap.String("component", "memory.hybrid")),
+		resolver:        NewConflictResolver(cold),
+		masker:          NewPIIMasker(),
+		dedupOversample: defaultDedupOversample,
 	}
+}
+
+// SetDedupOversample overrides conflict-detection vector candidate oversample K.
+func (h *HybridStore) SetDedupOversample(n int) {
+	if n > 0 {
+		h.dedupOversample = n
+	}
+}
+
+// DedupOversample returns the effective oversample K (default 10).
+func (h *HybridStore) DedupOversample() int {
+	if h.dedupOversample <= 0 {
+		return defaultDedupOversample
+	}
+	return h.dedupOversample
 }
 
 // SetBlackboard sets the blackboard for publishing events.

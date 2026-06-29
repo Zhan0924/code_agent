@@ -122,6 +122,13 @@ func NewMemoryAdapter(rdb *redis.Client, pgStore *store.Store, embedder memory.E
 	}
 
 	hybrid := memory.NewHybridStore(hot, cold, logger)
+	if memCfg.DedupOversample > 0 {
+		hybrid.SetDedupOversample(memCfg.DedupOversample)
+	}
+	logger.Info("hybrid dedup oversample effective",
+		zap.String("audit_id", "REAUDIT-P2-1"),
+		zap.String("op", "dedup_oversample_config"),
+		zap.Int("dedup_oversample", hybrid.DedupOversample()))
 	if embedder != nil {
 		hybrid.SetEmbedder(embedder)
 	}

@@ -609,6 +609,7 @@ func main() {
 			zap.Bool("demote_enabled", cfg.Memory.Demote.Enabled),
 			zap.Float64("demote_threshold", cfg.Memory.Demote.Threshold),
 			zap.Float64("core_promote_threshold", memoryExtractor.CorePromoteThreshold()),
+			zap.Int("dedup_oversample", memAdapter.HybridStore().DedupOversample()),
 		)
 
 		// ─── Active Memory Tools (MemGPT-style core memory) ─────────────────

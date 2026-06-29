@@ -158,6 +158,10 @@ type MemoryConfig struct {
 	// CorePromoteThreshold 是 Extractor 自动晋升 Core Memory 的 importance
 	// 下限（preference/decision）。默认 0.9；见 docs/architecture/25_memory.md §34。
 	CorePromoteThreshold float64 `mapstructure:"core_promote_threshold"`
+
+	// DedupOversample 是 HybridStore.Store 冲突检测时的向量候选超采样倍数。
+	// 默认 10；见 docs/architecture/25_memory.md §34。
+	DedupOversample int `mapstructure:"dedup_oversample"`
 }
 
 // MemoryEpisodicGCConfig configures the periodic deletion of old episodic memories
