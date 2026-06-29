@@ -165,14 +165,7 @@ const memoryExtractionTimeout = 30 * time.Second
 // shift between turns; only the [Long-Term Memory] block changes with
 // `query`. See `internal/context/prompt_builder.go` for the surrounding
 // cache-friendly slot architecture.
-func (o *Orchestrator) buildLongTermMemory(ctx context.Context, sessionSummary, userID, projectID, query string) string {
-	o.logger.Debug("buildLongTermMemory called",
-		zap.String("user_id", userID),
-		zap.String("project_id", projectID),
-		zap.String("query", query),
-		zap.Bool("has_memory_store", o.memoryStore != nil),
-		zap.Bool("has_core_memory", o.coreMemory != nil))
-
+func (o *Orchestrator) buildStableMemory(ctx context.Context, sessionSummary, userID, projectID string) string {
 	var parts []string
 
 	// 1. Core memory (always-on, no query needed). Highest stability slot.
@@ -186,6 +179,12 @@ func (o *Orchestrator) buildLongTermMemory(ctx context.Context, sessionSummary, 
 	if sessionSummary != "" {
 		parts = append(parts, sessionSummary)
 	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+func (o *Orchestrator) buildDynamicMemory(ctx context.Context, userID, projectID, query string) string {
+	var parts []string
 
 	// 3. Query-specific long-term memories (lowest stability, changes per turn).
 	if o.memoryStore != nil && query != "" {

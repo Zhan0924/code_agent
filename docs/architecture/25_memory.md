@@ -1767,6 +1767,14 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 ### 修复策略
 引入了动态 Embedding 列。在 `pg_cold.go` 中，默认 1536 维度继续使用 `embedding` 列，其他维度则使用命名约定 `embedding_{dim}` (例如 `embedding_3072`)。`Migrate()` 过程中如果发现维度不是 1536，会自动添加对应的特定维度列并只对该列建立 HNSW 索引（限制 `dim <= 2000` 时才建立 HNSW，避免 pgvector 限制）。查询和插入都根据配置的维度动态读写对应的列，从而支持"双 column 渐进迁移"，避免了直接丢失原有数据和引发崩溃的问题。
 
+## §33. AUDIT-P1-6: 召回导致 KV-Cache 失效 (Prompt Cache Invalidation)
+
+### 病征
+在之前的实现中，`prompt_builder.go` 将 Query-specific 的 Long-Term Memories（由于它随当前用户的查询变化）作为 `UpdateLongTermMemory` 的一部分写入了 System Prompt（稳定前缀）。这就导致每一次新的提问都会更改前缀哈希，从而将 LLM 中的 Prefix Cache 全部命中失败（即使对话历史没有改变）。
+
+### 修复策略
+将 `orchestrator` 中生成长期记忆的步骤拆分为两部分：`buildStableMemory`（返回稳定的 Core Memory 和 Session Summary）和 `buildDynamicMemory`（返回 Query-specific 检索记忆）。将稳定的部分传递给 `UpdateLongTermMemory` 确保前缀哈希稳定；而动态部分直接传入 `prompt_builder.BuildPrompt`，并作为一条独立的 System Message 追加在对话历史之后（Region 4.5），从而最大化跨 Turn 的 KV Cache 命中率。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

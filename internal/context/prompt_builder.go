@@ -138,6 +138,7 @@ func (pb *PromptBuilder) BuildPrompt(
 	session *models.Session,
 	codeChunks []models.CodeChunk,
 	relevanceScores []float64,
+	dynamicMemory string,
 	currentMessage string,
 ) []models.Message {
 	var messages []models.Message
@@ -216,6 +217,18 @@ func (pb *PromptBuilder) BuildPrompt(
 			recentMsgs := pb.pruner.PruneMessages(session.Messages, remainingBudget)
 			messages = append(messages, recentMsgs...)
 		}
+	}
+
+	// ── Region 4.5: Turn-Specific Dynamic Memory ──
+	if dynamicMemory != "" {
+		dynMsg := models.Message{
+			Role:    models.RoleSystem,
+			Content: dynamicMemory,
+		}
+		if pb.enablePromptCaching {
+			dynMsg.CacheControl = &models.CacheControl{Type: "ephemeral"}
+		}
+		messages = append(messages, dynMsg)
 	}
 
 	// ── Region 5: Current User Message ──

@@ -579,10 +579,12 @@ func (o *Orchestrator) reactLoop(ctx context.Context, task *models.Task) (string
 			userID = sess.UserID
 			projectID = sess.ProjectID
 		}
-		return o.buildLongTermMemory(ctx, summary, userID, projectID, task.UserInput)
+		return o.buildStableMemory(ctx, summary, userID, projectID)
 	}())
 
-	messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
+	dynamicMemory := o.buildDynamicMemory(ctx, sess.UserID, sess.ProjectID, task.UserInput)
+
+	messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, dynamicMemory, task.UserInput)
 	if len(messages) > 0 && messages[0].Role == models.RoleSystem {
 		messages[0] = o.buildSystemMessage(task.Intent)
 	}
@@ -1085,21 +1087,21 @@ func (o *Orchestrator) ProcessMessageStreamFull(reqCtx context.Context, sessionI
 			}
 		}
 
+		summary := ""
+		userID := ""
+		projectID := ""
+		if sess != nil {
+			summary = sess.Summary
+			userID = sess.UserID
+			projectID = sess.ProjectID
+		}
+
 		o.promptBuilder.UpdateLongTermMemory(func() string {
-			summary := ""
-			if sess != nil {
-				summary = sess.Summary
-			}
-			userID := ""
-			projectID := ""
-			if sess != nil {
-				userID = sess.UserID
-				projectID = sess.ProjectID
-			}
-			return o.buildLongTermMemory(workCtx, summary, userID, projectID, task.UserInput)
+			return o.buildStableMemory(workCtx, summary, userID, projectID)
 		}())
 
-		messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, task.UserInput)
+		dynamicMemory := o.buildDynamicMemory(workCtx, userID, projectID, task.UserInput)
+		messages := o.promptBuilder.BuildPrompt(sess, codeChunks, relevanceScores, dynamicMemory, task.UserInput)
 		if len(messages) > 0 && messages[0].Role == models.RoleSystem {
 			messages[0] = o.buildSystemMessage(task.Intent)
 		}
