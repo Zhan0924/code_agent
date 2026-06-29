@@ -64,7 +64,24 @@ func NewPGTrajectoryStore(db *sql.DB, logger *zap.Logger, embedder IntentEmbedde
 // Migrate creates the trajectories table and indexes idempotently.
 // Forward-compatible: every column uses IF NOT EXISTS so re-running on
 // an existing deployment is a no-op.
+//
+// AUDIT-P0-3: trajectory recall used to ride an IVFFlat index with
+// lists=50, which underfits any tenant below a few thousand rows and
+// silently degrades the intent-KNN signal that the agent loop relies
+// on. We now mirror the memories table's HNSW switch (see
+// `internal/memory/pg_cold.go::Migrate`): drop the legacy IVFFlat
+// index if present, then build an HNSW index — pgvector only supports
+// HNSW for `dim <= 2000`, so callers running larger embedders fall
+// back to a sequential scan (still correct, just slower) until the
+// index can be reconfigured at the application layer.
 func (s *PGTrajectoryStore) Migrate() error {
+	hnswStmt := ""
+	if s.embedDim > 0 && s.embedDim <= 2000 {
+		hnswStmt = `
+		CREATE INDEX IF NOT EXISTS idx_trajectories_intent_embedding_hnsw
+			ON trajectories USING hnsw (intent_embedding vector_cosine_ops);
+		`
+	}
 	createStmt := fmt.Sprintf(`
 		CREATE EXTENSION IF NOT EXISTS vector;
 		CREATE TABLE IF NOT EXISTS trajectories (
@@ -78,9 +95,11 @@ func (s *PGTrajectoryStore) Migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_trajectories_intent ON trajectories(intent);
 		CREATE INDEX IF NOT EXISTS idx_trajectories_success ON trajectories(success);
-		CREATE INDEX IF NOT EXISTS idx_trajectories_intent_embedding
-			ON trajectories USING ivfflat (intent_embedding vector_cosine_ops) WITH (lists = 50);
-	`, s.embedDim)
+		-- Drop the legacy IVFFlat index — recall on small tables was poor
+		-- and we now uniformly prefer HNSW (matches memories table).
+		DROP INDEX IF EXISTS idx_trajectories_intent_embedding;
+		%s
+	`, s.embedDim, hnswStmt)
 	if _, err := s.db.Exec(createStmt); err != nil {
 		return fmt.Errorf("trajectory store migrate: %w", err)
 	}

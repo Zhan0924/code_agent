@@ -63,7 +63,7 @@ LLM 蒸馏（GPT-4o mini 跑 extractionPrompt）质量高但每次对话**多一
 ### 为什么"热/冷"两层而不是只用 Postgres？
 
 - **热层 Redis**（24h TTL）：单次召回 < 5ms，写入 < 2ms。最近对话产生的 Memory 90% 落在这里；
-- **冷层 PG + pgvector**：单次召回 ~20ms（ivfflat 索引），但**永久存储 + 向量精确搜索**。
+- **冷层 PG + pgvector**：单次召回 ~20ms（HNSW 索引，AUDIT-P0-3 把历史 IVFFlat 索引替换为 HNSW），**永久存储 + 向量精确搜索**。
 
 读路径：Redis 优先；命中数足够（≥ limit）直接返回，否则**降级**到 PG。这是经典 cache-aside 模式，跟 [02_session](02_session.md) 的 hot/cold session 是同源设计。
 
@@ -504,8 +504,12 @@ CREATE TABLE memories (
 CREATE INDEX idx_memories_user_project ON memories(user_id, project_id);
 CREATE INDEX idx_memories_type ON memories(type);
 CREATE INDEX idx_memories_score ON memories(score DESC);
-CREATE INDEX idx_memories_embedding ON memories
-    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- AUDIT-P0-3: HNSW replaces the legacy IVFFlat index — small agent
+-- tables (< 1k rows/tenant) recall poorly under IVFFlat lists=100,
+-- and HNSW behaves correctly across the full size spectrum.
+CREATE INDEX idx_memories_embedding_hnsw ON memories
+    USING hnsw (embedding vector_cosine_ops);
+DROP INDEX IF EXISTS idx_memories_embedding;
 ```
 
 **索引选择**：
@@ -513,18 +517,20 @@ CREATE INDEX idx_memories_embedding ON memories
 - `idx_memories_user_project` —— 几乎所有查询都过滤这两列，复合索引必备；
 - `idx_memories_type` —— 按类型筛选（"只看 preference"）；
 - `idx_memories_score DESC` —— 排序辅助；
-- `idx_memories_embedding ivfflat lists=100` —— pgvector 的近似最近邻索引。
+- `idx_memories_embedding_hnsw` —— pgvector HNSW，召回率 ~99%、对 < 1k 行小表仍稳定（参见 §7.2）。
 
-### 7.2 为什么 ivfflat 不是 hnsw？
+### 7.2 为什么是 HNSW 而非 IVFFlat（AUDIT-P0-3）
 
-`pgvector` 提供两种向量索引：
+历史版本写死了 `USING ivfflat WITH (lists = 100)`。pgvector 官方推荐 `lists ≈ √rows`，对于早期部署的小表（每 tenant 几十到几百条）100 个聚类严重欠拟合，召回率退化到 70–80%，再被 P1 #9 的 K=30 候选放大也补不回来。
 
-| 索引 | 召回率 | 写延迟 | 内存占用 | 适用规模 |
-|------|--------|--------|----------|----------|
-| ivfflat | ~95% | 低 | 低（基于聚类）| < 10M 行 |
-| hnsw | ~99% | 高 | 高（每行 ~100B 额外）| > 1M 行 |
+| 索引 | 小表召回率（< 1k 行） | 大表召回率（> 1M 行） | 写延迟 | 内存占用 |
+|------|-----|-----|-----|-----|
+| IVFFlat lists=100 | ~70%（欠拟合）| ~95% | 低 | 低 |
+| HNSW（默认 m=16, ef_construction=64）| ~99% | ~99% | 高 | 中（~100B/row）|
 
-Memory 表预期规模：每 user 每 project 几百条；1000 user × 10 project × 500 = 5M 行。完全在 ivfflat 舒适区。`lists=100` 是经验值（约 √行数 / 10）——pgvector 文档推荐。
+迁移路径：`Migrate()` 在新部署上直接建 HNSW（`dim<=2000` 时），同时 `DROP INDEX IF EXISTS idx_memories_embedding` 干掉历史 IVFFlat 索引。embedding 维度 > 2000（pgvector HNSW 上限）时不建索引，查询走 seq scan，仍然正确——只是慢。
+
+Trajectory 表（`internal/agentloop/pg_trajectory_store.go`）走同一条迁移路径，废弃 `idx_trajectories_intent_embedding`（IVFFlat lists=50），新建 `idx_trajectories_intent_embedding_hnsw`。
 
 ### 7.3 cosine 距离查询
 
@@ -535,7 +541,7 @@ ORDER BY embedding <=> $3
 LIMIT $4
 ```
 
-`<=>` 是 pgvector 的 cosine 距离运算符（1 - cosine_similarity）。`ORDER BY <=>` 才能使用 ivfflat 索引（其他距离运算符 `<#>` `<-> ` 需要不同的索引类型）。
+`<=>` 是 pgvector 的 cosine 距离运算符（1 - cosine_similarity）。HNSW 与 IVFFlat 都通过 `vector_cosine_ops` 操作类绑定到 `<=>`，所以查询 SQL 不需要随索引切换而变化——索引切换对调用方完全透明。
 
 ### 7.4 `formatVector` / `parseVector` —— 文本协议
 
