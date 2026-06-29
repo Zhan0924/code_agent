@@ -65,67 +65,6 @@ type HybridStore struct {
 	masker *PIIMasker
 }
 
-// PromoteOptions tunes the read-path cold→hot back-fill batcher.
-// The defaults are sized for a Retrieve QPS of ~50/s with ~20%
-// cold-only-hit rate: 50 * 0.2 = 10 promotes/s ≪ BatchSize 50
-// and well under QueueSize 256.
-type PromoteOptions struct {
-	// Threshold: only promote memories with Score >= Threshold. Score
-	// is the importance signal from Extractor / ConflictResolver, so
-	// 0.7 keeps tier-1 cached without polluting hot with noise.
-	Threshold float64
-	// BatchSize: single-pipeline SET fan-out cap.
-	BatchSize int
-	// FlushInterval: timer-based flush for partial batches.
-	FlushInterval time.Duration
-	// QueueSize: bounded chan; overflow → drop + metric.
-	QueueSize int
-}
-
-func (o PromoteOptions) withDefaults() PromoteOptions {
-	if o.Threshold <= 0 {
-		o.Threshold = 0.7
-	}
-	if o.BatchSize <= 0 {
-		o.BatchSize = 50
-	}
-	if o.FlushInterval <= 0 {
-		o.FlushInterval = 5 * time.Second
-	}
-	if o.QueueSize <= 0 {
-		o.QueueSize = 256
-	}
-	return o
-}
-
-// AccessBatcherOptions tunes the read-path Touch debouncer. The defaults
-// (`.withDefaults()`) are calibrated for "200 QPS Retrieve × 5 results
-// stable state" — i.e. ~1000 IDs/s of throughput.
-type AccessBatcherOptions struct {
-	// BatchSize caps the number of IDs per UPDATE round-trip. Default 100.
-	BatchSize int
-	// FlushInterval forces a flush even when BatchSize isn't reached.
-	// Default 5s — bounds Decay's last_accessed_at staleness.
-	FlushInterval time.Duration
-	// QueueSize bounds the in-memory chan capacity. Default 1024.
-	// At saturation the read path drops IDs (non-blocking) and metrics
-	// surface the back-pressure via MemoryTouchQueueDropsTotal.
-	QueueSize int
-}
-
-func (o AccessBatcherOptions) withDefaults() AccessBatcherOptions {
-	if o.BatchSize <= 0 {
-		o.BatchSize = 100
-	}
-	if o.FlushInterval <= 0 {
-		o.FlushInterval = 5 * time.Second
-	}
-	if o.QueueSize <= 0 {
-		o.QueueSize = 1024
-	}
-	return o
-}
-
 // NewHybridStore creates a hybrid memory store.
 func NewHybridStore(hot *RedisHot, cold *PGCold, logger *zap.Logger) *HybridStore {
 	return &HybridStore{
@@ -135,34 +74,6 @@ func NewHybridStore(hot *RedisHot, cold *PGCold, logger *zap.Logger) *HybridStor
 		resolver: NewConflictResolver(cold),
 		masker:   NewPIIMasker(),
 	}
-}
-
-// EnableAccessBatcher allocates the touchQueue and stores the tuning
-// options. Call this before StartAccessBatcher; the read path checks
-// for a non-nil touchQueue to decide whether to enqueue. main.go
-// invokes this once during construction with config-driven options.
-func (h *HybridStore) EnableAccessBatcher(opts AccessBatcherOptions) {
-	h.accessOpts = opts.withDefaults()
-	h.touchQueue = make(chan TouchRef, h.accessOpts.QueueSize)
-}
-
-// EnablePromoteBatcher allocates the promoteQueue and stores the
-// tuning options. Pairs with StartPromoteBatcher (background goroutine)
-// and enqueuePromote (read-path hook). All three must run for the
-// P1 #8 cold→hot back-fill to take effect.
-func (h *HybridStore) EnablePromoteBatcher(opts PromoteOptions) {
-	h.promoteOpts = opts.withDefaults()
-	h.promoteQueue = make(chan Memory, h.promoteOpts.QueueSize)
-}
-
-// SetDemoteThreshold configures the P1 #8 hot-eviction floor used by
-// the Decay path. Zero (default) keeps the legacy behavior of "SET with
-// reduced score" — no DELs from hot during decay. Positive value
-// triggers DEL when an entry's score crosses below the threshold this
-// iteration. Must be > 0.01 to interact meaningfully with the existing
-// score floor.
-func (h *HybridStore) SetDemoteThreshold(t float64) {
-	h.demoteThreshold = t
 }
 
 // SetBlackboard sets the blackboard for publishing events.
@@ -277,116 +188,6 @@ func (h *HybridStore) Store(ctx context.Context, m *Memory) (retErr error) {
 	}
 
 	h.publishEvent(ctx, "added", m)
-	return nil
-}
-
-// dedupMerge is the P1 #7 conflict-resolution kernel. Given the
-// non-empty list of conflicting memories we found in cold + the new
-// memory being stored, it:
-//
-//  1. Picks one anchor (highest score, then access count, then oldest
-//     by CreatedAt — see PickAnchor for the full tie-breaker order).
-//  2. Reinforces the anchor's AccessCount + LastAccessedAt with every
-//     non-anchor duplicate's signal — so the surviving entry inherits
-//     the cumulative "this concept was seen N times" weight.
-//  3. Folds the new memory into the anchor via ResolveWithOutcome
-//     (which decides override / preserve / merge based on score gap).
-//  4. Writes the merged anchor + deletes the non-anchor IDs in a single
-//     cold transaction (PGCold.DedupTx). Either both land or nothing
-//     changes — no half-state where dups stay alive after anchor lost.
-//  5. Best-effort: drops the same IDs from hot via DeleteBatch and
-//     re-publishes the anchor to hot via Store.
-//  6. Emits metrics — outcome="dedup" for the conflict counter, plus
-//     dedup_removed_total (count of deletions) and dedup_batch_size
-//     histogram for percentile tracking.
-//
-// Returns nil on success or the underlying cold-transaction error so
-// the caller (Store) can surface it to the metrics decorator. If the
-// dedup branch was a no-op (e.g. only one conflict and the anchor IS
-// that one — so dupIDs is empty), we still go through DedupTx so the
-// reinforcement on the anchor is committed.
-func (h *HybridStore) dedupMerge(ctx context.Context, conflicts []Memory, newMem *Memory) error {
-	if len(conflicts) == 0 {
-		return nil
-	}
-
-	// Cap to MaxConflicts: a runaway candidate set (e.g. 200 highly
-	// similar entries) shouldn't tie up a multi-second DELETE.
-	// We process the top-N by anchor priority — PickAnchor already
-	// sorts implicitly via its scan, but we materialise the order
-	// here so the cap is applied to the *most relevant* conflicts.
-	maxN := h.resolver.MaxConflicts()
-	if len(conflicts) > maxN {
-		// Sort conflicts by anchor priority DESC so the cap keeps the
-		// "best" candidates — same comparator as PickAnchor.
-		sort.SliceStable(conflicts, func(i, j int) bool {
-			return anchorBeats(conflicts[i], conflicts[j])
-		})
-		conflicts = conflicts[:maxN]
-	}
-
-	anchorIdx := PickAnchor(conflicts)
-	anchor := conflicts[anchorIdx]
-
-	dupIDs := make([]string, 0, len(conflicts)-1)
-	dupRefs := make([]TouchRef, 0, len(conflicts)-1)
-	for i, c := range conflicts {
-		if i == anchorIdx {
-			continue
-		}
-		// Fold the duplicate's reinforcement counters into the anchor
-		// before we drop it. The anchor's content/embedding/score are
-		// authoritative — only AccessCount + LastAccessedAt accumulate.
-		h.resolver.ReinforceFromDup(&anchor, c)
-		dupIDs = append(dupIDs, c.ID)
-		dupRefs = append(dupRefs, TouchRef{UserID: c.UserID, ProjectID: c.ProjectID, ID: c.ID})
-	}
-
-	// Now resolve the new memory against the (already reinforced)
-	// anchor. This is where score-aware override/preserve/merge runs.
-	resolved, outcome := h.resolver.ResolveWithOutcome(&anchor, newMem)
-
-	// Cold transaction: anchor UPDATE + dup DELETEs atomically.
-	// dupIDs may be empty if len(conflicts)==1; DedupTx tolerates
-	// that and just runs the UPDATE.
-	if err := h.cold.DedupTx(ctx, resolved, dupIDs); err != nil {
-		h.logger.Warn("dedup cold transaction failed",
-			zap.Error(err),
-			zap.String("anchor_id", resolved.ID),
-			zap.Int("dup_count", len(dupIDs)))
-		return err
-	}
-
-	// Metrics: dedup outcome supersedes the inner ResolveWithOutcome
-	// outcome when we actually removed duplicates — operators care
-	// about "we cleaned up duplicates" more than "we did a merge-blend
-	// on the anchor" in that branch. When dupIDs is empty (single
-	// conflict, anchor==conflicts[0]) we fall back to the per-resolve
-	// outcome string.
-	if len(dupIDs) > 0 {
-		metrics.MemoryConflictTotal.WithLabelValues("dedup").Inc()
-		metrics.MemoryDedupRemovedTotal.Add(float64(len(dupIDs)))
-		metrics.MemoryDedupBatchSize.Observe(float64(len(dupIDs)))
-	} else {
-		metrics.MemoryConflictTotal.WithLabelValues(string(outcome)).Inc()
-	}
-
-	// Hot: best-effort dual write. Drop dup keys then re-store the
-	// anchor. Errors are logged at Debug — cold is the source of truth.
-	if h.hot != nil {
-		if len(dupRefs) > 0 {
-			if hotErr := h.hot.DeleteBatch(ctx, dupRefs); hotErr != nil {
-				h.logger.Debug("hot dedup DeleteBatch failed",
-					zap.Error(hotErr), zap.Int("count", len(dupRefs)))
-			}
-		}
-		if hotErr := h.hot.Store(ctx, resolved); hotErr != nil {
-			h.logger.Debug("hot dedup anchor Store failed",
-				zap.Error(hotErr), zap.String("id", resolved.ID))
-		}
-	}
-
-	h.publishEvent(ctx, "merged", resolved)
 	return nil
 }
 
@@ -579,46 +380,6 @@ const rrfK = 60.0
 // Magnitude chosen so a hot-list rank-5 still beats a cold-list rank-1 in
 // pure isolation, encouraging recently-discussed context to surface.
 const hotBonus = 1.0 / (rrfK + 0)
-
-func fuseRRF(hot, cold []Memory, limit int) []Memory {
-	type entry struct {
-		mem   Memory
-		score float64
-	}
-	merged := make(map[string]*entry, len(hot)+len(cold))
-
-	for i, m := range hot {
-		e, ok := merged[m.ID]
-		if !ok {
-			e = &entry{mem: m}
-			merged[m.ID] = e
-		}
-		e.score += 1.0/(rrfK+float64(i+1)) + hotBonus
-	}
-	for i, m := range cold {
-		e, ok := merged[m.ID]
-		if !ok {
-			e = &entry{mem: m}
-			merged[m.ID] = e
-		}
-		e.score += 1.0 / (rrfK + float64(i+1))
-	}
-
-	out := make([]entry, 0, len(merged))
-	for _, e := range merged {
-		out = append(out, *e)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].score > out[j].score })
-
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	result := make([]Memory, len(out))
-	for i, e := range out {
-		result[i] = e.mem
-	}
-	return result
-}
 
 // RetrieveByType is the type-filtered semantic search variant of Retrieve.
 // Used by orchestrator.buildLongTermMemory's importance bucketing to
@@ -828,9 +589,9 @@ func (h *HybridStore) DeleteByUser(ctx context.Context, userID string) (int64, e
 	if userID == "" {
 		return 0, nil
 	}
-	
+
 	var totalDeleted int64
-	
+
 	if h.cold != nil {
 		if deleted, err := h.cold.DeleteByUser(ctx, userID); err != nil {
 			return 0, fmt.Errorf("cold tier delete failed: %w", err)
@@ -838,7 +599,7 @@ func (h *HybridStore) DeleteByUser(ctx context.Context, userID string) (int64, e
 			totalDeleted += deleted
 		}
 	}
-	
+
 	if h.hot != nil {
 		if deleted, err := h.hot.DeleteByUser(ctx, userID); err != nil {
 			return totalDeleted, fmt.Errorf("hot tier delete failed: %w", err)
@@ -846,7 +607,7 @@ func (h *HybridStore) DeleteByUser(ctx context.Context, userID string) (int64, e
 			totalDeleted += deleted
 		}
 	}
-	
+
 	if h.blackboard != nil {
 		// Broadcast deletion so any active listeners can drop caches
 		dummyMem := &Memory{
@@ -854,10 +615,9 @@ func (h *HybridStore) DeleteByUser(ctx context.Context, userID string) (int64, e
 		}
 		_ = h.blackboard.Publish(ctx, "deleted_user", dummyMem)
 	}
-	
+
 	return totalDeleted, nil
 }
-
 
 // ListActiveDistillTenants delegates to cold (PG owns the GROUP BY index).
 // Hot tier doesn't store cross-tenant aggregates, so there's nothing to
@@ -889,7 +649,7 @@ func (h *HybridStore) BoostScoreBatch(ctx context.Context, refs []TouchRef, boos
 		return nil
 	}
 	var errs []error
-	
+
 	// Cold store only needs IDs
 	if h.cold != nil {
 		ids := make([]string, len(refs))
@@ -900,14 +660,14 @@ func (h *HybridStore) BoostScoreBatch(ctx context.Context, refs []TouchRef, boos
 			errs = append(errs, err)
 		}
 	}
-	
+
 	// Hot store needs full TouchRefs
 	if h.hot != nil {
 		if err := h.hot.BoostScoreBatch(ctx, refs, boost); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	
+
 	if len(errs) > 0 {
 		return fmt.Errorf("boost score errors: %v", errs)
 	}
@@ -924,368 +684,4 @@ func (h *HybridStore) TouchBatch(ctx context.Context, ids []string) error {
 		return nil
 	}
 	return h.cold.TouchBatch(ctx, ids)
-}
-
-// enqueueTouches is the read-path hook: after a retrieval returns N
-// memories, we want to record "these were accessed" without paying N
-// UPDATEs of latency. The batcher goroutine (StartAccessBatcher) folds
-// many enqueues into a single UPDATE round-trip — and into a single
-// hot pipeline GET+SET, since P0 #5.
-//
-// Non-blocking by design: if the queue is full, we drop and emit a
-// metric. Better to under-count accesses than to slow down reads.
-func (h *HybridStore) enqueueTouches(ms []Memory) {
-	if h.touchQueue == nil {
-		return
-	}
-	for _, m := range ms {
-		if m.ID == "" {
-			continue
-		}
-		ref := TouchRef{UserID: m.UserID, ProjectID: m.ProjectID, ID: m.ID}
-		select {
-		case h.touchQueue <- ref:
-		default:
-			metrics.MemoryTouchQueueDropsTotal.Inc()
-		}
-	}
-}
-
-// flushTouches is the batcher's terminal step: dual-write cold + hot.
-// Cold is the source of truth — its error decides status="ok"|"err".
-// Hot is best-effort: a stale hot copy just makes the next Retrieve
-// see slightly older AccessCount/LastAccessedAt, but cold has the
-// truth and Decay reads from cold.
-func (h *HybridStore) flushTouches(refs []TouchRef) error {
-	if len(refs) == 0 {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var coldErr error
-	if h.cold != nil {
-		ids := make([]string, len(refs))
-		for i, r := range refs {
-			ids[i] = r.ID
-		}
-		coldErr = h.cold.TouchBatch(ctx, ids)
-	}
-	if h.hot != nil {
-		if err := h.hot.TouchBatch(ctx, refs); err != nil {
-			// Hot drift is recoverable — cold is the durable record.
-			// Surface for ops awareness but don't fail the batch.
-			h.logger.Warn("hot touch batch failed (cold remains source of truth)",
-				zap.Int("refs", len(refs)), zap.Error(err))
-		}
-	}
-	return coldErr
-}
-
-// StartAccessBatcher runs the debouncing flusher. Returns when ctx is
-// cancelled, after draining any pending refs in one last flush.
-//
-// Concurrency contract: caller invokes this exactly once in a goroutine
-// after EnableAccessBatcher. Multiple batchers would race on the same
-// touchQueue and produce non-deterministic flush sizes; we deliberately
-// don't guard against that — main.go is the sole caller.
-func (h *HybridStore) StartAccessBatcher(ctx context.Context) {
-	if h.touchQueue == nil {
-		return
-	}
-	if h.cold == nil && h.hot == nil {
-		return
-	}
-	h.logger.Info("memory access batcher started",
-		zap.Int("batch_size", h.accessOpts.BatchSize),
-		zap.Duration("flush_interval", h.accessOpts.FlushInterval),
-		zap.Int("queue_size", h.accessOpts.QueueSize))
-	defer h.logger.Info("memory access batcher stopping")
-
-	runAccessBatcherLoop(ctx, h.touchQueue, h.accessOpts.BatchSize, h.accessOpts.FlushInterval, h.flushTouches, h.logger)
-}
-
-// runAccessBatcherLoop is the pure state machine of the access batcher.
-// Exposed unexported for testing — see TestRunAccessBatcherLoop_*.
-//
-// flush is invoked on every drained batch with a slice the loop owns;
-// the callee MUST NOT retain the slice past the call. Status metrics
-// are recorded here so the same observability holds regardless of how
-// HybridStore wires up the actual UPDATE.
-//
-// Dedup key is TouchRef.ID — within a single batch window we only need
-// one update per memory regardless of how many reads referenced it.
-// (user, project, id) is technically the more precise key, but IDs are
-// already globally unique UUIDs so collisions across tenants are zero.
-func runAccessBatcherLoop(
-	ctx context.Context,
-	queue <-chan TouchRef,
-	batchSize int,
-	flushInterval time.Duration,
-	flush func([]TouchRef) error,
-	logger *zap.Logger,
-) {
-	timer := time.NewTimer(flushInterval)
-	defer timer.Stop()
-	buf := make([]TouchRef, 0, batchSize)
-	seen := make(map[string]struct{}, batchSize)
-
-	doFlush := func() {
-		if len(buf) == 0 {
-			return
-		}
-		err := flush(buf)
-		status := "ok"
-		if err != nil {
-			status = "err"
-			if logger != nil {
-				logger.Warn("touch batch flush failed", zap.Int("ids", len(buf)), zap.Error(err))
-			}
-		}
-		metrics.MemoryTouchBatchTotal.WithLabelValues(status).Inc()
-		metrics.MemoryTouchBatchSize.Observe(float64(len(buf)))
-		buf = buf[:0]
-		for k := range seen {
-			delete(seen, k)
-		}
-	}
-
-	resetTimer := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(flushInterval)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			doFlush()
-			return
-		case ref, ok := <-queue:
-			if !ok {
-				doFlush()
-				return
-			}
-			if _, dup := seen[ref.ID]; dup {
-				continue
-			}
-			seen[ref.ID] = struct{}{}
-			buf = append(buf, ref)
-			if len(buf) >= batchSize {
-				doFlush()
-				resetTimer()
-			}
-		case <-timer.C:
-			doFlush()
-			timer.Reset(flushInterval)
-		}
-	}
-}
-
-// StartPromoteBatcher runs the cold→hot back-fill flusher. Returns
-// when ctx is cancelled, after draining any pending memories in one
-// last flush. Mirrors StartAccessBatcher's contract — one caller
-// (main.go) invokes this once in a goroutine after
-// EnablePromoteBatcher.
-func (h *HybridStore) StartPromoteBatcher(ctx context.Context) {
-	if h.promoteQueue == nil || h.hot == nil {
-		return
-	}
-	h.logger.Info("memory promote batcher started",
-		zap.Float64("threshold", h.promoteOpts.Threshold),
-		zap.Int("batch_size", h.promoteOpts.BatchSize),
-		zap.Duration("flush_interval", h.promoteOpts.FlushInterval),
-		zap.Int("queue_size", h.promoteOpts.QueueSize))
-	defer h.logger.Info("memory promote batcher stopping")
-
-	runPromoteBatcherLoop(ctx, h.promoteQueue, h.promoteOpts.BatchSize, h.promoteOpts.FlushInterval, h.flushPromotes, h.logger)
-}
-
-// enqueuePromote scans the fused retrieval result for "cold-only hits
-// with score >= threshold" — those are the entries we want cached in
-// hot so subsequent retrievals hit the 5ms path. hot-already-cached
-// items are skipped (no point SET-ing what's already there); the
-// threshold check filters out low-signal entries that don't justify
-// the hot tier's 24h footprint.
-//
-// Non-blocking by design (read latency must not couple to promote
-// latency). Queue overflow → drop + metric. Nil queue → no-op.
-func (h *HybridStore) enqueuePromote(hot, fused []Memory) {
-	if h.promoteQueue == nil || h.hot == nil {
-		return
-	}
-	hotIDs := make(map[string]struct{}, len(hot))
-	for _, m := range hot {
-		hotIDs[m.ID] = struct{}{}
-	}
-	for _, m := range fused {
-		if m.ID == "" {
-			continue
-		}
-		if _, already := hotIDs[m.ID]; already {
-			continue
-		}
-		if m.Score < h.promoteOpts.Threshold {
-			continue
-		}
-		select {
-		case h.promoteQueue <- m:
-		default:
-			metrics.MemoryPromoteQueueDropsTotal.Inc()
-		}
-	}
-}
-
-// flushPromotes is the batcher's terminal step. Delegates to
-// hot.PromoteBatch which does the actual pipeline SET. Cold isn't
-// touched here — promote is a hot-only operation by definition.
-func (h *HybridStore) flushPromotes(mems []Memory) error {
-	if h.hot == nil || len(mems) == 0 {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return h.hot.PromoteBatch(ctx, mems)
-}
-
-// runPromoteBatcherLoop is the pure state machine of the promote
-// batcher. Exposed unexported for testing — see TestRunPromoteBatcher*.
-// Dedup key is Memory.ID (same as access batcher).
-func runPromoteBatcherLoop(
-	ctx context.Context,
-	queue <-chan Memory,
-	batchSize int,
-	flushInterval time.Duration,
-	flush func([]Memory) error,
-	logger *zap.Logger,
-) {
-	timer := time.NewTimer(flushInterval)
-	defer timer.Stop()
-	buf := make([]Memory, 0, batchSize)
-	seen := make(map[string]struct{}, batchSize)
-
-	doFlush := func() {
-		if len(buf) == 0 {
-			return
-		}
-		err := flush(buf)
-		status := "ok"
-		if err != nil {
-			status = "err"
-			if logger != nil {
-				logger.Warn("promote batch flush failed", zap.Int("items", len(buf)), zap.Error(err))
-			}
-		}
-		metrics.MemoryPromoteTotal.WithLabelValues(status).Inc()
-		metrics.MemoryPromoteBatchSize.Observe(float64(len(buf)))
-		buf = buf[:0]
-		for k := range seen {
-			delete(seen, k)
-		}
-	}
-
-	resetTimer := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(flushInterval)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			doFlush()
-			return
-		case m, ok := <-queue:
-			if !ok {
-				doFlush()
-				return
-			}
-			if _, dup := seen[m.ID]; dup {
-				continue
-			}
-			seen[m.ID] = struct{}{}
-			buf = append(buf, m)
-			if len(buf) >= batchSize {
-				doFlush()
-				resetTimer()
-			}
-		case <-timer.C:
-			doFlush()
-			timer.Reset(flushInterval)
-		}
-	}
-}
-
-// Decay reduces scores for old memories in both hot and cold stores.
-// Returns the cold-tier mutation count (hot is best-effort).
-//
-// Hot decay path (P1 #6 + P1 #8):
-//
-// Before P1 #6, hot.Decay did SCAN `memory:*` on every tick. We now
-// ask cold "which tenants even have stale entries?" and only SCAN
-// their sub-namespaces. P1 #8 additionally passes the demoteThreshold
-// so hot DELs entries whose post-decay score crosses below the
-// threshold — instead of caching low-signal entries until TTL expires.
-// If cold == nil we fall back to the legacy whole-DB scan (still
-// bounded by hotScanLimit, so it can't go runaway).
-func (h *HybridStore) Decay(olderThan time.Duration, factor float64) (int, error) {
-	var coldCount int
-	var err error
-	if h.cold != nil {
-		coldCount, err = h.cold.Decay(olderThan, factor)
-	}
-	if h.hot != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		if h.cold != nil {
-			// Tenant-sliced path: ask cold who has stale data, then
-			// run hot decay only against those (user, project) prefixes.
-			// 200 is a sane default — at 24h decay cadence on a single
-			// Redis instance this is plenty; operators with > 200
-			// active tenants should batch or stagger their ticks.
-			tenants, listErr := h.cold.ListActiveDecayTenants(ctx, olderThan, 200)
-			if listErr != nil {
-				h.logger.Warn("hot decay tenant discovery failed; skipping hot",
-					zap.Error(listErr))
-			} else if len(tenants) > 0 {
-				if _, hotErr := h.hot.DecayTenants(ctx, tenants, olderThan, factor, h.demoteThreshold); hotErr != nil {
-					h.logger.Debug("hot decay had per-tenant failures",
-						zap.Int("tenants", len(tenants)), zap.Error(hotErr))
-				}
-			}
-		} else {
-			// Fallback: no cold store → walk all hot keys with the
-			// scan-budget-capped path. Mostly relevant for tests &
-			// pure-hot dev environments.
-			if _, hotErr := h.hot.Decay(ctx, olderThan, factor, h.demoteThreshold); hotErr != nil {
-				h.logger.Debug("hot decay (fallback) failed", zap.Error(hotErr))
-			}
-		}
-	}
-	return coldCount, err
-}
-
-// Promote moves a cold memory to hot (Redis) for faster access.
-func (h *HybridStore) Promote(ctx context.Context, m *Memory) error {
-	if h.hot != nil {
-		return h.hot.Store(ctx, m)
-	}
-	return nil
-}
-
-// Demote removes a memory from hot store (it remains in cold).
-func (h *HybridStore) Demote(ctx context.Context, m *Memory) error {
-	if h.hot != nil {
-		return h.hot.Delete(ctx, m.UserID, m.ProjectID, m.ID)
-	}
-	return nil
 }
