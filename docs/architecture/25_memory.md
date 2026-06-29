@@ -1743,6 +1743,14 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 ### 修复策略
 在 `conflict.go` 中移除了 `c.Type != newMem.Type` 的判断限制，使得纯粹依靠 Vector Similarity 来触发 Deduplication。同时引入了 `typePriority` （如 Preference > Knowledge > Semantic），确保合并后保留优先级更高的类型。
 
+## §30. AUDIT-P1-2: Second-Layer Shielding and Custom PII Regex
+
+### 病征
+以前 `piiMasker` 只能拦截固定模式的 token (JWT, AWS key 等)，且只有 Extractor 触发了 `mask`。若是 LLM Tool 插入记忆，完全绕过 `mask` 导致隐私泄露。且 `Blackboard` 在广播事件时未经二次脱敏。
+
+### 修复策略
+将 `piiMasker` 抽出为公共 `memory.PIIMasker`，并支持通过 `AGENT_CUSTOM_PII_REGEX` 环境变量动态传入业务侧正则（格式 `LABEL=Regex,LABEL2=Regex2`）。在 `HybridStore.Store` 写入库与 `Blackboard.Publish` 广播前，强制对 `Memory.Content` 进行二次 `Mask()`，作为 Defense in Depth。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

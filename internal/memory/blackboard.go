@@ -21,12 +21,14 @@ type MemoryEvent struct {
 type Blackboard struct {
 	client *redis.Client
 	logger *zap.Logger
+	masker *PIIMasker
 }
 
 func NewBlackboard(client *redis.Client, logger *zap.Logger) *Blackboard {
 	return &Blackboard{
 		client: client,
 		logger: logger.With(zap.String("component", "memory.blackboard")),
+		masker: NewPIIMasker(),
 	}
 }
 
@@ -39,10 +41,12 @@ func (b *Blackboard) channel(projectID string) string {
 // never see them" (channel-drop scenarios are tracked separately in
 // Subscribe's default branch).
 func (b *Blackboard) Publish(ctx context.Context, action string, m *Memory) error {
+	safeM := *m
+	safeM.Content = b.masker.Mask(safeM.Content)
 	event := MemoryEvent{
 		Action:    action,
-		Memory:    m,
-		ProjectID: m.ProjectID,
+		Memory:    &safeM,
+		ProjectID: safeM.ProjectID,
 	}
 	data, err := json.Marshal(event)
 	if err != nil {

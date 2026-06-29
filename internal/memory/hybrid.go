@@ -61,6 +61,8 @@ type HybridStore struct {
 	// pre-fix behavior (SET with reduced score, KeepTTL). Set via
 	// SetDemoteThreshold from main.go.
 	demoteThreshold float64
+
+	masker *PIIMasker
 }
 
 // PromoteOptions tunes the read-path cold→hot back-fill batcher.
@@ -131,6 +133,7 @@ func NewHybridStore(hot *RedisHot, cold *PGCold, logger *zap.Logger) *HybridStor
 		cold:     cold,
 		logger:   logger.With(zap.String("component", "memory.hybrid")),
 		resolver: NewConflictResolver(cold),
+		masker:   NewPIIMasker(),
 	}
 }
 
@@ -206,6 +209,9 @@ func (h *HybridStore) embedText(ctx context.Context, text string) []float32 {
 //     new-insert branch (previous code skipped publishing on merge, which
 //     broke multi-agent state sync on memory updates).
 func (h *HybridStore) Store(ctx context.Context, m *Memory) (retErr error) {
+	// Apply PII masking (shield against unmasked tool injection)
+	m.Content = h.masker.Mask(m.Content)
+
 	start := time.Now()
 	// Tier label is decided at exit (hybrid when both tiers ran, cold-only
 	// otherwise). Status defaults to ok and flips to err on early return.

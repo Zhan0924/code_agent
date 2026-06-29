@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -64,7 +63,7 @@ type Extractor struct {
 	embedder            Embedder // optional: enables embedding-based dedup
 	maxPerRun           int      // cap on candidates accepted per ExtractFromInteraction
 	dedupCandidateLimit int      // P1 #9: K for the dedup near-neighbor lookup
-	piiMasker           *piiMasker
+	piiMasker           *PIIMasker
 }
 
 // NewExtractor creates a memory extractor.
@@ -76,7 +75,7 @@ func NewExtractor(store MemoryStorer, llmCaller LLMCaller, logger *zap.Logger) *
 		logger:              logger.With(zap.String("component", "memory.extractor")),
 		maxPerRun:           10, // LLM occasionally over-produces; cap at 10 strong signals
 		dedupCandidateLimit: defaultDedupCandidateLimit,
-		piiMasker:           newPIIMasker(),
+		piiMasker:           NewPIIMasker(),
 	}
 }
 
@@ -151,7 +150,7 @@ func (e *Extractor) RecordTaskEpisode(ctx context.Context, userID, projectID, us
 	if content == "" {
 		return nil
 	}
-	content = e.piiMasker.mask(content)
+	content = e.piiMasker.Mask(content)
 
 	now := time.Now()
 	m := Memory{
@@ -235,8 +234,8 @@ type ExtractedMemory struct {
 func (e *Extractor) ExtractFromInteraction(ctx context.Context, userID, projectID, userMsg, assistantMsg string) {
 	// PII masking: do this BEFORE LLM extraction so the upstream LLM doesn't
 	// also see secrets — defense in depth, even though we control the LLM.
-	maskedUser := e.piiMasker.mask(userMsg)
-	maskedAssist := e.piiMasker.mask(assistantMsg)
+	maskedUser := e.piiMasker.Mask(userMsg)
+	maskedAssist := e.piiMasker.Mask(assistantMsg)
 
 	var candidates []ExtractedMemory
 	if e.llm != nil {
@@ -262,7 +261,7 @@ func (e *Extractor) ExtractFromInteraction(ctx context.Context, userID, projectI
 		}
 		// Belt-and-suspenders: re-mask the candidate in case the LLM
 		// reconstructed PII from context.
-		c.Content = e.piiMasker.mask(c.Content)
+		c.Content = e.piiMasker.Mask(c.Content)
 
 		memType := parseMemoryType(c.Type)
 
@@ -726,70 +725,4 @@ func extractSentence(text, phrase string) string {
 		return sentence[:300]
 	}
 	return sentence
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// PII masking
-// ────────────────────────────────────────────────────────────────────────
-
-// piiMasker scrubs common secret formats before content reaches the LLM
-// (defence-in-depth) and before being persisted as a long-term memory
-// (compliance — once stored, this content may be re-injected into prompts
-// of future sessions, possibly across organisational boundaries).
-//
-// Conservative on purpose: we'd rather over-mask (and lose a bit of
-// extraction quality) than persist a token. False positives are visible
-// (the user sees [REDACTED:*]); silent leaks are not.
-type piiMasker struct {
-	patterns []*regexp.Regexp
-	labels   []string
-}
-
-func newPIIMasker() *piiMasker {
-	type entry struct {
-		label string
-		re    string
-	}
-	specs := []entry{
-		// AWS access key + secret
-		{"AWS_KEY", `\bAKIA[0-9A-Z]{16}\b`},
-		// Generic high-entropy long token (hex/base64) — 32+ chars
-		{"TOKEN", `\b[A-Fa-f0-9]{32,}\b`},
-		{"TOKEN", `\b[A-Za-z0-9+/]{40,}={0,2}\b`},
-		// JWT (3 dot-separated base64 segments)
-		{"JWT", `\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b`},
-		// OpenAI-style sk- key (also catches sk-ant- etc.)
-		{"API_KEY", `\bsk-[A-Za-z0-9_\-]{20,}\b`},
-		// "<key_name>=<value>" assignments commonly leaking secrets
-		{"SECRET", `(?i)\b(api[_-]?key|secret|password|passwd|token|access[_-]?key)\s*[:=]\s*['"]?[A-Za-z0-9_\-\.+/=]{8,}['"]?`},
-		// Bearer tokens
-		{"BEARER", `(?i)bearer\s+[A-Za-z0-9_\-\.+/=]{8,}`},
-		// Private key blocks
-		{"PRIVATE_KEY", `-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----`},
-		// Email addresses (mask but keep domain hint)
-		{"EMAIL", `\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`},
-		// IPv4 addresses
-		{"IPV4", `\b(?:\d{1,3}\.){3}\d{1,3}\b`},
-	}
-	m := &piiMasker{}
-	for _, s := range specs {
-		re, err := regexp.Compile(s.re)
-		if err == nil {
-			m.patterns = append(m.patterns, re)
-			m.labels = append(m.labels, s.label)
-		}
-	}
-	return m
-}
-
-func (m *piiMasker) mask(s string) string {
-	if s == "" {
-		return s
-	}
-	out := s
-	for i, re := range m.patterns {
-		label := m.labels[i]
-		out = re.ReplaceAllString(out, "[REDACTED:"+label+"]")
-	}
-	return out
 }
