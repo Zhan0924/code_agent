@@ -543,11 +543,35 @@ func (p *PGCold) MarkDistilled(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	_, err := p.db.ExecContext(ctx, `
-		DELETE FROM memories
+	start := time.Now()
+	res, err := p.db.ExecContext(ctx, `
+		UPDATE memories
+		SET distilled_at = NOW(), updated_at = NOW()
 		WHERE id = ANY($1)
+		  AND distilled_at IS NULL
 	`, pq.Array(ids))
-	return err
+	if err != nil {
+		if p.logger != nil {
+			p.logger.Error("mark_distilled failed",
+				zap.String("audit_id", "REAUDIT-P0-1"),
+				zap.String("op", "mark_distilled"),
+				zap.String("severity", "critical"),
+				zap.Int("before.count", len(ids)),
+				zap.Error(err))
+		}
+		return err
+	}
+	marked, _ := res.RowsAffected()
+	if p.logger != nil {
+		p.logger.Info("mark_distilled completed",
+			zap.String("audit_id", "REAUDIT-P0-1"),
+			zap.String("op", "mark_distilled"),
+			zap.Int("before.count", len(ids)),
+			zap.Int64("after.marked", marked),
+			zap.Duration("duration_ms", time.Since(start)),
+			zap.String("result", "ok"))
+	}
+	return nil
 }
 
 // DeleteOldEpisodic removes episodic memories that have already been

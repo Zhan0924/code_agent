@@ -138,7 +138,39 @@ func TestPGCold_Integration(t *testing.T) {
 		var score float64
 		err = db.QueryRow(`SELECT score FROM memories WHERE id = '00000000-0000-0000-0000-000000000007'`).Scan(&score)
 		require.NoError(t, err)
-		
+
 		assert.Less(t, score, 1.0, "Score should have decayed")
+	})
+
+	// 4. Test MarkDistilled + DeleteOldEpisodic (REAUDIT-P0-1 contract)
+	t.Run("MarkDistilledAndDeleteOldEpisodic", func(t *testing.T) {
+		_, err := db.Exec(`DELETE FROM memories`)
+		require.NoError(t, err)
+
+		epID := "00000000-0000-0000-0000-000000000008"
+		_, err = db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at, last_accessed_at)
+			VALUES ($1, 'u4', 'p4', 'episodic', 'episode to distill', 1.0, NOW(), NOW(), NOW())`, epID)
+		require.NoError(t, err)
+
+		err = pgStore.MarkDistilled(ctx, []string{epID})
+		require.NoError(t, err)
+
+		var distilledAt sql.NullTime
+		err = db.QueryRow(`SELECT distilled_at FROM memories WHERE id = $1`, epID).Scan(&distilledAt)
+		require.NoError(t, err)
+		assert.True(t, distilledAt.Valid, "distilled_at should be set after MarkDistilled")
+
+		// Force distilled_at into the past so DeleteOldEpisodic can pick it up.
+		_, err = db.Exec(`UPDATE memories SET distilled_at = NOW() - INTERVAL '48 hours' WHERE id = $1`, epID)
+		require.NoError(t, err)
+
+		deleted, err := pgStore.DeleteOldEpisodic(ctx, 24*time.Hour)
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, deleted, "old distilled episodic should be deleted by GC")
+
+		var count int
+		err = db.QueryRow(`SELECT count(*) FROM memories WHERE id = $1`, epID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count, "row should be gone after DeleteOldEpisodic")
 	})
 }
