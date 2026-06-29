@@ -1659,6 +1659,70 @@ HybridStore.RetrieveByType(limit=50)
 - `memory_hot_scan_truncated_total{endpoint="decay_tenant"}` 稳态 > 0 → 单 tenant hot 条目数系统性突破 50/tenant 不变量，排查 write churn
 - `histogram_quantile(0.95, memory_hot_scan_keys_bucket{endpoint="retrieve_by_query"})` 接近 `hot_scan_limit` → 离截断不远，提前预警
 
+## §25. AUDIT-P1-7: Episodic GC Loop
+
+### 病征
+Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长了会导致 `memories` 表无限膨胀。
+
+### 修复策略
+实现 `runEpisodicGCLoop` 守护线程，定期调用 `DeleteOldEpisodic`。在 `internal/config/config.go` 新增 `MemoryEpisodicGCConfig` 且默认开启（Interval=24h, OlderThan=30d）。
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `cmd/agent/memory_adapter.go` | 增加 `runEpisodicGCLoop` |
+| `internal/memory/pg_cold.go` | 增加 `DeleteOldEpisodic` 实行 SQL 级别清理 |
+| `internal/memory/hybrid.go` | 增加 `DeleteOldEpisodic` 桥接 |
+
+### 验证
+- podman build && deploy
+- 检查代码输出日志 `episodic gc scheduler started`
+
+### 设计取舍
+保留最近 30 天以备排障，过期后物理删除，缓解 `idx_memories_episodic_undistilled` 以外的索引扫描压力。
+
+---
+
+## §26. AUDIT-P1-3: GDPR Delete API
+
+### 病征
+缺乏根据 `user_id` 主动删除长期记忆的接口。
+
+### 修复策略
+暴露 `DELETE /api/v1/memory/user/:user_id`，联级删除 `PGCold` 和 `RedisHot`，并通过 `Blackboard` 广播 `deleted_user` 事件。
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `internal/api/router.go` | 注册 `DELETE /api/v1/memory/user/:user_id` |
+| `internal/api/memory_handlers.go` | 增加 `handleDeleteMemoryByUser` |
+| `internal/memory/hybrid.go` | 增加 `DeleteByUser` |
+
+### 验证
+- curl 请求 `/api/v1/memory/user/test-user-123`
+- podman 验证无误
+
+### 设计取舍
+同时删除冷热层并发送广播，使得在多分布式实例中能快速同步丢弃已删除的用户状态。
+
+## §27. AUDIT-P2-2: PG Integration Testing
+
+### 病征
+以往的 PG 查询、事务及 pgvector HNSW 召回缺乏真实的 DB 集成测试，仅通过 mock 或 fakeStore 绕过。导致在调整 SQL 或向量函数时缺乏安全网。
+
+### 修复策略
+引入 `github.com/testcontainers/testcontainers-go` 及 `postgres` 模块。在 `internal/memory/pg_cold_integration_test.go` 中启动真实的 `pgvector` 容器，进行核心链路测试。
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `internal/memory/pg_cold_integration_test.go` | 新增 `TestPGCold_Integration` 测试 |
+| `go.mod` | 增加 `testcontainers-go` 依赖 |
+
+### 验证
+- 通过 `go test -v ./internal/memory -run TestPGCold_Integration` (兼容 Podman `TESTCONTAINERS_RYUK_DISABLED=true`)。
+- 覆盖率包含了 `DedupTx` 事务删除逻辑、`RetrieveByVectorAndType` 的过滤与 HNSW 近似搜索、`Decay` 的数学衰减。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。
