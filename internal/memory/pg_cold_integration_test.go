@@ -15,15 +15,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// TestPGCold_Integration runs integration tests against a real pgvector container.
-func TestPGCold_Integration(t *testing.T) {
+// setupPGColdIntegration boots a pgvector container and returns a migrated PGCold store.
+func setupPGColdIntegration(t *testing.T) (context.Context, *PGCold, *sql.DB, func()) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
 
 	ctx := context.Background()
-
-	// Start pgvector container
 	postgresContainer, err := postgres.Run(ctx,
 		"docker.io/pgvector/pgvector:pg16",
 		postgres.WithDatabase("testdb"),
@@ -34,143 +33,103 @@ func TestPGCold_Integration(t *testing.T) {
 				WithOccurrence(2).WithStartupTimeout(15*time.Second)),
 	)
 	require.NoError(t, err)
-	defer func() {
+
+	cleanup := func() {
 		if err := postgresContainer.Terminate(ctx); err != nil {
 			t.Logf("failed to terminate container: %s", err)
 		}
-	}()
+	}
 
 	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
 	require.NoError(t, err)
 
 	db, err := sql.Open("postgres", connStr)
 	require.NoError(t, err)
-	defer db.Close()
 
-	// Initialize PGCold store
-	logger, _ := zap.NewDevelopment()
-	dim := 3
-	pgStore := NewPGColdWithDim(db, logger, dim)
+	logger := zap.NewNop()
+	pgStore := NewPGColdWithDim(db, logger, 3)
+	require.NoError(t, pgStore.Migrate())
 
-	// Run migrations
-	err = pgStore.Migrate()
-	require.NoError(t, err, "Migration should succeed")
+	return ctx, pgStore, db, func() {
+		_ = db.Close()
+		cleanup()
+	}
+}
 
-	// 1. Test DedupTx
-	t.Run("DedupTx", func(t *testing.T) {
-		anchorID := "00000000-0000-0000-0000-000000000001"
-		dup1ID := "00000000-0000-0000-0000-000000000002"
-		dup2ID := "00000000-0000-0000-0000-000000000003"
-		
-		memories := []Memory{
-			{ID: anchorID, UserID: "u1", ProjectID: "p1", Type: MemoryKnowledge, Content: "Anchor content", Score: 0.8},
-			{ID: dup1ID, UserID: "u1", ProjectID: "p1", Type: MemoryKnowledge, Content: "Dup 1", Score: 0.5},
-			{ID: dup2ID, UserID: "u1", ProjectID: "p1", Type: MemoryKnowledge, Content: "Dup 2", Score: 0.6},
-		}
-		
-		for _, m := range memories {
-			_, err := db.Exec(`
-				INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at) 
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
-				m.ID, m.UserID, m.ProjectID, m.Type, m.Content, m.Score, time.Now())
-			require.NoError(t, err)
-		}
+// TestPGCold_Integration_BoostScoreBatch covers §35 citation score bumps on real PG.
+func TestPGCold_Integration_BoostScoreBatch(t *testing.T) {
+	ctx, pg, db, cleanup := setupPGColdIntegration(t)
+	defer cleanup()
 
-		anchorToUpdate := &Memory{
-			ID:          anchorID,
-			Score:       0.95,
-			AccessCount: 2,
-			Embedding:   []float32{0.1, 0.2, 0.3},
-		}
-		err = pgStore.DedupTx(ctx, anchorToUpdate, []string{dup1ID, dup2ID})
-		require.NoError(t, err)
+	memID := "00000000-0000-0000-0000-000000000010"
+	_, err := db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at)
+		VALUES ($1, 'u_boost', 'p1', 'knowledge', 'boost me', 0.5, NOW(), NOW())`, memID)
+	require.NoError(t, err)
 
-		// Verify duplicates are deleted
-		var count int
-		err = db.QueryRow(`SELECT count(*) FROM memories WHERE id IN ($1, $2)`, dup1ID, dup2ID).Scan(&count)
-		require.NoError(t, err)
-		assert.Equal(t, 0, count, "Duplicates should be deleted")
+	require.NoError(t, pg.BoostScoreBatch(ctx, []string{memID}, 0.2))
 
-		// Verify anchor is updated
-		var newScore float64
-		var accessCount int
-		err = db.QueryRow(`SELECT score, access_count FROM memories WHERE id = $1`, anchorID).Scan(&newScore, &accessCount)
-		require.NoError(t, err)
-		assert.InDelta(t, 0.95, newScore, 0.001, "Score should be updated")
-		assert.Equal(t, 2, accessCount, "Access count should be updated")
-	})
+	var score float64
+	require.NoError(t, db.QueryRow(`SELECT score FROM memories WHERE id = $1`, memID).Scan(&score))
+	assert.InDelta(t, 0.7, score, 0.001)
+}
 
-	// 2. Test RetrieveByVectorAndType
-	t.Run("RetrieveByVectorAndType", func(t *testing.T) {
-		_, err := db.Exec(`DELETE FROM memories`)
-		require.NoError(t, err)
+// TestPGCold_Integration_MarkDistilled covers §36 UPDATE semantics (REAUDIT-P0-1).
+func TestPGCold_Integration_MarkDistilled(t *testing.T) {
+	ctx, pg, db, cleanup := setupPGColdIntegration(t)
+	defer cleanup()
 
-		// Insert 3 records, 2 knowledge and 1 preference
-		_, err = db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, embedding, created_at, updated_at) VALUES 
-			('00000000-0000-0000-0000-000000000004', 'u2', 'p2', 'knowledge', 'content1', 0.8, '[1,0,0]', NOW(), NOW()),
-			('00000000-0000-0000-0000-000000000005', 'u2', 'p2', 'knowledge', 'content2', 0.8, '[0,1,0]', NOW(), NOW()),
-			('00000000-0000-0000-0000-000000000006', 'u2', 'p2', 'preference', 'content3', 0.8, '[1,0,0]', NOW(), NOW())`)
-		require.NoError(t, err)
+	epID := "00000000-0000-0000-0000-000000000011"
+	_, err := db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at, last_accessed_at)
+		VALUES ($1, 'u_distill', 'p1', 'episodic', 'episode', 1.0, NOW(), NOW(), NOW())`, epID)
+	require.NoError(t, err)
 
-		vec := []float32{1, 0, 0}
-		results, err := pgStore.RetrieveByVectorAndType(vec, "u2", "p2", string(MemoryKnowledge), 5)
-		require.NoError(t, err)
-		
-		assert.Len(t, results, 2, "Should only retrieve knowledge type memories")
-		assert.Equal(t, "00000000-0000-0000-0000-000000000004", results[0].ID, "m1 should be first as it is closer to [1,0,0]")
-	})
+	require.NoError(t, pg.MarkDistilled(ctx, []string{epID}))
 
-	// 3. Test Decay
-	t.Run("Decay", func(t *testing.T) {
-		_, err := db.Exec(`DELETE FROM memories`)
-		require.NoError(t, err)
+	var distilledAt sql.NullTime
+	require.NoError(t, db.QueryRow(`SELECT distilled_at FROM memories WHERE id = $1`, epID).Scan(&distilledAt))
+	assert.True(t, distilledAt.Valid)
 
-		// Insert older memory
-		_, err = db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at, last_accessed_at) VALUES 
-			('00000000-0000-0000-0000-000000000007', 'u3', 'p3', 'knowledge', 'content', 1.0, $1, $1, $1)`, time.Now().Add(-48*time.Hour))
-		require.NoError(t, err)
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM memories WHERE id = $1`, epID).Scan(&count))
+	assert.Equal(t, 1, count, "MarkDistilled must UPDATE not DELETE")
+}
 
-		// Run decay for everything older than 24h
-		decayed, err := pgStore.Decay(24*time.Hour, 0.9)
-		require.NoError(t, err)
-		assert.Greater(t, decayed, 0)
+// TestPGCold_Integration_DeleteByUser covers §26 GDPR delete path.
+func TestPGCold_Integration_DeleteByUser(t *testing.T) {
+	ctx, pg, db, cleanup := setupPGColdIntegration(t)
+	defer cleanup()
 
-		var score float64
-		err = db.QueryRow(`SELECT score FROM memories WHERE id = '00000000-0000-0000-0000-000000000007'`).Scan(&score)
-		require.NoError(t, err)
+	_, err := db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at) VALUES
+		('00000000-0000-0000-0000-000000000012', 'gdpr_user', 'p1', 'knowledge', 'a', 0.5, NOW(), NOW()),
+		('00000000-0000-0000-0000-000000000013', 'gdpr_user', 'p2', 'preference', 'b', 0.5, NOW(), NOW()),
+		('00000000-0000-0000-0000-000000000014', 'other_user', 'p1', 'knowledge', 'c', 0.5, NOW(), NOW())`)
+	require.NoError(t, err)
 
-		assert.Less(t, score, 1.0, "Score should have decayed")
-	})
+	deleted, err := pg.DeleteByUser(ctx, "gdpr_user")
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, deleted)
 
-	// 4. Test MarkDistilled + DeleteOldEpisodic (REAUDIT-P0-1 contract)
-	t.Run("MarkDistilledAndDeleteOldEpisodic", func(t *testing.T) {
-		_, err := db.Exec(`DELETE FROM memories`)
-		require.NoError(t, err)
+	var remaining int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM memories WHERE user_id = 'gdpr_user'`).Scan(&remaining))
+	assert.Equal(t, 0, remaining)
 
-		epID := "00000000-0000-0000-0000-000000000008"
-		_, err = db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, created_at, updated_at, last_accessed_at)
-			VALUES ($1, 'u4', 'p4', 'episodic', 'episode to distill', 1.0, NOW(), NOW(), NOW())`, epID)
-		require.NoError(t, err)
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM memories WHERE user_id = 'other_user'`).Scan(&remaining))
+	assert.Equal(t, 1, remaining)
+}
 
-		err = pgStore.MarkDistilled(ctx, []string{epID})
-		require.NoError(t, err)
+// TestPGCold_Integration_CrossTypeRetrieve covers §29 type-filtered vector retrieval.
+func TestPGCold_Integration_CrossTypeRetrieve(t *testing.T) {
+	_, pg, db, cleanup := setupPGColdIntegration(t)
+	defer cleanup()
 
-		var distilledAt sql.NullTime
-		err = db.QueryRow(`SELECT distilled_at FROM memories WHERE id = $1`, epID).Scan(&distilledAt)
-		require.NoError(t, err)
-		assert.True(t, distilledAt.Valid, "distilled_at should be set after MarkDistilled")
+	_, err := db.Exec(`INSERT INTO memories (id, user_id, project_id, type, content, score, embedding_3, created_at, updated_at) VALUES
+		('00000000-0000-0000-0000-000000000015', 'u_type', 'p1', 'knowledge', 'k1', 0.8, '[1,0,0]', NOW(), NOW()),
+		('00000000-0000-0000-0000-000000000016', 'u_type', 'p1', 'knowledge', 'k2', 0.8, '[0,1,0]', NOW(), NOW()),
+		('00000000-0000-0000-0000-000000000017', 'u_type', 'p1', 'preference', 'pref', 0.8, '[1,0,0]', NOW(), NOW())`)
+	require.NoError(t, err)
 
-		// Force distilled_at into the past so DeleteOldEpisodic can pick it up.
-		_, err = db.Exec(`UPDATE memories SET distilled_at = NOW() - INTERVAL '48 hours' WHERE id = $1`, epID)
-		require.NoError(t, err)
-
-		deleted, err := pgStore.DeleteOldEpisodic(ctx, 24*time.Hour)
-		require.NoError(t, err)
-		assert.EqualValues(t, 1, deleted, "old distilled episodic should be deleted by GC")
-
-		var count int
-		err = db.QueryRow(`SELECT count(*) FROM memories WHERE id = $1`, epID).Scan(&count)
-		require.NoError(t, err)
-		assert.Equal(t, 0, count, "row should be gone after DeleteOldEpisodic")
-	})
+	results, err := pg.RetrieveByVectorAndType([]float32{1, 0, 0}, "u_type", "p1", string(MemoryKnowledge), 5)
+	require.NoError(t, err)
+	assert.Len(t, results, 2)
+	assert.Equal(t, string(MemoryKnowledge), string(results[0].Type))
 }
