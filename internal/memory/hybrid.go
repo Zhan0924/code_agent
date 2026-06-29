@@ -615,6 +615,20 @@ func (h *HybridStore) DeleteOldEpisodic(ctx context.Context, olderThan time.Dura
 	return h.cold.DeleteOldEpisodic(ctx, olderThan)
 }
 
+// GetByID is the AUDIT-P2-5 explainability primitive: returns one memory
+// straight from cold (source of truth) regardless of hot-tier TTL state.
+// Returns (nil, nil) when the row does not exist so the HTTP layer can
+// translate that into 404 without inventing sentinel errors. Cold-only
+// because the hot copy's score/access_count can lag the cold copy after
+// a Touch flush — the support engineer running the audit wants the
+// authoritative number.
+func (h *HybridStore) GetByID(ctx context.Context, id string) (*Memory, error) {
+	if h.cold == nil {
+		return nil, nil
+	}
+	return h.cold.GetByID(ctx, id)
+}
+
 // DeleteByUser removes all memories belonging to a specific user across both tiers.
 // It also publishes a "deleted_user" event to the blackboard.
 func (h *HybridStore) DeleteByUser(ctx context.Context, userID string) (int64, error) {

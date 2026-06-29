@@ -182,6 +182,41 @@ func (p *PGCold) checkDim(v []float32) error {
 // fuel, not user-facing recall candidates. Callers that need to enumerate
 // episodic entries (e.g. the Distiller itself) must go through
 // ListEpisodicUndistilled.
+// GetByID fetches a single memory by primary key, returning (nil, nil)
+// when the row does not exist. This is the AUDIT-P2-5 audit-trail
+// primitive — "explain why the agent remembered X" — so the SELECT
+// surfaces every column the explanation API needs (distilled_at,
+// access_count, score history etc.).
+//
+// The `memories.id` column is UUID; a non-UUID input string would
+// otherwise make PG throw `invalid input syntax for type uuid`, which
+// the HTTP layer would surface as 500. We cast `id::text` in the
+// predicate so the lookup gracefully reports "not found" for garbage
+// input instead of leaking a SQL error to the caller.
+func (p *PGCold) GetByID(ctx context.Context, id string) (*Memory, error) {
+	if id == "" {
+		return nil, nil
+	}
+	row := p.db.QueryRowContext(ctx, `
+		SELECT id, user_id, project_id, type, content, score, access_count,
+		       created_at, updated_at, last_accessed_at, distilled_at
+		FROM memories
+		WHERE id::text = $1
+	`, id)
+
+	var m Memory
+	var distilledAt sql.NullTime
+	if err := row.Scan(&m.ID, &m.UserID, &m.ProjectID, &m.Type, &m.Content,
+		&m.Score, &m.AccessCount, &m.CreatedAt, &m.UpdatedAt, &m.LastAccessedAt, &distilledAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	m.DistilledAt = scanNullableTime(distilledAt)
+	return &m, nil
+}
+
 func (p *PGCold) Retrieve(userID, projectID string, query string, limit int) ([]Memory, error) {
 	rows, err := p.db.Query(`
 		SELECT id, user_id, project_id, type, content, score, access_count, created_at, updated_at, last_accessed_at, distilled_at

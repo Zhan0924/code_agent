@@ -118,6 +118,54 @@ func (s *Server) handleMemoryStats(c *gin.Context) {
 	})
 }
 
+// handleGetMemoryByID is the AUDIT-P2-5 explainability endpoint — given a
+// memory ID extracted from `[mem:<id>]` citations or audit logs, return
+// the full row from the source-of-truth cold tier so a user / support
+// engineer can answer "why does the agent remember this?".
+//
+// Returns:
+//
+//	200 + {id, user_id, project_id, type, content, score, access_count,
+//	       created_at, last_accessed_at, distilled_at}
+//	404 if the id is unknown
+//	503 when the memory store is not wired
+func (s *Server) handleGetMemoryByID(c *gin.Context) {
+	if s.memoryStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not configured"})
+		return
+	}
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "id is required"})
+		return
+	}
+	m, err := s.memoryStore.GetByID(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if m == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "memory not found", "id": id})
+		return
+	}
+	resp := gin.H{
+		"id":               m.ID,
+		"user_id":          m.UserID,
+		"project_id":       m.ProjectID,
+		"type":             string(m.Type),
+		"content":          m.Content,
+		"score":            m.Score,
+		"access_count":     m.AccessCount,
+		"created_at":       m.CreatedAt,
+		"updated_at":       m.UpdatedAt,
+		"last_accessed_at": m.LastAccessedAt,
+	}
+	if m.DistilledAt != nil {
+		resp["distilled_at"] = m.DistilledAt
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 // handleDeleteMemoryByUser handles GDPR deletion requests.
 // It deletes all memories belonging to the specified user_id.
 func (s *Server) handleDeleteMemoryByUser(c *gin.Context) {

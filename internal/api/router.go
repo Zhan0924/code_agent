@@ -295,6 +295,11 @@ func (s *Server) setupRoutes() {
 		// Long-term memory inspection (read-only)
 		v1.GET("/memory", s.handleListMemory)
 		v1.GET("/memory/stats", s.handleMemoryStats)
+		// AUDIT-P2-5: single-memory explanation endpoint. Lives under
+		// /memory/explain/ instead of /memory/:id to avoid gin's
+		// static-vs-parametric route collision with the sibling
+		// /memory/stats and /memory/user/:user_id routes.
+		v1.GET("/memory/explain/:id", s.handleGetMemoryByID)
 		v1.DELETE("/memory/user/:user_id", s.handleDeleteMemoryByUser)
 
 

@@ -58,7 +58,7 @@
 | ✅ **AUDIT-P2-2** | **PG 真实集成测试缺位**。`DedupTx` / `RetrieveByVectorAndType` / `ListActiveDecayTenants` / `MarkDistilled` 等 SQL 关键路径用 fake / mock 覆盖，没有 testcontainers | `tests/internal/memory/*` 多用 `miniredis` / `fakeStore`；grep `testcontainers` 全仓 0 命中 | SQL 语法或事务行为变化（pgvector 升级、PG 主版本切换）会绕过 CI |
 | ✅ **AUDIT-P2-3** | **配置项默认值是经验值，缺压测**。`Threshold=0.7` / `dedupOversample=10` / `MaxConflictsToDedup=32` / `QueueSize=256` 都是文档里写"经验值"，但没有数据支撑 | `internal/memory/hybrid.go:82-95` + `internal/memory/extractor.go:39-57` 全是注释说"经验值"；`MEM-P2-3` 仅做了"可配置"而未做"知道该配多少" | 真实流量 profile 出来后大概率要调；目前 dashboard 也没有"建议下调到 X" 的明示线 |
 | ✅ **AUDIT-P2-4** | **错误分级不清**。hot Store 失败只 Warn，blackboard Publish 失败只 Debug；缺乏"持久层失败需要 alert + DLQ 重试" 的分级 | 新增 `code_agent_memory_failures_total{tier, op, severity}` counter；hybrid.Store cold 失败上报 `critical`、retrieve 失败 `error`、hot 失败 `warn` → 见 `docs/architecture/25_memory.md::§37` | PromQL 可基于 severity 区分 page/工单/忽略；测试 `TestMemoryFailuresTotal_LabelMatrix` 锁定标签矩阵 |
-| **AUDIT-P2-5** | **可解释性缺失**。用户问"agent 为什么知道我用 tabs"，没有 audit trail 显示注入了哪条 memory ID + 何时蒸馏 | `internal/orchestrator/memory_bridge.go::buildLongTermMemory` 拼 `[type] content` 但不带 ID；prompt 注入路径不带 ID 反射 | 既不可解释也不可追溯，AUDIT-P0-1 的反馈闭环要先解决这个 |
+| ✅ **AUDIT-P2-5** | **可解释性缺失**。用户问"agent 为什么知道我用 tabs"，没有 audit trail 显示注入了哪条 memory ID + 何时蒸馏 | `buildDynamicMemory` 升级到 Info + 附 `mem_ids=[...]`；新增 `GET /api/v1/memory/explain/:id` 单条溯源；测试 `TestBuildDynamicMemory_AuditLogAndCitations` 锁定字段契约 → 见 `docs/architecture/25_memory.md::§38` | 任一 turn 的 memory 来源可由 logging 链反推；single-memory explain endpoint 直接返回 source-of-truth 字段 |
 
 ## 4. 推荐优先级（如果只能动 3 项）
 

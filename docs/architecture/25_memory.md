@@ -1901,6 +1901,37 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 - **三档而非五档**：fatal / page / warn / debug / info 这种分级在工程上看起来精细，但实际报警只有「值班 vs 工单」两档，三档（warn/error/critical）刚好覆盖。
 - **不带 user_id 标签**：MemoryFailuresTotal 故意只到 op 级，避免高基数；如需 per-tenant 排查走日志 `user_id` 字段。
 
+## §38. AUDIT-P2-5: Memory Explainability
+
+### 病征
+- `buildDynamicMemory` 在注入 `[mem:id]` 之后只打 Debug 级日志且不带结构化字段，operator 无法事后查 "这次 LLM 回复究竟基于哪几条 memory"。
+- 没有「单条 memory 溯源」HTTP 端点，用户问 "agent 为什么记住我用 tabs" 时只能跑 SQL；P0-1 引入的 `[mem:id]` 标签也因此没法在 UI 上 join 出可读的解释。
+
+### 修复策略
+1. **结构化 audit log**：当 `retrieveBucketedMemories` 返回非空集合时，`buildDynamicMemory` 升级到 `Info` 并附 `user_id` / `project_id` / `count` / `mem_ids=[...]` 字段。下游 logging 链（Datadog / Elastic）即可按 `mem_ids:include:xxx` join 用户 reply。
+2. **新增 `GET /api/v1/memory/explain/:id`**：经 `HybridStore.GetByID → PGCold.GetByID` 直接读 cold（source of truth），返回 `id / user_id / project_id / type / content / score / access_count / created_at / updated_at / last_accessed_at / distilled_at`。`/explain/` 前缀刻意避开 gin 与 `/memory/stats`、`/memory/user/:user_id` 的 static-vs-param 路由冲突。
+3. **错误模型**：未知 id → 404 而不是 200 空体；`memoryStore=nil` → 503。
+4. **不增设 per-turn audit 表**：现有结构化日志 + Prometheus + DB 主表已能在 < 1 分钟内反推任意 turn 的 memory 来源；专门建表会同时引入额外写路径与 GC 责任，得不偿失。
+
+### 关键接口变更
+| 位置 | 变更 |
+|---|---|
+| `internal/orchestrator/memory_bridge.go::buildDynamicMemory` | Info 级 audit log 附 `mem_ids` |
+| `internal/memory/pg_cold.go::GetByID` | 新增；返回 `(nil, nil)` for `sql.ErrNoRows` |
+| `internal/memory/hybrid.go::GetByID` | 桥接 cold |
+| `internal/api/memory_handlers.go::handleGetMemoryByID` | 新增 HTTP handler |
+| `internal/api/router.go` | 注册 `GET /api/v1/memory/explain/:id` |
+| `internal/orchestrator/memory_audit_log_test.go` | 用 `zaptest/observer` 锁定 `mem_ids` 字段契约 |
+
+### 验证
+- `go test ./internal/orchestrator/... -run TestBuildDynamicMemory_AuditLogAndCitations`
+- Docker：`scripts/verify-audit-p2-5.sh` 种入 memory → curl explain → 校验 200 + 字段；未知 id → 404；删测试数据。
+
+### 设计取舍
+- **explain endpoint 走 cold 而非 hot**：hot 的 score/access_count 可能比 cold 落后一个 batcher flush 周期，做 audit 时希望拿权威数；hot 的延迟优势对单次溯源场景不重要。
+- **路径用 `/explain/:id` 不复用 `/memory/:id`**：gin 的路由树会让 `/memory/stats`、`/memory/user/:user_id` 与 `/memory/:id` 三者互相冲突；`/explain/` 前缀让语义和路由都更清晰。
+- **不在 prompt 中输出 `created_at`**：人类可读的"记住时间"放在 audit log + explain API，不污染 LLM 提示词；prompt 里只有 `[mem:id]` 是为了 P0-1 boost 闭环。
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。

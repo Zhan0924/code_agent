@@ -194,7 +194,20 @@ func (o *Orchestrator) buildDynamicMemory(ctx context.Context, userID, projectID
 			zap.String("query", query))
 		memories := o.retrieveBucketedMemories(ctx, userID, projectID, query, 5)
 		if len(memories) > 0 {
-			o.logger.Debug("memories retrieved", zap.Int("count", len(memories)))
+			// AUDIT-P2-5 audit trail: emit a structured log line that
+			// records *which* memory IDs were injected into the prompt
+			// this turn. Dashboards (Datadog/ES) can join this with the
+			// downstream `[mem:id]` citations to answer "for this user
+			// reply, which past memory drove the answer?".
+			ids := make([]string, 0, len(memories))
+			for _, m := range memories {
+				ids = append(ids, m.ID)
+			}
+			o.logger.Info("memories injected into prompt",
+				zap.String("user_id", userID),
+				zap.String("project_id", projectID),
+				zap.Int("count", len(memories)),
+				zap.Strings("mem_ids", ids))
 			parts = append(parts, "### Long-Term Memory (Context from past interactions)")
 			parts = append(parts, "Use these memories to inform your answer. If you use a memory, explicitly cite its ID like `[mem:<id>]` in your response to boost its relevance.")
 
