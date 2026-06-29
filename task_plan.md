@@ -4,7 +4,7 @@
 按 audit-driven-fix-loop 五步循环逐条闭环 `llmdoc/memory/reflections/2026-06-26-memory-system-02-audit.md` 里 11 条未闭环 REAUDIT-ID，每条独立 Plan + 实现 + Docker 三件套校验 + safe-push，并同步把第一份 audit doc 里被推翻的 ✅ 标记改为 ⚠️/❌。
 
 ## Current Phase
-Phase 2
+Phase 6
 
 ## Phases
 
@@ -28,9 +28,6 @@ Phase 2
 - [x] Step 5: safe-push → `b332948`
 - **Status:** complete
 
-## Current Phase
-Phase 4
-
 ### Phase 3: REAUDIT-P0-3 — Citation 反馈闭环对低成本模型形同虚设（观测增强）
 - [x] Step 1: 代码复核 — 注入与 cite 对比无 miss 信号
 - [x] Step 2: `docs/superpowers/plans/2026-06-29-REAUDIT-P0-3-citation-feedback-observability.md`
@@ -38,9 +35,6 @@ Phase 4
 - [x] Step 4: `verify-reaudit-p0-3.sh` PASS
 - [x] Step 5: safe-push
 - **Status:** complete
-
-## Current Phase
-Phase 5
 
 ### Phase 4: REAUDIT-P0-4 — Embedder 失效监控盲区
 - [x] Step 1: 代码复核 — embedText 无 embedder tier 指标
@@ -50,9 +44,16 @@ Phase 5
 - [x] Step 5: safe-push
 - **Status:** complete
 
+## Current Phase
+Phase 6
+
 ### Phase 5: REAUDIT-P1-1 — HybridStore 拆分从未发生（AUDIT-P2-1 假闭环）
-- [ ] 五步循环（重点：先完成 `docs/superpowers/plans/2026-06-29-AUDIT-P2-1-hybrid-refactor.md` 已开头的拆分，再 ✅）
-- **Status:** pending
+- [x] Step 1: 代码复核 — hybrid.go 仍 781 行，拆分未完成
+- [x] Step 2: `docs/superpowers/plans/2026-06-29-REAUDIT-P1-1-hybrid-split.md`
+- [x] Step 3: 拆分为 hybrid_embed/store/retrieve/list/admin + 契约测试
+- [x] Step 4: `verify-reaudit-p1-1.sh` PASS
+- [x] Step 5: safe-push
+- **Status:** complete
 
 ### Phase 6: REAUDIT-P1-2 — 匿名/默认值兜底在 API 层与 orchestrator 层语义不一致
 - [ ] 五步循环（重点：统一兜底策略；选 reject vs accept；文档明示）

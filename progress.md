@@ -41,3 +41,10 @@
 - Step 3：`MemoryFailuresTotal{embedder}` + `MemoryRetrieveDegradedTotal{reason}` + `RetrieveWithEmbedder` 测试端点
 - Step 4：`./scripts/verify-reaudit-p0-4.sh` PASS
 - 文档：02-audit REAUDIT-P0-4 ✅
+
+### Phase 5 完成（REAUDIT-P1-1）
+
+- Step 1 判定：**真实存在** — 部分拆分已有但 hybrid.go 仍 781 行
+- Step 3：拆为 9 个 `hybrid_*.go` 领域文件，`hybrid.go` 降至 94 行（core-only）
+- Step 4：`./scripts/verify-reaudit-p1-1.sh` PASS
+- 文档：02-audit REAUDIT-P1-1 ✅

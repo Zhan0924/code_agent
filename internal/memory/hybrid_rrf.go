@@ -4,6 +4,15 @@ import (
 	"sort"
 )
 
+// fuseRRF applies Reciprocal Rank Fusion to two ranked lists.
+// k=60 is the canonical value from the original RRF paper (Cormack et al.).
+const rrfK = 60.0
+
+// hotBonus is added to hot-list scores so cache-warm items break ties.
+// Magnitude chosen so a hot-list rank-5 still beats a cold-list rank-1 in
+// pure isolation, encouraging recently-discussed context to surface.
+const hotBonus = 1.0 / (rrfK + 0)
+
 func fuseRRF(hot, cold []Memory, limit int) []Memory {
 	type entry struct {
 		mem   Memory
