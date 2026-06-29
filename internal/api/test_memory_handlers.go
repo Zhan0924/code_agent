@@ -172,6 +172,35 @@ func citationFeedbackOutcome(injected, cited []string) string {
 	return "cited"
 }
 
+// handleTestEmbedderDegrade exercises REAUDIT-P0-4 embedder failure +
+// ILIKE degrade observability without mutating the production embedder.
+func (s *Server) handleTestEmbedderDegrade(c *gin.Context) {
+	if s.memoryStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not configured"})
+		return
+	}
+
+	userID := c.DefaultQuery("user_id", "verify_reaudit_p0_4")
+	projectID := c.DefaultQuery("project_id", "default")
+	query := c.DefaultQuery("query", "我喜欢用 tabs")
+
+	ctx := c.Request.Context()
+	_, err := s.memoryStore.RetrieveWithEmbedder(ctx, memory.TestFailingEmbedder{}, userID, projectID, query, 5)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "retrieve failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"audit_id":   "REAUDIT-P0-4",
+		"user_id":    userID,
+		"project_id": projectID,
+		"query":      query,
+		"degraded":   true,
+		"reason":     "embedder_failed",
+	})
+}
+
 // handleTestDecay manually triggers a decay sweep. Useful for ops to confirm
 // the cold-tier path is functional without waiting for the scheduler tick.
 // Decay everything older than 0 (== all) by factor 0.5; aggressive on

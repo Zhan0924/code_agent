@@ -39,9 +39,16 @@ Phase 4
 - [x] Step 5: safe-push
 - **Status:** complete
 
+## Current Phase
+Phase 5
+
 ### Phase 4: REAUDIT-P0-4 — Embedder 失效监控盲区
-- [ ] 五步循环（重点：`HybridStore.embedText` 失败上 `memory_failures_total{tier="embedder",...}` + 独立 `memory_retrieve_degraded_total`）
-- **Status:** pending
+- [x] Step 1: 代码复核 — embedText 无 embedder tier 指标
+- [x] Step 2: `docs/superpowers/plans/2026-06-29-REAUDIT-P0-4-embedder-degrade-observability.md`
+- [x] Step 3: `MemoryFailuresTotal{embedder}` + `MemoryRetrieveDegradedTotal` + dev endpoint
+- [x] Step 4: `verify-reaudit-p0-4.sh` PASS
+- [x] Step 5: safe-push
+- **Status:** complete
 
 ### Phase 5: REAUDIT-P1-1 — HybridStore 拆分从未发生（AUDIT-P2-1 假闭环）
 - [ ] 五步循环（重点：先完成 `docs/superpowers/plans/2026-06-29-AUDIT-P2-1-hybrid-refactor.md` 已开头的拆分，再 ✅）

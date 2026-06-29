@@ -33,6 +33,8 @@ func TestMemoryFailuresTotal_LabelMatrix(t *testing.T) {
 		{"cold", "list", "error"},
 		{"hot", "list", "warn"},
 		{"blackboard", "publish", "warn"},
+		{"embedder", "embed", "warn"},
+		{"embedder", "embed", "error"},
 	}
 
 	baseline := map[string]float64{}

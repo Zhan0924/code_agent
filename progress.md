@@ -34,3 +34,10 @@
 - Step 3：`buildDynamicMemory` 返回 injectedIDs；`recordCitationFeedback` 发 `injected|missed|cited|partial` 指标 + 结构化日志
 - Step 4：`./scripts/verify-reaudit-p0-3.sh` PASS（API outcome=missed + 日志 citation_feedback_miss）
 - 文档：02-audit REAUDIT-P0-3 ✅
+
+### Phase 4 完成（REAUDIT-P0-4）
+
+- Step 1 判定：**真实存在** — embedder 失败无 tier 指标，ILIKE 降级无 counter
+- Step 3：`MemoryFailuresTotal{embedder}` + `MemoryRetrieveDegradedTotal{reason}` + `RetrieveWithEmbedder` 测试端点
+- Step 4：`./scripts/verify-reaudit-p0-4.sh` PASS
+- 文档：02-audit REAUDIT-P0-4 ✅

@@ -425,6 +425,17 @@ var (
 		Help:      "Citation feedback loop outcomes when memories were injected (REAUDIT-P0-3 observability)",
 	}, []string{"outcome"})
 
+	// MemoryRetrieveDegradedTotal counts retrieve calls that fell back from
+	// semantic search to ILIKE because the embedder was unavailable or
+	// returned an error (REAUDIT-P0-4).
+	// reason: embedder_nil | embedder_failed
+	MemoryRetrieveDegradedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "code_agent",
+		Subsystem: "memory",
+		Name:      "retrieve_degraded_total",
+		Help:      "Retrieve paths degraded from vector search to ILIKE (REAUDIT-P0-4)",
+	}, []string{"reason"})
+
 	// MemoryFailuresTotal is the AUDIT-P2-4 alertable error-classification
 	// counter. Previously a hot-store error and a cold-store error were
 	// both logged at Warn / Error with no machine-readable severity, so
@@ -432,7 +443,7 @@ var (
 	// dashboards.
 	//
 	// Labels:
-	//   - tier:     "hot" | "cold" | "blackboard"
+	//   - tier:     "hot" | "cold" | "blackboard" | "embedder"
 	//   - op:       "store" | "retrieve" | "list" | "publish" | "touch" | "decay"
 	//   - severity: "warn"     -> degraded, compensating path exists (e.g. hot miss while cold is fine)
 	//               "error"    -> degraded with no compensating path (e.g. cold retrieve failed
@@ -462,8 +473,13 @@ func init() {
 		{"cold", "list", "error"},
 		{"hot", "list", "warn"},
 		{"blackboard", "publish", "warn"},
+		{"embedder", "embed", "warn"},
+		{"embedder", "embed", "error"},
 	}
 	for _, w := range warm {
 		MemoryFailuresTotal.WithLabelValues(w.tier, w.op, w.severity).Add(0)
+	}
+	for _, reason := range []string{"embedder_nil", "embedder_failed"} {
+		MemoryRetrieveDegradedTotal.WithLabelValues(reason).Add(0)
 	}
 }
