@@ -8,6 +8,7 @@ import (
 
 	"github.com/agent/code_agent/internal/memory"
 	"github.com/agent/code_agent/internal/models"
+	"github.com/agent/code_agent/internal/session"
 	"go.uber.org/zap"
 )
 
@@ -50,6 +51,43 @@ func (o *Orchestrator) SetCoreMemory(cm memory.CoreMemoryManager) {
 	o.coreMemory = cm
 }
 
+// resolveTenantIDs unifies API + orchestrator tenant fallback (REAUDIT-P1-2).
+// Order: context values → session record → session.NormalizeTenantIDs.
+func (o *Orchestrator) resolveTenantIDs(ctx context.Context, sessionID string) (userID, projectID string) {
+	userID = models.UserIDFromContext(ctx)
+	projectID = models.ProjectIDFromContext(ctx)
+	beforeUser, beforeProj := userID, projectID
+
+	if (userID == "" || projectID == "") && o.sessionMgr != nil && sessionID != "" {
+		if sess, err := o.sessionMgr.Get(ctx, sessionID); err == nil && sess != nil {
+			if userID == "" {
+				userID = sess.UserID
+			}
+			if projectID == "" {
+				projectID = sess.ProjectID
+			}
+		}
+	}
+
+	userID, projectID = session.NormalizeTenantIDs(userID, projectID)
+	if beforeUser != userID || beforeProj != projectID {
+		o.logger.Info("tenant ids normalized for memory pipeline",
+			zap.String("audit_id", "REAUDIT-P1-2"),
+			zap.String("op", "tenant_normalize"),
+			zap.String("before_user_id", beforeUser),
+			zap.String("before_project_id", beforeProj),
+			zap.String("user_id", userID),
+			zap.String("project_id", projectID),
+			zap.String("result", "ok"))
+	}
+	return userID, projectID
+}
+
+// ResolveTenantIDsForTest exposes resolveTenantIDs for dev-only HTTP smoke tests.
+func (o *Orchestrator) ResolveTenantIDsForTest(ctx context.Context, sessionID string) (userID, projectID string) {
+	return o.resolveTenantIDs(ctx, sessionID)
+}
+
 // extractMemoriesAsync runs memory extraction in a background goroutine.
 //
 // Trace-context propagation: we MUST NOT use a bare context.Background()
@@ -66,22 +104,7 @@ func (o *Orchestrator) extractMemoriesAsync(ctx context.Context, sessionID, user
 	// Snapshot identity once on the request goroutine. Doing the
 	// sessionMgr.Get *outside* the bgCtx avoids the race where the
 	// session is evicted before the extractor goroutine wakes up.
-	userID := models.UserIDFromContext(ctx)
-	projectID := models.ProjectIDFromContext(ctx)
-	if (userID == "" || projectID == "") && o.sessionMgr != nil && sessionID != "" {
-		if sess, err := o.sessionMgr.Get(ctx, sessionID); err == nil && sess != nil {
-			if userID == "" {
-				userID = sess.UserID
-			}
-			if projectID == "" {
-				projectID = sess.ProjectID
-			}
-		}
-	}
-	if userID == "" {
-		o.logger.Debug("skipping memory extraction: no userID resolvable")
-		return
-	}
+	userID, projectID := o.resolveTenantIDs(ctx, sessionID)
 
 	go func(parent context.Context) {
 		bgCtx, cancel := context.WithTimeout(detachCancel(parent), memoryExtractionTimeout)
@@ -112,22 +135,7 @@ func (o *Orchestrator) recordTaskEpisodeAsync(ctx context.Context, sessionID, us
 	if o.memoryExtractor == nil {
 		return
 	}
-	userID := models.UserIDFromContext(ctx)
-	projectID := models.ProjectIDFromContext(ctx)
-	if (userID == "" || projectID == "") && o.sessionMgr != nil && sessionID != "" {
-		if sess, err := o.sessionMgr.Get(ctx, sessionID); err == nil && sess != nil {
-			if userID == "" {
-				userID = sess.UserID
-			}
-			if projectID == "" {
-				projectID = sess.ProjectID
-			}
-		}
-	}
-	if userID == "" {
-		o.logger.Debug("skipping episode recording: no userID resolvable")
-		return
-	}
+	userID, projectID := o.resolveTenantIDs(ctx, sessionID)
 
 	go func(parent context.Context, tools []string) {
 		bgCtx, cancel := context.WithTimeout(detachCancel(parent), memoryExtractionTimeout)

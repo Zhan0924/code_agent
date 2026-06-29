@@ -192,7 +192,7 @@ func (m *Manager) Create(ctx context.Context, userID, projectID string) (*models
 		userID = AnonymousUserID
 	}
 	if projectID == "" {
-		projectID = "default"
+		projectID = DefaultProjectID
 	}
 	session := &models.Session{
 		ID:        uuid.New().String(),

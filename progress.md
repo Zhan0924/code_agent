@@ -48,3 +48,10 @@
 - Step 3：拆为 9 个 `hybrid_*.go` 领域文件，`hybrid.go` 降至 94 行（core-only）
 - Step 4：`./scripts/verify-reaudit-p1-1.sh` PASS
 - 文档：02-audit REAUDIT-P1-1 ✅
+
+### Phase 6 完成（REAUDIT-P1-2）
+
+- Step 1 判定：**真实存在** — API 用 anonymous/default，orchestrator 空 userID 则 skip
+- Step 3：`session.NormalizeTenantIDs` + orchestrator `resolveTenantIDs`（不再 skip）
+- Step 4：`./scripts/verify-reaudit-p1-2.sh` PASS
+- 文档：02-audit REAUDIT-P1-2 ✅

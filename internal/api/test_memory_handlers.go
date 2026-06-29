@@ -201,6 +201,35 @@ func (s *Server) handleTestEmbedderDegrade(c *gin.Context) {
 	})
 }
 
+// handleTestTenantNormalize exercises REAUDIT-P1-2 shared tenant fallback.
+func (s *Server) handleTestTenantNormalize(c *gin.Context) {
+	if s.orchestrator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "orchestrator not configured"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	sessionID := c.Query("session_id")
+	if sessionID == "" {
+		if s.sessionMgr != nil {
+			sess, err := s.sessionMgr.Create(ctx, c.Query("user_id"), c.Query("project_id"))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "session create failed: " + err.Error()})
+				return
+			}
+			sessionID = sess.ID
+		}
+	}
+
+	userID, projectID := s.orchestrator.ResolveTenantIDsForTest(ctx, sessionID)
+	c.JSON(http.StatusOK, gin.H{
+		"audit_id":   "REAUDIT-P1-2",
+		"session_id": sessionID,
+		"user_id":    userID,
+		"project_id": projectID,
+	})
+}
+
 // handleTestDecay manually triggers a decay sweep. Useful for ops to confirm
 // the cold-tier path is functional without waiting for the scheduler tick.
 // Decay everything older than 0 (== all) by factor 0.5; aggressive on

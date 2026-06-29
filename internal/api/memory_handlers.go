@@ -26,18 +26,8 @@ func (s *Server) handleListMemory(c *gin.Context) {
 		return
 	}
 
-	// (user_id, project_id) 一起归一化 —— 跟 session.Manager.Create 入口对齐。
-	// session.Create 把空 project_id 写成 "default",memory.RedisHot.keyPrefix
-	// 用的是 "memory:<user>:<project>",所以前端不传 project_id 时,扫描模式会
-	// 变成 "memory:anonymous::*",永远扫不到真实存的 "memory:anonymous:default:*"。
-	userID := c.Query("user_id")
-	if userID == "" {
-		userID = session.AnonymousUserID
-	}
-	projectID := c.Query("project_id")
-	if projectID == "" {
-		projectID = "default"
-	}
+	// (user_id, project_id) 一起归一化 —— 跟 session.NormalizeTenantIDs 对齐。
+	userID, projectID := session.NormalizeTenantIDs(c.Query("user_id"), c.Query("project_id"))
 	typeFilter := c.Query("type")
 	limit := 50
 	if v := c.Query("limit"); v != "" {
@@ -81,16 +71,7 @@ func (s *Server) handleMemoryStats(c *gin.Context) {
 		return
 	}
 
-	// 同 handleListMemory:user_id + project_id 一起归一化,使前端不带任何 query
-	// 也能在「默认空间」拿到 stats。
-	userID := c.Query("user_id")
-	if userID == "" {
-		userID = session.AnonymousUserID
-	}
-	projectID := c.Query("project_id")
-	if projectID == "" {
-		projectID = "default"
-	}
+	userID, projectID := session.NormalizeTenantIDs(c.Query("user_id"), c.Query("project_id"))
 
 	// 500 is a deliberate upper bound for the stats roll-up; visualization
 	// histograms rarely benefit from more granularity. Adjust if/when needed.

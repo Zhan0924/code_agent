@@ -4,7 +4,7 @@
 按 audit-driven-fix-loop 五步循环逐条闭环 `llmdoc/memory/reflections/2026-06-26-memory-system-02-audit.md` 里 11 条未闭环 REAUDIT-ID，每条独立 Plan + 实现 + Docker 三件套校验 + safe-push，并同步把第一份 audit doc 里被推翻的 ✅ 标记改为 ⚠️/❌。
 
 ## Current Phase
-Phase 6
+Phase 7
 
 ## Phases
 
@@ -56,8 +56,12 @@ Phase 6
 - **Status:** complete
 
 ### Phase 6: REAUDIT-P1-2 — 匿名/默认值兜底在 API 层与 orchestrator 层语义不一致
-- [ ] 五步循环（重点：统一兜底策略；选 reject vs accept；文档明示）
-- **Status:** pending
+- [x] Step 1: 代码复核 — API fallback vs orchestrator skip
+- [x] Step 2: `docs/superpowers/plans/2026-06-29-REAUDIT-P1-2-tenant-normalize.md`
+- [x] Step 3: `session.NormalizeTenantIDs` + `resolveTenantIDs`
+- [x] Step 4: `verify-reaudit-p1-2.sh` PASS
+- [x] Step 5: safe-push
+- **Status:** complete
 
 ### Phase 7: REAUDIT-P1-3 — Core Memory 自动晋升阈值与去重
 - [ ] 五步循环（重点：threshold 改可配置；同 content 去重；§34 调优表加 `core_promote_threshold`）
