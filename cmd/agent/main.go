@@ -581,6 +581,32 @@ func main() {
 			zap.Bool("with_embedder_dedup", embedder != nil),
 			zap.Int("max_per_run", cfg.Memory.MaxPerRun))
 
+		// ─── Effective Config Dump (AUDIT-P2-3) ─────────────────────────
+		// Emit all resolved memory parameters at startup so operators can
+		// verify what's running and correlate with Prometheus metrics for
+		// tuning decisions. See docs/architecture/25_memory.md §34 for
+		// the metrics → tuning guide.
+		logger.Info("memory subsystem effective config",
+			zap.Int("dedup_candidate_limit", cfg.Memory.DedupCandidateLimit),
+			zap.Int("max_per_run", cfg.Memory.MaxPerRun),
+			zap.Int("embedding_dim", cfg.Memory.EmbeddingDim),
+			zap.Bool("decay_enabled", cfg.Memory.Decay.Enabled),
+			zap.Duration("decay_interval", cfg.Memory.Decay.Interval),
+			zap.Duration("decay_older_than", cfg.Memory.Decay.OlderThan),
+			zap.Float64("decay_factor", cfg.Memory.Decay.Factor),
+			zap.Bool("access_batcher_enabled", cfg.Memory.Access.Enabled),
+			zap.Int("access_batch_size", cfg.Memory.Access.BatchSize),
+			zap.Duration("access_flush_interval", cfg.Memory.Access.FlushInterval),
+			zap.Int("access_queue_size", cfg.Memory.Access.QueueSize),
+			zap.Bool("promote_enabled", cfg.Memory.Promote.Enabled),
+			zap.Float64("promote_threshold", cfg.Memory.Promote.Threshold),
+			zap.Int("promote_batch_size", cfg.Memory.Promote.BatchSize),
+			zap.Duration("promote_flush_interval", cfg.Memory.Promote.FlushInterval),
+			zap.Int("promote_queue_size", cfg.Memory.Promote.QueueSize),
+			zap.Bool("demote_enabled", cfg.Memory.Demote.Enabled),
+			zap.Float64("demote_threshold", cfg.Memory.Demote.Threshold),
+		)
+
 		// ─── Active Memory Tools (MemGPT-style core memory) ─────────────────
 		// Wires *both* directions:
 		//   1) Tools — core_memory_append / core_memory_replace let the LLM

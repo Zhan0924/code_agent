@@ -54,9 +54,9 @@
 
 | ID | 现象 | 关键证据 | 影响 |
 |---|---|---|---|
-| **AUDIT-P2-1** | **认知复杂度爆表**。`hybrid.go` 单文件 1200+ 行，4 个异步队列 + 双写一致性 + RRF + Promote/Demote/Touch/Decay 全在 HybridStore 一个类里 | `internal/memory/hybrid.go` 总行数（参考实际）；`HybridStore` struct 字段 10+ | 新人入门成本极高；单元测试在但回归 PR 经常触发"我以为这块跟那块无关"的微妙 bug |
+| ✅ **AUDIT-P2-1** | **认知复杂度爆表**。`hybrid.go` 单文件 1200+ 行，4 个异步队列 + 双写一致性 + RRF + Promote/Demote/Touch/Decay 全在 HybridStore 一个类里 | `internal/memory/hybrid.go` 总行数（参考实际）；`HybridStore` struct 字段 10+ | 新人入门成本极高；单元测试在但回归 PR 经常触发"我以为这块跟那块无关"的微妙 bug |
 | ✅ **AUDIT-P2-2** | **PG 真实集成测试缺位**。`DedupTx` / `RetrieveByVectorAndType` / `ListActiveDecayTenants` / `MarkDistilled` 等 SQL 关键路径用 fake / mock 覆盖，没有 testcontainers | `tests/internal/memory/*` 多用 `miniredis` / `fakeStore`；grep `testcontainers` 全仓 0 命中 | SQL 语法或事务行为变化（pgvector 升级、PG 主版本切换）会绕过 CI |
-| **AUDIT-P2-3** | **配置项默认值是经验值，缺压测**。`Threshold=0.7` / `dedupOversample=10` / `MaxConflictsToDedup=32` / `QueueSize=256` 都是文档里写"经验值"，但没有数据支撑 | `internal/memory/hybrid.go:82-95` + `internal/memory/extractor.go:39-57` 全是注释说"经验值"；`MEM-P2-3` 仅做了"可配置"而未做"知道该配多少" | 真实流量 profile 出来后大概率要调；目前 dashboard 也没有"建议下调到 X" 的明示线 |
+| ✅ **AUDIT-P2-3** | **配置项默认值是经验值，缺压测**。`Threshold=0.7` / `dedupOversample=10` / `MaxConflictsToDedup=32` / `QueueSize=256` 都是文档里写"经验值"，但没有数据支撑 | `internal/memory/hybrid.go:82-95` + `internal/memory/extractor.go:39-57` 全是注释说"经验值"；`MEM-P2-3` 仅做了"可配置"而未做"知道该配多少" | 真实流量 profile 出来后大概率要调；目前 dashboard 也没有"建议下调到 X" 的明示线 |
 | **AUDIT-P2-4** | **错误分级不清**。hot Store 失败只 Warn，blackboard Publish 失败只 Debug；缺乏"持久层失败需要 alert + DLQ 重试" 的分级 | `internal/memory/hybrid.go::Store` line ~267 仅 Warn；`publishEvent` 只 Debug | 关键失败被淹没在日志里，运维很难第一时间知道 |
 | **AUDIT-P2-5** | **可解释性缺失**。用户问"agent 为什么知道我用 tabs"，没有 audit trail 显示注入了哪条 memory ID + 何时蒸馏 | `internal/orchestrator/memory_bridge.go::buildLongTermMemory` 拼 `[type] content` 但不带 ID；prompt 注入路径不带 ID 反射 | 既不可解释也不可追溯，AUDIT-P0-1 的反馈闭环要先解决这个 |
 

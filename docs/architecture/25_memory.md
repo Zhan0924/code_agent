@@ -1775,6 +1775,28 @@ Distiller 标记 `distilled_at` 之后，episodic 仍保留在主表，时间长
 ### 修复策略
 将 `orchestrator` 中生成长期记忆的步骤拆分为两部分：`buildStableMemory`（返回稳定的 Core Memory 和 Session Summary）和 `buildDynamicMemory`（返回 Query-specific 检索记忆）。将稳定的部分传递给 `UpdateLongTermMemory` 确保前缀哈希稳定；而动态部分直接传入 `prompt_builder.BuildPrompt`，并作为一条独立的 System Message 追加在对话历史之后（Region 4.5），从而最大化跨 Turn 的 KV Cache 命中率。
 
+## §34. AUDIT-P2-3: Memory 配置调优指南 (Metrics → Tuning)
+
+### 病征
+`Threshold=0.7` / `dedupOversample=10` / `MaxConflictsToDedup=32` / `QueueSize=256` 等配置项的默认值在注释里标注为"经验值"，缺乏数据支撑和操作指导。运维人员在流量增长后不知道该怎么调整。
+
+### 修复策略
+1. **启动日志打印有效配置**：在 `main.go` 中增加了 `memory subsystem effective config` 日志行，启动时打印所有已解析的内存子系统配置值（含已应用的 defaults），运维无需读代码即可确认运行参数。
+2. **Metrics → 调优对照表**：下表将每个可调参数映射到对应的 Prometheus metric 和判断标准。
+
+| 参数 | 默认值 | 观测 Metric | 判断标准 | 调优建议 |
+|---|---|---|---|---|
+| `promote.threshold` | 0.7 | `memory_promote_total{status}` | `ok` 频率为 0 → threshold 过高 | 降低 0.05 步长，观察 hot 命中率是否上升 |
+| `promote.queue_size` | 256 | `memory_promote_queue_drops_total` | 持续 > 0 → 队列满溢 | 倍增 QueueSize 或降低 FlushInterval |
+| `promote.batch_size` | 50 | `memory_promote_batch_size` | P95 = BatchSize → 批次饱和 | 倍增 BatchSize |
+| `access.queue_size` | 1024 | `memory_touch_queue_drops_total` | > 0 → AccessCount 不准 | 倍增 QueueSize |
+| `access.batch_size` | 100 | `memory_touch_batch_size` | P50 << BatchSize → interval 主导 | 降低 FlushInterval 至 2s |
+| `dedup_candidate_limit` | 30 | `memory_dedup_candidate_count` | P95 ≈ limit → 漏去重 | 提高至 50-100 |
+| `conflict.threshold` | 0.85 | `memory_conflict_total{outcome=none}` | 占比 > 95% → 阈值过高 | 降至 0.80（embedding-3 模型适配） |
+| `conflict.max_conflicts` | 32 | `memory_dedup_batch_size` | P95 = 32 → 截断风险 | 提高至 64 |
+| `decay.factor` | 0.95 | `memory_decay_affected_count` | 每轮 0 → factor 太保守 | 降至 0.90 |
+| `demote.threshold` | 0.3 | `memory_demote_total{tier=hot}` | 持续为 0 → 阈值过低 | 提高至 0.35 观察热缓存占用 |
+
 ---
 
 下一篇：[`26_pty.md`](26_pty.md) —— PTY 终端会话：状态持久化的 shell 工具。
