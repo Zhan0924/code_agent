@@ -57,3 +57,4 @@ configs/config.allinone.yaml
 
 # Docker volumes
 data/
+agent_bin

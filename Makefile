@@ -51,13 +51,13 @@ migrate:
 
 # ─── Docker ───────────────────────────────────────────────
 docker-build:
-	docker build -t $(APP_NAME):$(VERSION) .
+	podman build -t $(APP_NAME):$(VERSION) .
 
 docker-up:
-	docker compose up -d
+	podman compose --profile hitl --profile observability up -d
 
 docker-down:
-	docker compose down -v
+	podman compose --profile hitl --profile observability down -v
 
 # ─── Maintenance ──────────────────────────────────────────
 clean:
