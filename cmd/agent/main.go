@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
@@ -944,9 +945,21 @@ func main() {
 
 	// ─── [P1] LSP Client (optional) ─────────────────────────────────────
 	if cfg.LSP.Enabled {
+		// Parse request timeout ("10s") into whole seconds for the client.
+		// NOTE: previously MaxConcurrentRequests (a count) was mistakenly
+		// passed as the timeout — fixed to use RequestTimeout.
+		timeoutSec := 15
+		if cfg.LSP.RequestTimeout != "" {
+			if d, perr := time.ParseDuration(cfg.LSP.RequestTimeout); perr == nil && d > 0 {
+				timeoutSec = int(d.Seconds())
+			} else if perr != nil {
+				logger.Warn("invalid lsp.request_timeout, using default 15s",
+					zap.String("value", cfg.LSP.RequestTimeout), zap.Error(perr))
+			}
+		}
 		lspCfg := lsp.Config{
 			Servers: make(map[string]lsp.ServerConfig),
-			Timeout: cfg.LSP.MaxConcurrentRequests,
+			Timeout: timeoutSec,
 		}
 		for name, srv := range cfg.LSP.Servers {
 			lspCfg.Servers[name] = lsp.ServerConfig{
@@ -958,7 +971,34 @@ func main() {
 		lspClient := lsp.NewClient(lspCfg, logger)
 		orch.SetLSPClient(lspClient)
 		defer lspClient.ShutdownAll()
-		logger.Info("LSP client initialized", zap.Int("servers", len(cfg.LSP.Servers)))
+
+		// Eagerly start a server per configured language whose command is on
+		// PATH. Without this the tools register but every call fails with
+		// "no LSP server running". Missing binaries degrade to a warning so a
+		// dev box without gopls still boots cleanly.
+		lspInitCtx, lspCancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+		lspRoot, wderr := os.Getwd()
+		if wderr != nil {
+			lspRoot = "."
+		}
+		started := 0
+		for name, srv := range cfg.LSP.Servers {
+			if _, lookErr := exec.LookPath(srv.Command); lookErr != nil {
+				logger.Warn("LSP server binary not found on PATH; skipping",
+					zap.String("language", name), zap.String("command", srv.Command))
+				continue
+			}
+			if initErr := lspClient.Initialize(lspInitCtx, name, lspRoot); initErr != nil {
+				logger.Warn("LSP server failed to initialize; semantic tools for this language will error",
+					zap.String("language", name), zap.Error(initErr))
+				continue
+			}
+			started++
+		}
+		lspCancel()
+		logger.Info("LSP client initialized",
+			zap.Int("configured", len(cfg.LSP.Servers)),
+			zap.Int("started", started))
 	}
 
 	httpServer := &http.Server{

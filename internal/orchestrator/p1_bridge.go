@@ -25,6 +25,7 @@ type LSPClient interface {
 	FindReferences(ctx context.Context, uri string, line, col int) ([]lsp.Location, error)
 	Rename(ctx context.Context, uri string, line, col int, newName string) (*lsp.WorkspaceEdit, error)
 	Hover(ctx context.Context, uri string, line, col int) (*lsp.HoverResult, error)
+	DocumentSymbols(ctx context.Context, uri string) ([]lsp.SymbolInfo, error)
 	ShutdownAll() error
 }
 

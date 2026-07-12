@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/agent/code_agent/internal/lsp"
 	"github.com/agent/code_agent/internal/models"
 	"github.com/agent/code_agent/internal/tools"
 	"go.uber.org/zap"
@@ -47,6 +48,12 @@ func (o *Orchestrator) RegisterLSPTools(reg *tools.Registry) error {
 			params:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string","description":"File path"},"line":{"type":"integer","description":"Line number (1-based)"},"column":{"type":"integer","description":"Column number (1-based)"},"new_name":{"type":"string","description":"New name for the symbol"}},"required":["file","line","column","new_name"]}`),
 			handler: o.toolRenameSymbol,
 		},
+		{
+			name:    "document_symbols",
+			desc:    "List all symbols (functions, types, methods, variables) declared in a file, with their line ranges. Useful for understanding a file's structure before navigating.",
+			params:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string","description":"File path"}},"required":["file"]}`),
+			handler: o.toolDocumentSymbols,
+		},
 	}
 
 	for _, lt := range lspTools {
@@ -58,7 +65,7 @@ func (o *Orchestrator) RegisterLSPTools(reg *tools.Registry) error {
 			RiskLevel:   0,
 		}
 		switch lt.name {
-		case "goto_definition", "find_references", "hover_info":
+		case "goto_definition", "find_references", "hover_info", "document_symbols":
 			def.IsIdempotentRead = true
 		case ToolRenameSymbol:
 			def.RiskLevel = 2 // high risk: cross-file modification
@@ -192,6 +199,63 @@ func (o *Orchestrator) toolRenameSymbol(ctx context.Context, args json.RawMessag
 		zap.Int("total_edits", totalEdits))
 
 	return &models.ToolResult{Content: sb.String()}, nil
+}
+
+func (o *Orchestrator) toolDocumentSymbols(ctx context.Context, args json.RawMessage) (*models.ToolResult, error) {
+	var params struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return &models.ToolResult{Content: "Invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+
+	uri := fileToURI(params.File)
+	symbols, err := o.lspClient.DocumentSymbols(ctx, uri)
+	if err != nil {
+		return &models.ToolResult{Content: fmt.Sprintf("LSP error: %v", err), IsError: true}, nil
+	}
+
+	if len(symbols) == 0 {
+		return &models.ToolResult{Content: "No symbols found"}, nil
+	}
+
+	var sb strings.Builder
+	var walk func(syms []lsp.SymbolInfo, depth int)
+	walk = func(syms []lsp.SymbolInfo, depth int) {
+		for _, s := range syms {
+			indent := strings.Repeat("  ", depth)
+			startLine := s.Range.Start.Line + 1
+			endLine := s.Range.End.Line + 1
+			sb.WriteString(fmt.Sprintf("%s%s (%s) L%d-%d", indent, s.Name, symbolKindName(s.Kind), startLine, endLine))
+			if s.Detail != "" {
+				sb.WriteString(" — " + s.Detail)
+			}
+			sb.WriteString("\n")
+			if len(s.Children) > 0 {
+				walk(s.Children, depth+1)
+			}
+		}
+	}
+	walk(symbols, 0)
+
+	o.logger.Info("tool:document_symbols", zap.String("file", params.File), zap.Int("results", len(symbols)))
+	return &models.ToolResult{Content: sb.String()}, nil
+}
+
+// symbolKindName maps LSP SymbolKind integers to human-readable names.
+func symbolKindName(kind int) string {
+	names := map[int]string{
+		1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class",
+		6: "method", 7: "property", 8: "field", 9: "constructor", 10: "enum",
+		11: "interface", 12: "function", 13: "variable", 14: "constant", 15: "string",
+		16: "number", 17: "boolean", 18: "array", 19: "object", 20: "key",
+		21: "null", 22: "enum_member", 23: "struct", 24: "event", 25: "operator",
+		26: "type_parameter",
+	}
+	if n, ok := names[kind]; ok {
+		return n
+	}
+	return fmt.Sprintf("kind%d", kind)
 }
 
 func fileToURI(path string) string {
